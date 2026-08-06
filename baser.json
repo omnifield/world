@@ -1,0 +1,7 @@
+{
+  "formVersion": 5,
+  "sources": [
+    { "use": "@omnifield/baser-devbox", "channel": "dev" },
+    { "use": "@omnifield/brainer-harness", "channel": "latest" }
+  ]
+}

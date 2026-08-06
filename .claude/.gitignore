@@ -1,0 +1,3 @@
+# Harness runtime state — НЕ коммитить. Материализуется плагином как .claude/.gitignore (mode:exact).
+# main-session-marker.mjs пишет сюда session_id'ы активных main-сессий (рантайм, не артефакт репо).
+.main-session-id
