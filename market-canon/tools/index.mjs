@@ -47,8 +47,9 @@ if (!existsSync(каталог)) {
   process.exit(1)
 }
 
+// README.md — пояснение к папке, `_*.md` — бланки. Ни то, ни другое не выписка.
 const записи = readdirSync(каталог)
-  .filter(f => f.endsWith('.md') && !f.startsWith('_'))
+  .filter(f => f.endsWith('.md') && !f.startsWith('_') && f !== 'README.md')
   .sort()
   .map(f => ({ файл: f, поля: шапка(readFileSync(join(каталог, f), 'utf8')) || {} }))
 
