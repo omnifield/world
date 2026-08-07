@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/omnifield/world/core/internal/ingest"
 )
 
 // fixedNow — чтобы поле time проверялось значением, а не «похоже на дату».
@@ -16,8 +18,20 @@ func fixedNow() time.Time {
 	return time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 }
 
+// роутер поднимает дерево маршрутов ЦЕЛИКОМ — со смонтированным приёмом
+// стенда. Проверять старые ручки на урезанном дереве бессмысленно: вопрос
+// ровно в том, живы ли они рядом с новым префиксом.
+func роутер(t *testing.T, webDir string) http.Handler {
+	t.Helper()
+	store, err := ingest.New(filepath.Join(t.TempDir(), "stand"))
+	if err != nil {
+		t.Fatalf("каталог прогонов не поднялся: %v", err)
+	}
+	return newRouter(webDir, ingest.NewHandler(store, func(string, ...any) {}, fixedNow), fixedNow)
+}
+
 func TestHelloОтдаётПаспортМира(t *testing.T) {
-	srv := newRouter(t.TempDir(), fixedNow)
+	srv := роутер(t, t.TempDir())
 
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/hello", nil))
@@ -47,7 +61,7 @@ func TestHelloОтдаётПаспортМира(t *testing.T) {
 }
 
 func TestHealthzОтвечаетКакОстальнойКонтур(t *testing.T) {
-	srv := newRouter(t.TempDir(), fixedNow)
+	srv := роутер(t, t.TempDir())
 
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -72,7 +86,7 @@ func TestКореньРаздаётСтатикуЗоныWeb(t *testing.T) {
 		t.Fatalf("подготовка статики не удалась: %v", err)
 	}
 
-	srv := newRouter(dir, fixedNow)
+	srv := роутер(t, dir)
 
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -82,6 +96,45 @@ func TestКореньРаздаётСтатикуЗоныWeb(t *testing.T) {
 	}
 	if body := rec.Body.String(); body != markup {
 		t.Errorf("отдан не тот файл: получено %q, ожидалось %q", body, markup)
+	}
+}
+
+// Главный вопрос совместимости: новый префикс не съел ни статику, ни старые
+// ручки. Проверяется на одном дереве и после живой записи в журнал — так
+// ловится и перехват маршрута, и падение общего роутера на приёме.
+func TestПриёмСтендаНеЛомаетСтаруюДверь(t *testing.T) {
+	dir := t.TempDir()
+	const markup = "<!doctype html><title>мир</title>"
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(markup), 0o644); err != nil {
+		t.Fatalf("подготовка статики не удалась: %v", err)
+	}
+	srv := роутер(t, dir)
+
+	событие := `{"session":"run-1","ts":"2026-08-07T18:23:34Z","seq":1,"attempt":"place baser at 0,0","allowed":true}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/stand/events", strings.NewReader(событие)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("приём события: получено %d (%s), ожидалось %d", rec.Code, rec.Body.String(), http.StatusOK)
+	}
+
+	tests := []struct {
+		name, path, вТеле string
+	}{
+		{"статика", "/", markup},
+		{"healthz", "/healthz", `"status":"ok"`},
+		{"hello", "/api/hello", `"product":"world"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("код ответа: получено %d, ожидалось %d", rec.Code, http.StatusOK)
+			}
+			if !strings.Contains(rec.Body.String(), tt.вТеле) {
+				t.Errorf("тело: получено %q, ожидалась подстрока %q", rec.Body.String(), tt.вТеле)
+			}
+		})
 	}
 }
 

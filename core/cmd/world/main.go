@@ -15,11 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/omnifield/world/core/internal/ingest"
 )
 
 const (
-	defaultAddr   = ":8080"
-	defaultWebDir = "../web"
+	defaultAddr     = ":8080"
+	defaultWebDir   = "../web"
+	defaultStandDir = "../stand"
 )
 
 // helloPayload — ответ смоук-эндпоинта. Поля названы так, чтобы ответ читался
@@ -32,9 +35,10 @@ type helloPayload struct {
 	Time    string `json:"time"`
 }
 
-// newRouter собирает маршруты поверх каталога статики. Вынесен из main отдельно,
-// чтобы тест поднимал ровно то же дерево маршрутов, что и живой процесс.
-func newRouter(webDir string, now func() time.Time) http.Handler {
+// newRouter собирает маршруты поверх каталога статики и приёма стенда.
+// Вынесен из main отдельно, чтобы тест поднимал ровно то же дерево маршрутов,
+// что и живой процесс.
+func newRouter(webDir string, standIngest http.Handler, now func() time.Time) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/hello", func(w http.ResponseWriter, r *http.Request) {
@@ -51,6 +55,16 @@ func newRouter(webDir string, now func() time.Time) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"service": "world", "status": "ok"})
 	})
+
+	// Приём журнала испытательного стенда — целиком под своим префиксом,
+	// вместе с трассировкой и CORS (см. core/internal/ingest). Методы названы
+	// поимённо не для красоты: без метода этот шаблон конфликтует с «GET /»
+	// раздачи статики, и роутер падает на старте.
+	if standIngest != nil {
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodOptions} {
+			mux.Handle(method+" "+ingest.Prefix, standIngest)
+		}
+	}
 
 	// Статика зоны web. Граница зон соблюдена: core ЧИТАЕТ web на рантайме и
 	// никогда её не правит — владелец файлов остаётся owner-web.
@@ -103,13 +117,18 @@ func main() {
 		log.Fatalf("world: %v", err)
 	}
 
+	store, err := ingest.New(envOr("WORLD_STAND_DIR", defaultStandDir))
+	if err != nil {
+		log.Fatalf("world: %v", err)
+	}
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newRouter(webDir, time.Now),
+		Handler:           newRouter(webDir, ingest.NewHandler(store, log.Printf, time.Now), time.Now),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("world: слушаю %s, статика из %s", addr, webDir)
+	log.Printf("world: слушаю %s, статика из %s, прогоны стенда в %s", addr, webDir, store.Dir())
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("world: сервер остановлен: %v", err)
 	}
