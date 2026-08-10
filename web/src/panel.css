@@ -1,0 +1,156 @@
+/* Оформление пульта. Лежит отдельным файлом рядом с main.tsx, а не блоком <style> в
+   index.html: скелет положен один раз и обвес в него больше не заглядывает, поэтому всё
+   вписанное туда замёрзло бы навсегда (kb:PROBEWEB-7).
+
+   Цвета берём ТОЛЬКО токенами темы (--background, --foreground, …): литеральный цвет здесь
+   не переключается вместе с темой и всплывает светлым пятном в тёмном режиме. Это инвариант
+   стилевого слоя, и нарушать его у себя смысла нет.
+
+   Кит безголовый: класса по умолчанию у кнопки нет. Одеваем её по зацепке data-slot — одним
+   правилом на весь кит, а не каждую кнопку поимённо. */
+
+[data-slot="button"] {
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--primary);
+  color: var(--primary-foreground);
+  font: inherit;
+  cursor: pointer;
+  transition: opacity var(--motion-fast) var(--ease-out);
+}
+
+[data-slot="button"]:hover {
+  opacity: 0.88;
+}
+
+[data-slot="button"]:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.pult {
+  width: min(48rem, 92vw);
+  margin: 0 auto;
+  padding: 3rem 0 4rem;
+  display: grid;
+  gap: 1.5rem;
+}
+
+.pult__head h1 {
+  margin: 0 0 0.35rem;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
+}
+
+.pult__sub,
+.pult__hint,
+.pult__who,
+.pult__foot {
+  color: var(--muted-foreground);
+}
+
+.pult__sub {
+  margin: 0;
+  max-width: 42rem;
+}
+
+.pult__block {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--card);
+  color: var(--card-foreground);
+  padding: 1.25rem 1.5rem;
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+}
+
+.pult__block h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.pult__block p {
+  margin: 0;
+  max-width: 42rem;
+}
+
+/* Отказ виден как отказ, но не кричит: кайма и заголовок, а не красная заливка. Красным
+   красят поломку, а отказ мира — это работающее правило (kb:WORLD-31). */
+.pult__refusal {
+  border-color: var(--destructive);
+}
+
+.pult__refusal h2 {
+  color: var(--destructive);
+  font-family: var(--font-mono);
+  font-size: 1rem;
+}
+
+.pult__exit {
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border);
+}
+
+.pult__who {
+  font-size: 0.875rem;
+}
+
+.pult__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.pult__loc {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.875rem 1rem;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.pult__name {
+  font-weight: 600;
+  color: var(--foreground);
+  text-decoration: none;
+}
+
+.pult__name:hover {
+  text-decoration: underline;
+}
+
+.pult__gives {
+  margin: 0;
+}
+
+.pult__facts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2rem 1rem;
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+
+.pult__facts dt {
+  color: var(--muted-foreground);
+}
+
+.pult__facts dd {
+  margin: 0;
+}
+
+code,
+.pult__facts code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.pult__foot {
+  font-size: 0.875rem;
+}
