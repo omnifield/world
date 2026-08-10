@@ -1,124 +1,15 @@
 <!doctype html>
 <html lang="ru">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Мир omnifield — смоук</title>
-    <style>
-      :root {
-        color-scheme: light dark;
-        --bg: #fbfbfa;
-        --fg: #1c1c1a;
-        --muted: #6b6b66;
-        --line: #dedbd4;
-        --ok: #2f7d4f;
-        --fail: #a8362c;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #16161a;
-          --fg: #ececea;
-          --muted: #97968f;
-          --line: #33333a;
-          --ok: #6cc48c;
-          --fail: #e07a6f;
-        }
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background: var(--bg);
-        color: var(--fg);
-        font: 16px/1.6 ui-sans-serif, system-ui, sans-serif;
-      }
-      main {
-        width: min(34rem, 90vw);
-        padding: 2rem;
-      }
-      h1 {
-        margin: 0 0 0.25rem;
-        font-size: 1.5rem;
-      }
-      p.sub {
-        margin: 0 0 1.75rem;
-        color: var(--muted);
-      }
-      dl {
-        display: grid;
-        grid-template-columns: auto 1fr;
-        gap: 0.5rem 1.25rem;
-        margin: 0;
-        padding-top: 1.25rem;
-        border-top: 1px solid var(--line);
-      }
-      dt {
-        color: var(--muted);
-      }
-      dd {
-        margin: 0;
-        font-variant-numeric: tabular-nums;
-      }
-      .state-ok {
-        color: var(--ok);
-      }
-      .state-fail {
-        color: var(--fail);
-      }
-      code {
-        font-family: ui-monospace, monospace;
-        font-size: 0.9em;
-      }
-    </style>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Пульт мира — кто сейчас в поле</title>
   </head>
   <body>
-    <main>
-      <h1>🌍 Мир omnifield</h1>
-      <p class="sub">
-        Смоук-страница: проверяет, что веб едет и что зона <code>core</code> отвечает.
-        Правил мира здесь нет — они собираются по маршруту <code>tasker:PILOT-13</code>.
-      </p>
-      <dl>
-        <dt>связь</dt>
-        <dd id="state">запрашиваю…</dd>
-        <dt>продукт</dt>
-        <dd id="product">—</dd>
-        <dt>зона</dt>
-        <dd id="zone">—</dd>
-        <dt>ответ мира</dt>
-        <dd id="message">—</dd>
-        <dt>время сервера</dt>
-        <dd id="time">—</dd>
-      </dl>
-    </main>
-
-    <script>
-      // Отказ обязан называть причину (kb:WORLD-1): показываем, ЧТО именно не
-      // получилось, а не «ошибка». Флаг «ок / не ок» здесь не помог бы никому.
-      const поле = (id, текст) => (document.getElementById(id).textContent = текст);
-
-      async function спроситьМир() {
-        const state = document.getElementById("state");
-        try {
-          const ответ = await fetch("/api/hello");
-          if (!ответ.ok) {
-            throw new Error(`core ответил ${ответ.status} ${ответ.statusText}`);
-          }
-          const данные = await ответ.json();
-          state.textContent = "есть";
-          state.className = "state-ok";
-          поле("product", данные.product ?? "—");
-          поле("zone", данные.zone ?? "—");
-          поле("message", данные.message ?? "—");
-          поле("time", данные.time ?? "—");
-        } catch (причина) {
-          state.textContent = `нет — ${причина.message}`;
-          state.className = "state-fail";
-        }
-      }
-
-      спроситьМир();
-    </script>
+    <!-- #root — часть замороженной поверхности probe-web (kb:PROBEWEB-7): mount() ищет его сам.
+         Оформление живёт в src/panel.css, а не блоком <style> здесь: файл положен один раз,
+         и всё вписанное в него замёрзло бы навсегда. -->
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

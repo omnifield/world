@@ -1,0 +1,5 @@
+minimumReleaseAgeExclude:
+  - '@omnifield/probe-web-build@0.1.0'
+  - '@omnifield/probe-web-runtime@0.1.0'
+  - '@omnifield/probe-web-style@0.1.0'
+  - '@omnifield/probe-web-ui@0.1.0'

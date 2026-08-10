@@ -1,0 +1,9 @@
+{
+  "extends": "@omnifield/probe-web-build/tsconfig",
+  "include": ["src", "vite.config.ts", "vitest.config.ts"],
+  "compilerOptions": {
+    // vite.config.ts читает process.env — это узел, а не браузер. Больше типы Node нигде
+    // не нужны, и в src их нет.
+    "types": ["vite/client", "node"]
+  }
+}
