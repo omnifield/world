@@ -24,6 +24,13 @@ func fixedNow() time.Time {
 // вопрос ровно в том, живы ли они рядом с новыми префиксами.
 func роутер(t *testing.T, webDir string) http.Handler {
 	t.Helper()
+	return роутерСРаздачей(t, staticHandler(webDir))
+}
+
+// роутерСРаздачей — то же дерево, но раздача задаётся целиком. Нужен там, где
+// вопрос как раз в ней: страница не собрана, а дверь обязана работать.
+func роутерСРаздачей(t *testing.T, static http.Handler) http.Handler {
+	t.Helper()
 	store, err := ingest.New(filepath.Join(t.TempDir(), "stand"))
 	if err != nil {
 		t.Fatalf("каталог прогонов не поднялся: %v", err)
@@ -36,7 +43,7 @@ func роутер(t *testing.T, webDir string) http.Handler {
 	// Проба адреса в тестах роутера всегда согласна: здесь проверяется дерево
 	// маршрутов, а отказы регистрации — в пакете door, каждый своей пробой.
 	доступен := func(string) error { return nil }
-	return newRouter(webDir,
+	return newRouter(static,
 		ingest.NewHandler(store, молча, fixedNow),
 		door.NewHandler(registry, молча, fixedNow, доступен),
 		fixedNow)
@@ -264,42 +271,130 @@ func TestСтатикаОтвечаетТолькоНаЧтение(t *testing.T
 	}
 }
 
-func TestResolveWebDirНазываетПричинуОтказа(t *testing.T) {
+// Шов между зонами: core раздаёт АРТЕФАКТ СБОРКИ зоны web, а не её исходник.
+// Проверка на константу выглядит мелко, но именно она и есть починка: у
+// исходника зоны web свой index.html, поэтому подмену не ловит ни одна
+// проверка содержимого — её ловит только правильное умолчание (tasker:WORLD-34).
+func TestДефолтРаздачиУказываетНаСборкуЗоныWeb(t *testing.T) {
+	if defaultWebDir != "../web/dist" {
+		t.Errorf("умолчание WORLD_WEB_DIR: получено %q, ожидалось %q — иначе наружу молча уезжает исходник",
+			defaultWebDir, "../web/dist")
+	}
+}
+
+// собранная — каталог, похожий на то, что оставляет после себя сборка зоны web.
+func собранная(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<!doctype html>собрано"), 0o644); err != nil {
+		t.Fatalf("подготовка сборки не удалась: %v", err)
+	}
+	return dir
+}
+
+func TestПроверкаСтатикиНазываетИзъянИВыход(t *testing.T) {
 	файл := filepath.Join(t.TempDir(), "не-каталог.txt")
 	if err := os.WriteFile(файл, []byte("x"), 0o644); err != nil {
 		t.Fatalf("подготовка не удалась: %v", err)
 	}
 
 	tests := []struct {
-		name    string
-		dir     string
-		вОшибке string
+		name, dir, причина, выход string
 	}{
-		{"каталога нет", filepath.Join(t.TempDir(), "нет-такого"), "каталога статики нет"},
-		{"путь ведёт в файл", файл, "должна быть каталогом"},
+		{"каталога нет", filepath.Join(t.TempDir(), "нет-такого"),
+			"каталога собранной страницы нет", "pnpm -C web build"},
+		{"путь ведёт в файл", файл,
+			"должна быть каталогом", "WORLD_WEB_DIR"},
+		{"каталог есть, index.html нет", t.TempDir(),
+			"нет index.html", "pnpm -C web build"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := resolveWebDir(tt.dir)
+			_, err := checkWebDir(tt.dir)
 			if err == nil {
-				t.Fatalf("ожидалась ошибка, получено nil")
+				t.Fatalf("изъян раскладки принят молча — снаружи это выглядело бы как рабочая страница")
 			}
-			if !strings.Contains(err.Error(), tt.вОшибке) {
-				t.Errorf("ошибка не называет причину: получено %q, ожидалась подстрока %q", err, tt.вОшибке)
+			if !strings.Contains(err.Error(), tt.причина) {
+				t.Errorf("не названа причина: получено %q, ожидалась подстрока %q", err, tt.причина)
+			}
+			// Причина без выхода — диагноз, по которому непонятно, что делать
+			// (`kb:WORLD-31`). Для несобранной страницы выход ровно один.
+			if !strings.Contains(err.Error(), tt.выход) {
+				t.Errorf("не назван выход: получено %q, ожидалась подстрока %q", err, tt.выход)
 			}
 		})
 	}
 }
 
-func TestResolveWebDirПринимаетЖивойКаталог(t *testing.T) {
-	dir := t.TempDir()
-
-	got, err := resolveWebDir(dir)
+func TestПроверкаСтатикиПринимаетСборку(t *testing.T) {
+	got, err := checkWebDir(собранная(t))
 	if err != nil {
-		t.Fatalf("живой каталог отвергнут: %v", err)
+		t.Fatalf("собранная страница отвергнута: %v", err)
 	}
 	if !filepath.IsAbs(got) {
 		t.Errorf("путь должен быть абсолютным, получено %q", got)
+	}
+}
+
+// Дверь важнее витрины: страница не собрана — вход в поле обязан работать.
+// Раньше здесь стоял Fatal на старте, и несобранный фронт клал весь сервис.
+func TestНесобраннаяСтраницаНеЗакрываетДверь(t *testing.T) {
+	static, откуда := resolveStatic(filepath.Join(t.TempDir(), "нет-такого"))
+	if !strings.Contains(откуда, "ВЫКЛЮЧЕНА") {
+		t.Fatalf("в стартовую строку уехало %q — по ней не видно, что раздачи нет", откуда)
+	}
+	srv := роутерСРаздачей(t, static)
+
+	// 1. Витрина молчать не имеет права: отказ называет и причину, и выход.
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("код ответа: получено %d (%s), ожидалось %d", rec.Code, rec.Body.String(), http.StatusServiceUnavailable)
+	}
+	for _, кусок := range []string{"web-not-built", "pnpm -C web build", "/api/locations"} {
+		if !strings.Contains(rec.Body.String(), кусок) {
+			t.Errorf("в отказе нет %q: %s", кусок, rec.Body.String())
+		}
+	}
+
+	// 2. Ручки и реестр живы.
+	for _, путь := range []string{"/healthz", "/api/hello", "/api/locations"} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, путь, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s отвечает %d, ожидалось %d — страница не собрана, а не дверь сломана", путь, rec.Code, http.StatusOK)
+		}
+	}
+
+	// 3. И главное: в поле пускают, маршрут работает.
+	локация := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("это локация"))
+	}))
+	defer локация.Close()
+	тело := `{"name":"baser","addr":"` + strings.TrimPrefix(локация.URL, "http://") + `","gives":"консоль сборки"}`
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/locations", strings.NewReader(тело)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("регистрация при несобранной странице: получено %d (%s)", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/baser/", nil))
+	if rec.Body.String() != "это локация" {
+		t.Errorf("маршрут при несобранной странице: получено %q, ожидалось %q", rec.Body.String(), "это локация")
+	}
+}
+
+func TestСобраннаяСтраницаУезжаетНаружу(t *testing.T) {
+	static, откуда := resolveStatic(собранная(t))
+	if strings.Contains(откуда, "ВЫКЛЮЧЕНА") {
+		t.Fatalf("собранная страница не раздаётся: %s", откуда)
+	}
+	srv := роутерСРаздачей(t, static)
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "<!doctype html>собрано" {
+		t.Errorf("наружу уехало %q (код %d), ожидалась собранная страница", rec.Body.String(), rec.Code)
 	}
 }
