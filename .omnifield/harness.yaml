@@ -51,7 +51,7 @@ zones:
     description: Go-сторона — сервис мира и раздача веба
   web:
     paths: [web]
-    description: клиентская сторона — статика без сборщика
+    description: клиентская сторона — пульт мира на фронте probe-web (Solid + Vite, kb:PROBEWEB-7)
 
 # Git-доступ по роли — РАМКА (инвариант shared-policy), приведён для наглядности,
 # выключить нельзя: architect=full; owner=commit-only (gate); layer=none.
