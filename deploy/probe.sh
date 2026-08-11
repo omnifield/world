@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Проба подъёма мира — поднимает образ и проверяет, что вход в поле работает.
+#
+#   ./deploy/probe.sh          зелёный прогон: подняли и проверили
+#   ./deploy/probe.sh --red    красный прогон: ломаем нарочно и убеждаемся, что проба падает
+#   ./deploy/probe.sh --both   сначала зелёный, потом красный
+#
+# Что проверяет зелёный прогон — ровно то, чем принимают зону:
+#
+#   1. /healthz отвечает                     дверь жива
+#   2. пульт открывается                     и это СБОРКА, а не исходник
+#   3. регистрация проходит                  локация попадает в поле
+#   4. маршрут работает                      к локации ходят через дверь по её имени
+#   5. пересоздание сохраняет поле           реестр лежит на томе, а не в слое контейнера
+#
+# Всё — СНАРУЖИ контейнера, по опубликованному хост-порту. Изнутри проверять
+# опубликованный порт бессмысленно: он там не участвует, и проба зеленела бы даже тогда,
+# когда наружу не торчит ничего.
+#
+# Пятый пункт делает ПЕРЕСОЗДАНИЕ, а не рестарт, и это главное место всей пробы: рестарт
+# сохраняет реестр и БЕЗ тома — слой контейнера при рестарте никуда не девается. Проба на
+# рестарте зеленела бы на несмонтированном томе, то есть не была бы пробой (`kb:WORLD-32`).
+#
+# Красный прогон — не приложение к зелёному, а его подтверждение. Он ломает подъём тремя
+# способами (том не смонтирован · порт занят · фронт не собран) и требует, чтобы проба
+# ПОКРАСНЕЛА. Зелёная проба, которую ни разу не заставили упасть, пробой не является.
+#
+# Имена переменных ЛАТИНСКИЕ намеренно: bash не поддерживает не-ASCII в именах переменных
+# и молча превращает `ПОРТ=8080` в «команда не найдена». Тексты и комментарии — русские.
+#
+# Проверки ниже зовутся косвенно — через `green`/`red`, по имени в аргументе; линтер
+# читает это как «функция не вызвана». Глушим, чтобы его прогон был чистым и настоящая
+# находка не потерялась среди шума.
+# shellcheck disable=SC2329
+set -euo pipefail
+
+NET=omnifield-gateway
+IMAGE=omnifield/world:dev
+PORT="${WORLD_PORT:-8080}"
+RED_PORT="${WORLD_PROBE_RED_PORT:-8099}"
+LOC=probe-loc
+MARK='проба подъёма: локация отвечает'
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE=("docker" "compose" "-f" "$HERE/compose.yaml")
+
+total=0; failed=0
+
+part()   { printf '\n\033[1m%s\033[0m\n' "$*" >&2; }
+detail() { printf '      %s\n' "$*" >&2; }
+
+# green <имя> <проверка…> — проверка ОБЯЗАНА пройти.
+green() {
+    local name="$1"; shift
+    total=$((total + 1))
+    if "$@"; then printf '  \033[32m✔\033[0m %s\n' "$name" >&2; return 0; fi
+    printf '  \033[31m✘\033[0m %s\n' "$name" >&2
+    failed=$((failed + 1)); return 1
+}
+
+# red <имя> <проверка…> — проверка ОБЯЗАНА упасть. Мы сломали подъём нарочно; если после
+# этого она зеленеет, чинить надо пробу, а не подъём.
+red() {
+    local name="$1"; shift
+    total=$((total + 1))
+    if "$@"; then
+        printf '  \033[31m✘\033[0m %s — проба ЗЕЛЕНЕЕТ на сломанном подъёме\n' "$name" >&2
+        failed=$((failed + 1)); return 1
+    fi
+    printf '  \033[32m✔\033[0m %s — покраснела, как и должна\n' "$name" >&2; return 0
+}
+
+fail() {
+    printf '\n\033[1;31m✗ пробу не выполнить: %s\033[0m\n' "$1" >&2
+    shift; local line; for line in "$@"; do printf '  выход: %s\n' "$line" >&2; done
+    exit 1
+}
+
+# ------------------------------------------------------------------ разговор с дверью
+# curl нужен ПРОБЕ, а не подъёму: мир поднимается одним докером, а вот стучаться в него
+# чем-то надо. Отсутствие curl — отказ пробы, и он назван, а не выглядит как «мир не встал».
+body_and_code() { curl -sS -m 10 -w $'\n%{http_code}' "$@" 2>&1; }
+http_code()     { curl -s  -m 10 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 000; }
+
+# wait_door <база> — «контейнер запущен» и «дверь отвечает» не одно и то же.
+wait_door() {
+    local _
+    for _ in {1..30}; do
+        [ "$(http_code "$1/healthz")" = 200 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------ сами проверки
+# Функции ниже — единственное место, где написано, что считается работающим входом в поле.
+# Зелёный и красный прогоны зовут ИХ ЖЕ: иначе красный проверял бы не то, что зелёный.
+
+# 1. дверь жива
+check_alive() {
+    local answer code body
+    answer=$(body_and_code "$1/healthz") || { detail "дверь не ответила: $answer"; return 1; }
+    code=${answer##*$'\n'}; body=${answer%$'\n'*}
+    [ "$code" = 200 ] || { detail "healthz ответил $code, а не 200: $body"; return 1; }
+    case "$body" in
+        *'"status":"ok"'*) return 0 ;;
+        *) detail "healthz ответил не ok: $body"; return 1 ;;
+    esac
+}
+
+# 2. пульт открывается — и это СБОРКА, а не исходник
+#
+# Три вопроса, а не один «ответило ли 200». Дверь отдаёт 503 web-not-built, когда пульт не
+# собран (`core/README.md`), и на этом проверка обязана краснеть. А ещё она обязана
+# краснеть на ИСХОДНИКЕ пульта: у него свой index.html, он тоже отдаётся с кодом 200, и
+# снаружи это выглядит как рабочая страница, которая ничего не показывает.
+check_panel() {
+    local answer code body bundle bundle_code
+    answer=$(body_and_code "$1/") || { detail "пульт не ответил: $answer"; return 1; }
+    code=${answer##*$'\n'}; body=${answer%$'\n'*}
+    [ "$code" = 200 ] || { detail "корень ответил $code, а не 200: $body"; return 1; }
+
+    case "$body" in
+        *'/src/main.tsx'*)
+            detail "отдаётся ИСХОДНИК пульта, а не сборка (в теле ссылка на /src/main.tsx)"
+            detail "выход: WORLD_WEB_DIR обязан смотреть на каталог сборки, в образе это /app/web"
+            return 1 ;;
+    esac
+
+    bundle=$(printf '%s' "$body" | grep -o '/assets/[A-Za-z0-9._-]*\.js' | head -n1)
+    [ -n "$bundle" ] || { detail "в странице нет ссылки на собранный бандл /assets/*.js"; return 1; }
+
+    # Сам бандл тоже спрашиваем: index.html мог доехать в одиночку, и пульт открылся бы
+    # белым экраном — снаружи это неотличимо от рабочего.
+    bundle_code=$(http_code "$1$bundle")
+    [ "$bundle_code" = 200 ] || { detail "бандл $bundle отдаётся с кодом $bundle_code"; return 1; }
+    return 0
+}
+
+# 3. регистрация проходит
+check_register() {
+    local answer code body
+    answer=$(body_and_code -X POST "$1/api/locations" \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$2\",\"addr\":\"$3\",\"gives\":\"проба подъёма мира\"}") \
+        || { detail "дверь не ответила на регистрацию: $answer"; return 1; }
+    code=${answer##*$'\n'}; body=${answer%$'\n'*}
+    case "$code" in
+        201|200) return 0 ;;
+        *) detail "регистрация ответила $code: $body"; return 1 ;;
+    esac
+}
+
+# 4. маршрут работает — к локации ходят снаружи по её имени
+check_route() {
+    local answer code body
+    answer=$(body_and_code "$1/$2/probe.txt") || { detail "маршрут не ответил: $answer"; return 1; }
+    code=${answer##*$'\n'}; body=${answer%$'\n'*}
+    [ "$code" = 200 ] || { detail "маршрут /$2/ ответил $code: $body"; return 1; }
+    case "$body" in
+        *"$MARK"*) return 0 ;;
+        *) detail "по маршруту ответила не наша заглушка: $body"; return 1 ;;
+    esac
+}
+
+# 5. поле на месте — локация видна в реестре
+check_in_field() {
+    local body
+    body=$(curl -sS -m 10 "$1/api/locations" 2>&1) || { detail "реестр не ответил: $body"; return 1; }
+    case "$body" in
+        *"\"$2\""*) return 0 ;;
+        *) detail "локации $2 в поле нет: $body"; return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------------------ заглушка-локация
+# Настоящая локация нам не нужна — нужен сосед, который отвечает по имени в общей сети.
+# Больше ничего дверь на регистрации и не проверяет (`core/README.md`): одно TCP-соединение.
+stub_up() {
+    docker rm -f "world-$LOC" >/dev/null 2>&1 || true
+    docker run -d --name "world-$LOC" \
+        --network "$NET" --network-alias "$LOC" \
+        alpine:3 sh -c "mkdir -p /w && printf '%s\n' '$MARK' > /w/probe.txt && httpd -f -p 8000 -h /w" \
+        >/dev/null
+    local _
+    for _ in {1..15}; do
+        docker run --rm --network "$NET" alpine:3 \
+            wget -q -T 2 -O /dev/null "http://$LOC:8000/probe.txt" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    fail "заглушка-локация не поднялась" "посмотри, что с ней: docker logs world-$LOC"
+}
+
+stub_down() { docker rm -f "world-$LOC" >/dev/null 2>&1 || true; }
+
+# ------------------------------------------------------------------ преамбула
+# Прервали пробу на полпути — мусор всё равно убираем: иначе следующий прогон упрётся в
+# занятое имя контейнера, и причина будет выглядеть посторонней.
+cleanup() {
+    docker rm -f "world-$LOC" world-red-vol world-red-port world-red-web >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+command -v docker >/dev/null 2>&1 || fail "докера на машине нет" \
+    "поставь Docker Engine: https://docs.docker.com/engine/install/"
+command -v curl >/dev/null 2>&1 || fail "на машине нет curl, а проба стучится в дверь снаружи" \
+    "поставь curl (сам мир для подъёма его не требует — он нужен только пробе)"
+
+# ================================================================== ЗЕЛЁНЫЙ ПРОГОН
+run_green() {
+    local base="http://127.0.0.1:$PORT"
+
+    part "── зелёный прогон: поднимаем мир и проверяем вход в поле"
+
+    part "подъём (deploy/up.sh)"
+    WORLD_PORT="$PORT" "$HERE/up.sh" >&2 || fail "мир не поднялся — причина названа выше"
+
+    part "заглушка-локация $LOC в сети $NET"
+    stub_up
+    detail "поднята"
+
+    part "проверки — все снаружи контейнера, через хост-порт $PORT"
+    green "1. /healthz отвечает"                          check_alive "$base" || true
+    green "2. пульт открывается (сборка, не исходник)"    check_panel "$base" || true
+    green "3. регистрация проходит"                       check_register "$base" "$LOC" "$LOC:8000" || true
+    green "4. маршрут /$LOC/ работает"                    check_route "$base" "$LOC" || true
+
+    # ПЕРЕСОЗДАНИЕ, а не рестарт: см. шапку файла. `down` без `-v` сносит контейнер и
+    # оставляет тома — ровно то, чем принимают зону.
+    part "пересоздаю контейнер (down + up, тома остаются)"
+    "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+    WORLD_PORT="$PORT" "${COMPOSE[@]}" up -d >/dev/null 2>&1 \
+        || fail "контейнер не встал обратно" "журнал: docker compose -f $HERE/compose.yaml logs"
+    wait_door "$base" || fail "после пересоздания дверь не ответила" \
+        "журнал: docker compose -f $HERE/compose.yaml logs --tail=40"
+    green "5. поле пережило пересоздание (том живой)"     check_in_field "$base" "$LOC" || true
+
+    part "убираю за собой"
+    curl -sS -m 10 -X DELETE "$base/api/locations/$LOC" >/dev/null 2>&1 || true
+    stub_down
+    detail "заглушка снята, локация из поля убрана; мир оставлен поднятым на $base"
+}
+
+# ================================================================== КРАСНЫЙ ПРОГОН
+# Три поломки, названные в приёмке. Каждая ломает ОДНУ вещь и требует, чтобы покраснела
+# ровно та проверка, которая за неё отвечает, — а соседние остались зелёными. Проверка,
+# которая краснеет от всего подряд, не показывает причину и потому бесполезна.
+run_red() {
+    local red_base="http://127.0.0.1:$RED_PORT"
+
+    part "── красный прогон: ломаем подъём нарочно, проба обязана падать"
+
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+        part "образа нет — собираю"
+        "${COMPOSE[@]}" build >&2 || fail "образ не собрался" "причина названа выше"
+    }
+
+    # ---------- поломка 1: том не смонтирован ----------
+    # Реестр ложится в слой контейнера. Рестарт этого не покажет — покажет пересоздание.
+    part "поломка 1 — том под реестр не смонтирован"
+    docker rm -f world-red-vol >/dev/null 2>&1 || true
+    stub_up
+    docker run -d --name world-red-vol --network "$NET" \
+        -p "127.0.0.1:$RED_PORT:8080" "$IMAGE" >/dev/null
+    wait_door "$red_base" || fail "контейнер без тома не поднялся" "docker logs world-red-vol"
+    green "дверь жива и без тома (ломали не её)"  check_alive "$red_base" || true
+    green "локация зарегистрировалась"            check_register "$red_base" "$LOC" "$LOC:8000" || true
+    docker rm -f world-red-vol >/dev/null 2>&1
+    docker run -d --name world-red-vol --network "$NET" \
+        -p "127.0.0.1:$RED_PORT:8080" "$IMAGE" >/dev/null
+    wait_door "$red_base" || fail "пересозданный контейнер без тома не поднялся" "docker logs world-red-vol"
+    red   "5. поле пережило пересоздание"         check_in_field "$red_base" "$LOC" || true
+    docker rm -f world-red-vol >/dev/null 2>&1 || true
+    stub_down
+
+    # ---------- поломка 2: хост-порт занят ----------
+    # Подъём обязан не просто упасть, а НАЗВАТЬ порт и следующее действие (`kb:WORLD-31`).
+    # Проверка здесь ЗЕЛЁНАЯ, хотя путь красный: спрашивается качество отказа, а исходов
+    # три, и два из них провал — подъём зазеленел на занятом порту (значит публикации
+    # наружу не случилось) либо упал молча, не назвав ни порта, ни выхода.
+    part "поломка 2 — хост-порт $PORT занят"
+    "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+    docker rm -f world-red-port >/dev/null 2>&1 || true
+    docker run -d --name world-red-port -p "$PORT:8080" alpine:3 sleep 600 >/dev/null
+    sleep 1
+    check_busy_port_named() {
+        local out status
+        out=$(WORLD_PORT="$PORT" "$HERE/up.sh" 2>&1) && status=0 || status=$?
+        if [ "$status" = 0 ]; then
+            detail "up.sh завершился УСПЕХОМ на занятом порту — публикации наружу не случилось"
+            return 1
+        fi
+        case "$out" in
+            *"порт $PORT"*) return 0 ;;
+        esac
+        detail "up.sh упал, но порта $PORT в отказе не назвал — это диагноз без выхода:"
+        printf '%s\n' "$out" | tail -n 12 >&2
+        return 1
+    }
+    green "подъём на занятом порту падает и называет порт" check_busy_port_named || true
+    docker rm -f world-red-port >/dev/null 2>&1 || true
+
+    # ---------- поломка 3: фронт не собран ----------
+    # Дверь при этом обязана работать: несобранная витрина не повод не пускать в поле
+    # (`core/README.md`). Поэтому здесь пара — одна проверка краснеет, соседняя зеленеет.
+    part "поломка 3 — пульта нет там, куда смотрит WORLD_WEB_DIR"
+    docker rm -f world-red-web >/dev/null 2>&1 || true
+    docker run -d --name world-red-web \
+        -p "127.0.0.1:$RED_PORT:8080" \
+        -e WORLD_WEB_DIR=/app/net-takogo-kataloga "$IMAGE" >/dev/null
+    wait_door "$red_base" || fail "контейнер без пульта не поднялся" "docker logs world-red-web"
+    red   "2. пульт открывается"                               check_panel "$red_base" || true
+    green "1. /healthz отвечает (дверь работает без пульта)"   check_alive "$red_base" || true
+    docker rm -f world-red-web >/dev/null 2>&1 || true
+
+    # Поломка 2 сняла штатный контейнер и обратно его не поднимала: красный прогон не
+    # обязан оставлять мир стоящим, но обязан сказать, в каком состоянии его оставил.
+    detail "мир снят поломкой 2; поднять обратно — ./deploy/up.sh (поле на томе, не потерялось)"
+}
+
+# ================================================================== запуск
+mode="${1:---green}"
+case "$mode" in
+    --green|"") run_green ;;
+    --red)      run_red ;;
+    --both)     run_green; run_red ;;
+    -h|--help)  sed -n '2,29p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *)          fail "непонятный ключ: $mode" "есть --green (по умолчанию), --red, --both" ;;
+esac
+
+part "── итог"
+if [ "$failed" = 0 ]; then
+    printf '  \033[1;32m✔ проверок %s, провалов нет\033[0m\n' "$total" >&2
+    exit 0
+fi
+printf '  \033[1;31m✘ проверок %s, провалено %s\033[0m\n' "$total" "$failed" >&2
+printf '    журнал двери: docker compose -f %s logs --tail=60\n' "$HERE/compose.yaml" >&2
+exit 1
