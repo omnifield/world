@@ -201,7 +201,21 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// main разводит два режима одного бинаря (`kb:WORLD-53`): в мире он держит
+// дверь, в локации стоит сторожем. Новой сущности мир не заводит.
+//
+// Без подкоманды — ДВЕРЬ, как было: образ мира зовёт бинарь без аргументов
+// (`ENTRYPOINT ["/app/world"]`), и это требование совместимости, а не умолчание
+// на всякий случай. Подкоманды — в commands.go.
 func main() {
+	if len(os.Args) > 1 {
+		os.Exit(runCommand(os.Args[1:], streams{out: os.Stdout, err: os.Stderr}))
+	}
+	runDoor()
+}
+
+// runDoor — режим мира: дверь, реестр локаций, приём стенда и раздача пульта.
+func runDoor() {
 	addr := envOr("WORLD_ADDR", defaultAddr)
 
 	static, откудаСтатика := resolveStatic(envOr("WORLD_WEB_DIR", defaultWebDir))
