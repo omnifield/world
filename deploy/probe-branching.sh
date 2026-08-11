@@ -98,6 +98,7 @@ cat > "$STUB_DIR/docker" <<'STUB'
 #!/usr/bin/env bash
 # ПОДСТАВНОЙ докер: пишет журнал вызовов и отвечает по сценарию. Контейнеров не запускает.
 printf '%s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+ALL="$*"   # вызов целиком — по нему отличается мир от локации после того, как ключи сдвинуты
 
 emit_tar() {   # отдать в stdout настоящий tar с названными файлами
     d=$(mktemp -d)
@@ -112,20 +113,49 @@ case "$1" in
     pull) [ -n "${STUB_PULL_OK:-}" ] && exit 0 || exit 1 ;;
     image)
         case "$3" in
-            omnifield/world:dev) [ -n "${STUB_HAVE_IMAGE:-}" ] && exit 0 || exit 1 ;;
-            *)                   [ -n "${STUB_HAVE_PROBE:-}" ] && exit 0 || exit 1 ;;
+            omnifield/world:dev)    [ -n "${STUB_HAVE_IMAGE:-}" ]     && exit 0 || exit 1 ;;
+            omnifield/location:dev) [ -n "${STUB_HAVE_LOC_IMAGE:-}" ] && exit 0 || exit 1 ;;
+            *)                      [ -n "${STUB_HAVE_PROBE:-}" ]     && exit 0 || exit 1 ;;
+        esac ;;
+    exec)
+        # `docker exec` в живой локации: стук в сторожа и команды входа в поле. Тем же
+        # бинарём, что стоит внутри, — и заглушка отвечает за него по сценарию.
+        case "$ALL" in
+            *"/app/world join"*)  [ -n "${STUB_JOIN_OK:-}" ] \
+                                      && { echo 'локация "podstava" вошла в поле'; exit 0; } \
+                                      || { echo 'world join: подстава отказала' >&2; exit 1; } ;;
+            *"/app/world leave"*) [ "${STUB_LEAVE_OK:-1}" = 1 ] \
+                                      && { echo 'локация "podstava" снята с поля'; exit 0; } \
+                                      || exit 1 ;;
+            *wget*)               [ -n "${STUB_GUARD_READY:-}" ] && exit 0 || exit 1 ;;
+            *)                    exit 0 ;;
         esac ;;
     compose)
-        shift 3   # compose -f <файл>
+        # Ключи до подкоманды: у мира это `-f ФАЙЛ`, у локации ещё `-p ИМЯ` и
+        # `--env-file ФАЙЛ`. Сдвигаем парами, а не на фиксированное число: иначе заглушка
+        # знала бы ровно один вызов из двух и молча отвечала бы не на ту подкоманду.
+        shift
+        while [ $# -gt 0 ]; do
+            case "$1" in -*) shift 2 ;; *) break ;; esac
+        done
         case "$1" in
-            config) echo "omnifield/world:dev"; exit 0 ;;
-            up)
-                # Значение, с которым компоуз подставит имя двери в сети, видно только в
-                # окружении процесса — в аргументах его нет. Пишем в журнал отдельной
-                # строкой: иначе проверить, что настройка ДОЕХАЛА, нечем.
-                printf 'ENV WORLD_DOOR_ALIAS=%s\n' "${WORLD_DOOR_ALIAS:-<нет>}" >> "${STUB_LOG:-/dev/null}"
+            config)
+                case "$ALL" in
+                    *location-compose.yaml*) echo "omnifield/location:dev" ;;
+                    *)                       echo "omnifield/world:dev" ;;
+                esac
                 exit 0 ;;
-            *)      exit 0 ;;
+            ps) echo "podstavnoy-kontejner-id"; exit 0 ;;
+            up)
+                # Значения, с которыми компоуз подставит имя двери в сети и настройку
+                # локации, видны только в окружении процесса — в аргументах их нет. Пишем в
+                # журнал отдельной строкой: иначе проверить, что настройка ДОЕХАЛА, нечем.
+                printf 'ENV WORLD_DOOR_ALIAS=%s\n' "${WORLD_DOOR_ALIAS:-<нет>}" >> "${STUB_LOG:-/dev/null}"
+                printf 'ENV WORLD_NAME=%s WORLD_GIVES=%s WORLD_DOOR=%s WORLD_NET=%s\n' \
+                    "${WORLD_NAME:-<нет>}" "${WORLD_GIVES:-<нет>}" \
+                    "${WORLD_DOOR:-<нет>}" "${WORLD_NET:-<нет>}" >> "${STUB_LOG:-/dev/null}"
+                exit 0 ;;
+            *)  exit 0 ;;
         esac ;;
     run)
         case "$*" in
@@ -346,14 +376,161 @@ n=$(printf '%s\n' "$defaults" | grep -c .)
 if [ "$n" = 1 ] && [ -n "$defaults" ]; then good "во всех трёх файлах одно умолчание: $defaults"
 else bad "умолчания разъехались: $(printf '%s' "$defaults" | tr '\n' ' ')"; fi
 
-# ================================================================== 12. подсказки
+# ================================================================== 13–19. ОБРАЗ ЛОКАЦИИ
+# Второе изделие мира (`kb:WORLD-53`): человек заполняет конфиг и даёт одну команду, локация
+# поднимается и САМА входит в поле. Без докера здесь проверяется то, что дороже всего стоит
+# в живом прогоне: чем подъём отказывает ДО первого контейнера и в каком порядке он делает
+# две вещи, которые нельзя менять местами.
+LOC_CFG="$STUB_DIR/location.env"
+loc_config() {   # loc_config <строки конфига…>
+    : > "$LOC_CFG"
+    local line
+    for line in "$@"; do printf '%s\n' "$line" >> "$LOC_CFG"; done
+}
+
+part "13. конфига локации нет → отказ с образцом, ни одного вызова докера"
+run_case 1 "$HERE/location-up.sh" --config "$STUB_DIR/net-takogo-fajla.env"
+said "конфига локации нет"
+said "cp deploy/location.env.example"
+not_called "location-compose.yaml up"
+
+part "14. в конфиге нет имени → отказ называет переменную, локация не поднимается"
+loc_config 'WORLD_GIVES=проба входа в поле'
+run_case 1 "$HERE/location-up.sh" --config "$LOC_CFG"
+said "не сказано имя локации"
+said "WORLD_NAME"
+not_called "location-compose.yaml up"
+
+part "15. в конфиге нет «что даёт» → отказ называет переменную, локация не поднимается"
+loc_config 'WORLD_NAME=probe-place'
+run_case 1 "$HERE/location-up.sh" --config "$LOC_CFG"
+said "не сказано, что локация даёт"
+said "WORLD_GIVES"
+not_called "location-compose.yaml up"
+
+# Имя уезжает в имя контейнера, имя проекта и алиас в сети — с неподходящим именем до двери
+# дело не дойдёт вовсе. Правило имени в ПОЛЕ при этом здесь не повторяется: его держит дверь.
+# Оба случая, а не один: имя может испортиться и первой буквой, и любой следующей, а ветки
+# в проверке разные. Стереги мы только одну — вторая перестала бы работать молча.
+part "16. имя не годится докеру → отказ до первого контейнера (обе ветки)"
+loc_config 'WORLD_NAME=Probe-place' 'WORLD_GIVES=проба входа в поле'
+run_case 1 "$HERE/location-up.sh" --config "$LOC_CFG"
+said "не годится ни в имя контейнера"
+said "начинаться оно обязано"
+not_called "location-compose.yaml up"
+
+loc_config 'WORLD_NAME=probe_place' 'WORLD_GIVES=проба входа в поле'
+run_case 1 "$HERE/location-up.sh" --config "$LOC_CFG"
+said "не годится ни в имя контейнера"
+said "строчные латинские буквы, цифры и дефис"
+not_called "location-compose.yaml up"
+
+# Конфиг читают ДВОЕ — подъём и компоуз, — и читать они обязаны одинаково. Разойдись они
+# на пробеле после `=`, локация объявилась бы в поле под одним именем, а сетевой алиас
+# получила бы под другим: дверь ответила бы `addr-unreachable`, а виноватой выглядела бы сеть.
+part "16b. конфиг читается как у компоуза: пробелы, кавычки, чужой ключ, кривая строка"
+loc_config '  WORLD_NAME = probe-place' 'WORLD_GIVES="что даёт, в кавычках"' \
+           'WORLD_TYPO=1' 'кривая строка без равно'
+STUB_HAVE_LOC_IMAGE=1 STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
+    run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
+called "ENV WORLD_NAME=probe-place"           # пробелы вокруг «=» снялись, как у компоуза
+called "WORLD_GIVES=что даёт, в кавычках"     # кавычки сняты, запятая внутри уцелела
+said "ключ WORLD_TYPO конфигу локации неизвестен"
+said "не похожа на «КЛЮЧ=значение»"
+
+part "17. конфиг полон · образ есть → не собирает, поднимает и ВХОДИТ В ПОЛЕ"
+loc_config 'WORLD_NAME=probe-place' 'WORLD_GIVES=проба входа в поле'
+STUB_HAVE_LOC_IMAGE=1 STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
+    run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
+not_called "location-compose.yaml build"       # образ есть — стройки не было
+called "location-compose.yaml up -d"
+called "-p world-loc-probe-place"              # проект по имени: две локации не сольются
+called "/app/world join"                       # вход в поле сделан, а не оставлен человеку
+called "ENV WORLD_NAME=probe-place"            # конфиг доехал до компоуза
+said "в поле"
+
+part "18. образа локации нет → собирается САМ, поле для этого не нужно"
+STUB_HAVE_LOC_IMAGE= STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
+    run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
+called "location-compose.yaml build"
+called "location-compose.yaml up -d"
+not_called "probe-web:4873"                    # склад пульта локации не нужен вовсе
+
+# Порядок «сначала сторож, потом вход» — единственное место, где эти два шага связаны, и
+# переставить их значит получить `self-unreachable` на ровном месте: дверь проверяет адрес.
+part "19. сторож не ответил → В ПОЛЕ НЕ ВХОДИМ (порядок, а не удача)"
+detail "сценарий ждёт 30 попыток стука — это ~30 секунд"
+STUB_HAVE_LOC_IMAGE=1 STUB_GUARD_READY= STUB_JOIN_OK=1 \
+    run_case 1 "$HERE/location-up.sh" --config "$LOC_CFG"
+said "сторож не ответил"
+said "в поле локация НЕ вошла"
+not_called "/app/world join"                   # маршрута в пустоту не появилось
+
+part "20. настройка конфига доезжает до компоуза и до сети"
+loc_config 'WORLD_NAME=probe-place' 'WORLD_GIVES=проба' \
+           'WORLD_DOOR=field-door:8080' 'WORLD_NET=drugaya-set'
+STUB_HAVE_LOC_IMAGE=1 STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
+    run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
+called "network inspect drugaya-set"           # входим в названную сеть, а не в умолчальную
+called "WORLD_DOOR=field-door:8080"
+not_called "WORLD_DOOR=door:8080"              # и умолчание не подставилось заодно
+
+# Умолчание адреса двери живёт в трёх файлах локации, а его первая половина — ещё и в
+# файлах мира: локация стучится по имени, которое дверь себе объявляет. Разъедутся — мир
+# будет стоять, локация не войдёт, и выглядеть это будет как поломка сети.
+part "20b. умолчание адреса двери не разъехалось — ни внутри локации, ни с миром"
+doors=$(for f in location-compose.yaml location-config.sh location.env.example; do
+        sed -n 's/.*WORLD_DOOR[:=][^A-Za-z0-9]*\([A-Za-z0-9_.-]*:[0-9][0-9]*\).*/\1/p' "$HERE/$f" | head -n1
+    done | sort -u)
+n=$(printf '%s\n' "$doors" | grep -c .)
+if [ "$n" = 1 ] && [ -n "$doors" ]; then good "во всех трёх файлах локации один адрес двери: $doors"
+else bad "адрес двери разъехался: $(printf '%s' "$doors" | tr '\n' ' ')"; fi
+alias_default=$(sed -n 's/.*WORLD_DOOR_ALIAS:-\([A-Za-z0-9_-]*\)}.*/\1/p' "$HERE/compose.yaml" | head -n1)
+[ "${doors%%:*}" = "$alias_default" ] \
+    && good "имя в адресе локации совпало с именем, которое объявляет дверь: $alias_default" \
+    || bad "локация стучится в «${doors%%:*}», а дверь объявляет себя как «$alias_default»"
+
+# Наружу торчит ровно одна дверь (`kb:FUND-5`), и она принадлежит миру. Хост-публикация у
+# локации завела бы второй вход в поле — мимо реестра и мимо маршрутов.
+part "21. локация не публикует порт наружу"
+grep -qE '^[[:space:]]*ports:' "$HERE/location-compose.yaml" \
+    && { bad "в файле запуска локации есть хост-публикация"; grep -nE '^[[:space:]]*ports:' "$HERE/location-compose.yaml" >&2; } \
+    || good "хост-публикации нет — снаружи локация доступна только через дверь"
+
+# ================================================================== 22–23. снятие локации
+# Снести контейнер, не выйдя из поля, значит оставить в реестре маршрут в пустоту. Порядок
+# здесь обратный подъёму, и он тоже не переставляется.
+part "22. снятие: сначала ВЫХОД ИЗ ПОЛЯ, потом контейнер"
+loc_config 'WORLD_NAME=probe-place' 'WORLD_GIVES=проба входа в поле'
+run_case 0 "$HERE/location-down.sh" --config "$LOC_CFG"
+called "/app/world leave"
+called "location-compose.yaml down"
+n_leave=$(grep -n -- '/app/world leave' "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_down=$(grep -n -- 'location-compose.yaml down' "$STUB_LOG" | head -n1 | cut -d: -f1)
+if [ -n "$n_leave" ] && [ -n "$n_down" ] && [ "$n_leave" -lt "$n_down" ]; then
+    good "выход из поля был ДО снятия контейнера (строки $n_leave и $n_down)"
+else
+    bad "порядок нарушен: leave в строке ${n_leave:-<нет>}, down в строке ${n_down:-<нет>}"
+fi
+
+part "23. --keep-in-field: контейнер снят, из поля НЕ выходим, и это сказано вслух"
+run_case 0 "$HERE/location-down.sh" --config "$LOC_CFG" --keep-in-field
+not_called "/app/world leave"
+called "location-compose.yaml down"
+said "location-unreachable"
+
+# ================================================================== 24. подсказки
 # `--help` обязан работать там, где докера нет вовсе, — иначе человек не узнает про ключи
 # ровно тогда, когда они ему и нужны.
-part "12. подсказки и непонятный ключ"
+part "24. подсказки и непонятный ключ"
 run_case 0 "$HERE/up.sh" --help
 run_case 0 "$HERE/build.sh" --help
 run_case 0 "$HERE/probe.sh" --help
+run_case 0 "$HERE/location-up.sh" --help
+run_case 0 "$HERE/location-down.sh" --help
+run_case 0 "$HERE/probe-location.sh" --help
 run_case 2 "$HERE/up.sh" --nesuschestvuyuschiy-klyuch
+run_case 2 "$HERE/location-up.sh" --nesuschestvuyuschiy-klyuch
 
 # ================================================================== итог
 part "── итог"
