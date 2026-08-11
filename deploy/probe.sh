@@ -136,6 +136,13 @@ fail() {
     exit 1
 }
 
+# docker_noconv … — вызов докера, в аргументах которого нет путей ХОСТА, но есть
+# контейнерные (`-e WORLD_WEB_DIR=/app/…`, `wget -O …`). Git Bash (MSYS) переписал бы их в
+# виндовые, и проба проверяла бы не то, что думает. Правило зоны и довод целиком — в
+# `build.sh` рядом с таким же помощником; глушить перевод глобально нельзя, потому что
+# `docker compose -f "$HERE/compose.yaml"` подаёт путь хоста, и его переводить обязаны.
+docker_noconv() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker "$@"; }
+
 # ------------------------------------------------------------------ разговор с дверью
 # curl нужен ПРОБЕ, а не подъёму: мир поднимается одним докером, а вот стучаться в него
 # чем-то надо. Отсутствие curl — отказ пробы, и он назван, а не выглядит как «мир не встал».
@@ -241,17 +248,21 @@ check_in_field() {
 # Единственная проверка, которая смотрит в САМ ОБРАЗ, а не в поднятую дверь.
 check_image_clean() {
     local listing
-    listing=$(docker run --rm --entrypoint sh "$1" -c 'ls -Ra /app' 2>&1) \
+    listing=$(docker_noconv run --rm --entrypoint sh "$1" -c 'ls -Ra /app' 2>&1) \
         || { detail "в образ не заглянуть: $listing"; return 1; }
     case "$listing" in
         *node_modules*|*.tsx*|*package.json*|*pnpm-lock*|*tsconfig*|*vite.config*)
             detail "в образе нашлись исходники или оснастка сборки — туда должно ехать только собранное:"
-            printf '%s\n' "$listing" | grep -E 'node_modules|\.tsx|package\.json|pnpm-lock|tsconfig|vite\.config' | head -5 >&2
+            # `|| true` не для красоты: `head -5` закрывает трубу, `grep` получает SIGPIPE,
+            # и при `set -euo pipefail` проба падала бы целиком ровно там, где нашла находку.
+            printf '%s\n' "$listing" | grep -E 'node_modules|\.tsx|package\.json|pnpm-lock|tsconfig|vite\.config' | head -5 >&2 || true
             return 1 ;;
     esac
     case "$listing" in
         *index.html*) ;;
-        *) detail "в образе нет собранной страницы (/app/web/index.html):"; printf '%s\n' "$listing" | head -10 >&2; return 1 ;;
+        *) detail "в образе нет собранной страницы (/app/web/index.html):"
+           printf '%s\n' "$listing" | head -10 >&2 || true   # SIGPIPE от head — см. выше
+           return 1 ;;
     esac
     return 0
 }
@@ -261,14 +272,16 @@ check_image_clean() {
 # Больше ничего дверь на регистрации и не проверяет (`core/README.md`): одно TCP-соединение.
 stub_up() {
     docker rm -f "world-$LOC" >/dev/null 2>&1 || true
-    docker run -d --name "world-$LOC" \
+    docker_noconv run -d --name "world-$LOC" \
         --network "$NET" --network-alias "$LOC" \
         alpine:3 sh -c "mkdir -p /w && printf '%s\n' '$MARK' > /w/probe.txt && httpd -f -p 8000 -h /w" \
         >/dev/null
     local _
     for _ in {1..15}; do
-        docker run --rm --network "$NET" alpine:3 \
-            wget -q -T 2 -O /dev/null "http://$LOC:8000/probe.txt" >/dev/null 2>&1 && return 0
+        # `-O-`, а не `-O /dev/null`: одиночный аргумент со слэша Git Bash переписал бы в
+        # виндовый путь, wget упал бы на записи, и заглушка выглядела бы неподнявшейся.
+        docker_noconv run --rm --network "$NET" alpine:3 \
+            wget -q -T 2 -O- "http://$LOC:8000/probe.txt" >/dev/null 2>&1 && return 0
         sleep 1
     done
     fail "заглушка-локация не поднялась" "посмотри, что с ней: docker logs world-$LOC"
@@ -400,7 +413,10 @@ run_red() {
     # (`core/README.md`). Поэтому здесь пара — одна проверка краснеет, соседняя зеленеет.
     part "поломка 3 — пульта нет там, куда смотрит WORLD_WEB_DIR"
     docker rm -f world-red-web >/dev/null 2>&1 || true
-    docker run -d --name world-red-web \
+    # Через `docker_noconv`: `-e WORLD_WEB_DIR=/app/…` — контейнерный путь, и Git Bash
+    # переписал бы его в виндовый. Поломка осталась бы поломкой, но НЕ ТОЙ, которую назвали:
+    # проба краснела бы по посторонней причине, а выглядело бы это как проверенное свойство.
+    docker_noconv run -d --name world-red-web \
         -p "127.0.0.1:$RED_PORT:8080" \
         -e WORLD_WEB_DIR=/app/net-takogo-kataloga "$IMAGE" >/dev/null
     wait_door "$red_base" || fail "контейнер без пульта не поднялся" "docker logs world-red-web"
