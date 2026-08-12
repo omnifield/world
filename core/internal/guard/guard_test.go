@@ -23,7 +23,7 @@ func fixedNow() time.Time { return time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 // стройки не задан. Пробы присутствия обязаны работать и в этом случае.
 func сторож(t *testing.T) *Guard {
 	t.Helper()
-	return New("probe-loc", "проба присутствия", nil, func(string, ...any) {}, fixedNow)
+	return New("probe-loc", "проба присутствия", nil, nil, func(string, ...any) {}, fixedNow)
 }
 
 // сторожСМестом — сторож с настоящим местом под стройку: пустой каталог, в
@@ -31,7 +31,7 @@ func сторож(t *testing.T) *Guard {
 func сторожСМестом(t *testing.T) (*Guard, *build.Site) {
 	t.Helper()
 	site := build.Open(filepath.Join(t.TempDir(), "стройка"), func(string, ...any) {}, fixedNow)
-	return New("probe-loc", "проба присутствия", site, func(string, ...any) {}, fixedNow), site
+	return New("probe-loc", "проба присутствия", site, nil, func(string, ...any) {}, fixedNow), site
 }
 
 // послать — запрос с телом: стройка это POST, и на httptest.NewRequest без тела
@@ -162,7 +162,7 @@ func TestНеизвестныйПутьНазываетПричинуИВыхо�
 // непонятно, дошёл ли до неё стук двери вообще.
 func TestКаждыйЗапросОставляетСтроку(t *testing.T) {
 	var строки []string
-	g := New("probe-loc", "", nil, func(f string, a ...any) {
+	g := New("probe-loc", "", nil, nil, func(f string, a ...any) {
 		строки = append(строки, fmt.Sprintf(f, a...))
 	}, fixedNow)
 
