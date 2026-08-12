@@ -51,7 +51,7 @@ func сторожВПамяти(t *testing.T, имя string) string {
 // не изобразить пересоздание контейнера (`tasker:WORLD-81`).
 func сторожСоСносом(t *testing.T, имя string) (адрес string, снести func()) {
 	t.Helper()
-	srv := httptest.NewServer(guard.New(имя, "проба присутствия", nil, func(string, ...any) {}, nil))
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", nil, nil, func(string, ...any) {}, nil))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
 }
@@ -357,7 +357,7 @@ func местоСоСтройкой(t *testing.T, имя string) string {
 	t.Helper()
 	молча := func(string, ...any) {}
 	site := build.Open(filepath.Join(t.TempDir(), "стройка"), молча, nil)
-	srv := httptest.NewServer(guard.New(имя, "проба присутствия", site, молча, nil))
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", site, nil, молча, nil))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
 }
@@ -479,4 +479,30 @@ func TestЗаменаПостройкиТолькоПоЯвнойПросьбе(
 		t.Fatalf("замена вернула %d: %s", код, errOut)
 	}
 	содержит(t, "выводе замены", out, "ЗАМЕНЕНА", втораяСхема)
+}
+
+// Стартовая строка обязана говорить, КУДА ведёт маршрут места: «застройка
+// заявлена» проверяется взглядом на строку подъёма, а не чтением конфига в
+// другом месте. Три состояния — три разных слова, и молчания среди них нет.
+func TestСтартоваяСтрокаГоворитКудаВедётМаршрутМеста(t *testing.T) {
+	for _, случай := range []struct {
+		имя, адрес, слушает string
+		куски               []string
+	}{
+		{имя: "не заявлена", адрес: "", слушает: ":8080",
+			куски: []string{"к сторожу", guard.AddrVar, "я здесь"}},
+		{имя: "заявлена", адрес: "127.0.0.1:3000", слушает: ":8080",
+			куски: []string{"в застройку", "127.0.0.1:3000"}},
+		{имя: "заявлена дурным адресом", адрес: "127.0.0.1", слушает: ":8080",
+			куски: []string{"НЕ ГОДИТСЯ", "build-addr-invalid", guard.AddrVar}},
+	} {
+		t.Run(случай.имя, func(t *testing.T) {
+			строка := кудаМаршрут(guard.OpenStands(случай.адрес, случай.слушает, func(string, ...any) {}))
+			for _, кусок := range случай.куски {
+				if !strings.Contains(строка, кусок) {
+					t.Errorf("в стартовой строке нет %q: %q", кусок, строка)
+				}
+			}
+		})
+	}
 }

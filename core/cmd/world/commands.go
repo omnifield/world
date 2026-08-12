@@ -116,7 +116,8 @@ const usage = `world — бинарь мира: дверь поля и стор�
   world                     без подкоманды — ДВЕРЬ: реестр локаций, маршруты
                             к ним, пульт мира (запуск как был, ничего не менялось)
   world door                та же дверь, названная вслух
-  world guard               сторож локации: отвечает «я здесь» и больше ничего
+  world guard               сторож локации: маршрут места ведёт к застройке,
+                            а пустое место отвечает «я здесь»
 
 Команды входа в поле:
   world join                проверить себя, войти в поле, получить маршрут
@@ -135,6 +136,8 @@ const usage = `world — бинарь мира: дверь поля и стор�
   WORLD_GIVES                   что локация даёт, одной строкой        (-gives)
   WORLD_SCHEMA                  адрес схемы постройки — репозиторий    (-schema)
   WORLD_BUILD_DIR   ../build    каталог стройки ВНУТРИ места      (-build-dir)
+  WORLD_BUILD_ADDR              адрес застройки «хост:порт» внутри места:
+                                куда ведёт маршрут места         (-build-addr)
 
 Умолчание WORLD_SELF_ADDR выводится из имени и порта прослушивания
 («имя:порт»): имя локации — это и её имя в общей сети. Разошлось с
@@ -152,6 +155,10 @@ func cmdGuard(s streams, args []string) error {
 	name := fs.String("name", os.Getenv("WORLD_NAME"), "имя локации — только для ответа человеку (WORLD_NAME)")
 	gives := fs.String("gives", os.Getenv("WORLD_GIVES"), "что локация даёт, одной строкой (WORLD_GIVES)")
 	buildDir := fs.String("build-dir", envOr("WORLD_BUILD_DIR", defaultBuildDir), "каталог стройки внутри места (WORLD_BUILD_DIR)")
+	// Куда ведёт маршрут места. Адрес ЗАЯВЛЯЕТСЯ настройкой локации и не
+	// угадывается: мир не ходит проверять и не сканирует место — не заявлено,
+	// значит застройки для него нет (канон `WORLD2`, узлы `0.8` и `1.8`).
+	buildAddr := fs.String("build-addr", os.Getenv(guard.AddrVar), "адрес застройки внутри места «хост:порт» — куда ведёт маршрут ("+guard.AddrVar+")")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -167,9 +174,26 @@ func cmdGuard(s streams, args []string) error {
 	// каталог останавливает стройку, а не локацию (`kb:WORLD-54`). Причина
 	// уходит в журнал сразу — и повторяется в отказе на первой же стройке.
 	site := build.Open(*buildDir, log.Printf, time.Now)
-	log.Printf("world: сторож локации (%s) слушает %s; каталог стройки %s; проба жизни GET /healthz, вход в поле — world join, стройка — POST %s",
-		кто, *listen, site.Dir(), build.Path)
-	return guard.Run(*listen, guard.New(*name, *gives, site, log.Printf, time.Now))
+	// Застройка заявляется адресом; дурной адрес НЕ роняет место — он называется
+	// в журнале на старте и в отказе на маршруте, вместе с выходом (`2.3`).
+	stands := guard.OpenStands(*buildAddr, *listen, log.Printf)
+	log.Printf("world: сторож локации (%s) слушает %s; каталог стройки %s; маршрут места ведёт %s; проба жизни GET /healthz, вход в поле — world join, стройка — POST %s",
+		кто, *listen, site.Dir(), кудаМаршрут(stands), build.Path)
+	return guard.Run(*listen, guard.New(*name, *gives, site, stands, log.Printf, time.Now))
+}
+
+// кудаМаршрут — что уходит в стартовую строку про маршрут места. Цифра в
+// журнале, а не догадка: «маршрут ведёт к застройке» проверяется взглядом на
+// строку подъёма, а не чтением конфига в другом месте.
+func кудаМаршрут(stands *guard.Stands) string {
+	switch {
+	case stands == nil:
+		return "к сторожу — застройка не заявлена (" + guard.AddrVar + " пуст), место отвечает «я здесь»"
+	case stands.Изъян() != nil:
+		return "к сторожу: застройка заявлена по " + stands.Addr() + ", но адрес НЕ ГОДИТСЯ — " + stands.Изъян().Error()
+	default:
+		return "в застройку " + stands.Addr()
+	}
 }
 
 // cmdBuild — ПОСТАВИТЬ ПОСТРОЙКУ на место через мир. Не заходя в контейнер: до

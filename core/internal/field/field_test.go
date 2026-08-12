@@ -72,7 +72,7 @@ func локация(t *testing.T, имя string) string {
 // именно им (`tasker:WORLD-81`).
 func локацияСоСносом(t *testing.T, имя string) (адрес string, снести func()) {
 	t.Helper()
-	srv := httptest.NewServer(guard.New(имя, "проба присутствия", nil, молча, fixedNow))
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", nil, nil, молча, fixedNow))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
 }
@@ -481,7 +481,7 @@ func дверьСМаршрутами(t *testing.T) string {
 func местоСоСтройкой(t *testing.T, имя string) string {
 	t.Helper()
 	site := build.Open(filepath.Join(t.TempDir(), "стройка"), молча, fixedNow)
-	srv := httptest.NewServer(guard.New(имя, "проба присутствия", site, молча, fixedNow))
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", site, nil, молча, fixedNow))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
 }
