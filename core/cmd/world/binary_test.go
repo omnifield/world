@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/omnifield/world/core/internal/schematest"
 )
 
 // Пробы этого файла гоняют НАСТОЯЩИЙ бинарь, а не обработчики в памяти.
@@ -271,5 +273,95 @@ func окружениеДвери(t *testing.T, addr string) []string {
 		"WORLD_DOOR_FILE=" + filepath.Join(dir, "field", "locations.json"),
 		"WORLD_STAND_DIR=" + filepath.Join(dir, "stand"),
 		"WORLD_WEB_DIR=" + filepath.Join(dir, "нет-витрины"),
+	}
+}
+
+// ПРИЁМКА ЗАДАЧИ ЖИВЬЁМ, процессами и одним бинарём: поднял место → в поле оно
+// пустое → НЕ ЗАХОДЯ ВНУТРЬ, через мир поставил на него постройку → место
+// говорит, что на нём стоит → повтор назван повтором.
+//
+// Здесь это и проверяется по-настоящему: `docker exec` в прогоне нет, доступ
+// идёт по маршруту двери, а клон появляется в каталоге места на диске — снаружи
+// процесса, а не в его ответе (`kb:WORLD-56`, `kb:WORLD-32`).
+func TestЖивойПрогонСтройкаЧерезМирБезЗаходаВнутрь(t *testing.T) {
+	схема := schematest.Схема(t, map[string]string{"README.md": "постройка живого прогона"})
+
+	дверь := свободныйАдрес(t)
+	служба(t, окружениеДвери(t, дверь))
+	дождаться(t, "http://"+дверь+"/healthz")
+
+	стройка := filepath.Join(t.TempDir(), "стройка")
+	сторож := свободныйАдрес(t)
+	служба(t, []string{
+		"WORLD_ADDR=" + сторож,
+		"WORLD_NAME=probe-loc",
+		"WORLD_GIVES=проба доступа внутрь места",
+		"WORLD_BUILD_DIR=" + стройка,
+	}, "guard")
+	дождаться(t, "http://"+сторож+"/healthz")
+
+	окружение := []string{
+		"WORLD_DOOR=" + дверь,
+		"WORLD_NAME=probe-loc",
+		"WORLD_GIVES=проба доступа внутрь места",
+		"WORLD_SELF_ADDR=" + сторож,
+	}
+	if код, _, errOut := команда(t, окружение, "join"); код != 0 {
+		t.Fatalf("join вернул %d: %s", код, errOut)
+	}
+
+	// В поле место пустое — и это видно ЧЕРЕЗ ДВЕРЬ, по маршруту места.
+	код, тело := взять(t, "http://"+дверь+"/probe-loc/api/build")
+	if код != http.StatusOK || !strings.Contains(тело, `"built":false`) {
+		t.Fatalf("свежее место не сказало, что оно пустое: %d %s", код, тело)
+	}
+
+	// Стройка. Внутрь контейнера никто не заходил: команда говорит с дверью.
+	код2, out, errOut := команда(t, окружение, "build", "-schema", схема)
+	if код2 != 0 {
+		t.Fatalf("build вернул %d: %s", код2, errOut)
+	}
+	if !strings.Contains(out, "ВСТАЛА") || !strings.Contains(out, schematest.Коммит(t, схема)) {
+		t.Fatalf("build не назвал исход и коммит: %s", out)
+	}
+
+	// Постройка на диске МЕСТА — это и есть «встала», а не строка в ответе.
+	if _, err := os.Stat(filepath.Join(стройка, "build", "README.md")); err != nil {
+		t.Fatalf("постройки нет в каталоге места: %v", err)
+	}
+
+	// Место говорит, что на нём стоит, — и через дверь, и командой.
+	if код, тело := взять(t, "http://"+дверь+"/probe-loc/api/build"); код != http.StatusOK || !strings.Contains(тело, схема) {
+		t.Fatalf("место не говорит о постройке: %d %s", код, тело)
+	}
+	if код, out, _ := команда(t, окружение, "what"); код != 0 || !strings.Contains(out, схема) {
+		t.Fatalf("what вернул %d: %s", код, out)
+	}
+
+	// Повтор назван повтором, а не второй стройкой.
+	код3, out, _ := команда(t, окружение, "build", "-schema", схема)
+	if код3 != 0 || !strings.Contains(out, "уже стоит") {
+		t.Fatalf("повтор: код %d, вывод %s", код3, out)
+	}
+}
+
+// Обязательный отказ ТЗ живьём: тянемся к месту, которого в поле нет.
+func TestЖивойОтказМестаНетВПоле(t *testing.T) {
+	дверь := свободныйАдрес(t)
+	служба(t, окружениеДвери(t, дверь))
+	дождаться(t, "http://"+дверь+"/healthz")
+
+	код, _, errOut := команда(t, []string{
+		"WORLD_DOOR=" + дверь,
+		"WORLD_NAME=такого-места-нет",
+	}, "build", "-schema", "/схемы/постройка")
+
+	if код != 1 {
+		t.Fatalf("код возврата: получено %d, ожидалась 1", код)
+	}
+	for _, кусок := range []string{"location-unknown", "world who"} {
+		if !strings.Contains(errOut, кусок) {
+			t.Errorf("в отказе нет %q: %s", кусок, errOut)
+		}
 	}
 }

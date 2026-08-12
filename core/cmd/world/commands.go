@@ -2,7 +2,13 @@
 //
 //	без подкоманды (и `world door`) — ДВЕРЬ: мир, реестр локаций, пульт;
 //	world guard                     — СТОРОЖ: локация говорит «я здесь»;
-//	world join · leave · who        — вход в поле, выход и список поля.
+//	world join · leave · who        — вход в поле, выход и список поля;
+//	world build · what              — постройка на месте и что на нём стоит.
+//
+// `build` и `what` — это РУКИ ЮЗЕРА, которые дал мир (`kb:WORLD-61`): решает и
+// строит человек, мир даёт до места доступ. Идут они ЧЕРЕЗ ДВЕРЬ по маршруту
+// места, а не в контейнер докером: «если доступ к локациям даёт не мир, а
+// инструмент стройки, — вот это дыра» (`kb:WORLD-56`).
 //
 // Почему без подкоманды остаётся дверь: образ мира зовёт бинарь без аргументов
 // (`ENTRYPOINT ["/app/world"]`), и менять это значит ломать уже собранный образ
@@ -28,6 +34,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/omnifield/world/core/internal/build"
 	"github.com/omnifield/world/core/internal/door"
 	"github.com/omnifield/world/core/internal/field"
 	"github.com/omnifield/world/core/internal/guard"
@@ -73,11 +80,15 @@ func runCommand(args []string, s streams) int {
 		err = cmdLeave(s, rest)
 	case "who":
 		err = cmdWho(s, rest)
+	case "build":
+		err = cmdBuild(s, rest)
+	case "what":
+		err = cmdWhat(s, rest)
 	case "help", "-h", "-help", "--help":
 		fmt.Fprint(s.out, usage)
 		return 0
 	default:
-		err = fmt.Errorf("неизвестная подкоманда %q — бинарь мира знает: door · guard · join · leave · who; "+
+		err = fmt.Errorf("неизвестная подкоманда %q — бинарь мира знает: door · guard · join · leave · who · build · what; "+
 			"без подкоманды он поднимает дверь. Что делает каждая: world help", cmd)
 	}
 
@@ -112,12 +123,18 @@ const usage = `world — бинарь мира: дверь поля и стор�
   world leave               сняться с поля
   world who                 кто сейчас в поле
 
+Стройка на месте — через мир, не заходя в контейнер:
+  world build -schema <адрес>   поставить постройку на место по схеме
+  world what                    что на месте стоит
+
 Настройка — переменные среды; флаг перекрывает переменную:
   WORLD_ADDR        :8080       что слушает дверь либо сторож          (-listen)
   WORLD_DOOR        door:8080   адрес двери в общей сети «имя:порт»    (-door)
   WORLD_NAME                    имя локации в поле = её маршрут        (-name)
   WORLD_SELF_ADDR               свой адрес «имя:порт», каким видит дверь (-addr)
   WORLD_GIVES                   что локация даёт, одной строкой        (-gives)
+  WORLD_SCHEMA                  адрес схемы постройки — репозиторий    (-schema)
+  WORLD_BUILD_DIR   ../build    каталог стройки ВНУТРИ места      (-build-dir)
 
 Умолчание WORLD_SELF_ADDR выводится из имени и порта прослушивания
 («имя:порт»): имя локации — это и её имя в общей сети. Разошлось с
@@ -134,6 +151,7 @@ func cmdGuard(s streams, args []string) error {
 	listen := fs.String("listen", envOr("WORLD_ADDR", defaultAddr), "что слушать (WORLD_ADDR)")
 	name := fs.String("name", os.Getenv("WORLD_NAME"), "имя локации — только для ответа человеку (WORLD_NAME)")
 	gives := fs.String("gives", os.Getenv("WORLD_GIVES"), "что локация даёт, одной строкой (WORLD_GIVES)")
+	buildDir := fs.String("build-dir", envOr("WORLD_BUILD_DIR", defaultBuildDir), "каталог стройки внутри места (WORLD_BUILD_DIR)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -145,8 +163,102 @@ func cmdGuard(s streams, args []string) error {
 	if кто == "" {
 		кто = "без имени"
 	}
-	log.Printf("world: сторож локации (%s) слушает %s; проба жизни GET /healthz, вход в поле — world join", кто, *listen)
-	return guard.Run(*listen, guard.New(*name, *gives, log.Printf, time.Now))
+	// Каталог стройки готовится на старте и НЕ мешает месту встать: непишущийся
+	// каталог останавливает стройку, а не локацию (`kb:WORLD-54`). Причина
+	// уходит в журнал сразу — и повторяется в отказе на первой же стройке.
+	site := build.Open(*buildDir, log.Printf, time.Now)
+	log.Printf("world: сторож локации (%s) слушает %s; каталог стройки %s; проба жизни GET /healthz, вход в поле — world join, стройка — POST %s",
+		кто, *listen, site.Dir(), build.Path)
+	return guard.Run(*listen, guard.New(*name, *gives, site, log.Printf, time.Now))
+}
+
+// cmdBuild — ПОСТАВИТЬ ПОСТРОЙКУ на место через мир. Не заходя в контейнер: до
+// места доводит дверь по его маршруту, а установку исполняет сторож, который
+// внутри уже стоит.
+//
+// Схема задаётся флагом, а не позицией, по тому же правилу, что и всё
+// остальное: настройка идёт переменными и флагами. Локацию поднимает докер по
+// конфигу, и `WORLD_SCHEMA` — его родной способ сказать, что ставить.
+func cmdBuild(s streams, args []string) error {
+	fs := flagSet(s, "build")
+	doorAddr := fs.String("door", envOr("WORLD_DOOR", field.DefaultDoor), "адрес двери «имя:порт» (WORLD_DOOR)")
+	name := fs.String("name", os.Getenv("WORLD_NAME"), "имя места в поле — куда ставим (WORLD_NAME)")
+	schema := fs.String("schema", os.Getenv("WORLD_SCHEMA"), "адрес схемы: репозиторий, из которого встаёт постройка (WORLD_SCHEMA)")
+	replace := fs.Bool("replace", false, "снести стоящую постройку и поставить эту (снос теряет её содержимое)")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*schema) == "" {
+		return fmt.Errorf(
+			"не сказано, ЧТО ставить: постройка приезжает схемой — репозиторием (kb:WORLD-27), и без адреса ехать нечему; " +
+				"задай WORLD_SCHEMA либо -schema, например -schema https://github.com/omnifield/world.git")
+	}
+
+	client := field.New(*doorAddr, nil, s.trace, time.Now)
+	готово, err := client.Raise(*name, *schema, *replace)
+	if err != nil {
+		return err
+	}
+
+	// Исходов ТРИ, и человек обязан видеть, какой у него. Напечатать «встала» на
+	// повторе значило бы соврать ровно там, где человек проверяет, что ничего не
+	// затёр; напечатать «встала» на замене — скрыть снос.
+	событие := "постройка ВСТАЛА на место"
+	switch готово.Outcome {
+	case build.OutcomeConfirmed:
+		событие = "постройка уже стоит — та же схема; место ничего не трогало"
+	case build.OutcomeReplaced:
+		событие = "постройка ЗАМЕНЕНА: прежняя снесена целиком, встала эта"
+	}
+	fmt.Fprintf(s.out, "место %q: %s\n", *name, событие)
+	таблица(s.out, стройка(*doorAddr, готово.Build))
+	return nil
+}
+
+// cmdWhat — ЧТО НА МЕСТЕ СТОИТ. Отдельная команда, а не строчка в `who`: список
+// поля — состояние ПОЛЯ, а внутренность места принадлежит месту, и спрашивать о
+// ней надо у него (`kb:WORLD-29`: мир не смотрит внутрь локаций, он даёт доступ).
+func cmdWhat(s streams, args []string) error {
+	fs := flagSet(s, "what")
+	doorAddr := fs.String("door", envOr("WORLD_DOOR", field.DefaultDoor), "адрес двери «имя:порт» (WORLD_DOOR)")
+	name := fs.String("name", os.Getenv("WORLD_NAME"), "имя места в поле (WORLD_NAME)")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	client := field.New(*doorAddr, nil, s.trace, time.Now)
+	стоит, err := client.Standing(*name)
+	if err != nil {
+		return err
+	}
+
+	// Пустое место — рабочее состояние, а не сбой: вход в пространство и стройка
+	// внутри него разные вещи (`kb:WORLD-54`). Поэтому здесь не «ничего не
+	// найдено», а сказанное вслух состояние и следующее действие.
+	if !стоит.Built {
+		fmt.Fprintf(s.out, "место %q пустое: постройки нет — это законно (дверь %s); поставить: world build -schema <адрес>\n", *name, *doorAddr)
+		return nil
+	}
+	fmt.Fprintf(s.out, "место %q: на нём стоит постройка\n", *name)
+	таблица(s.out, стройка(*doorAddr, стоит.Build))
+	return nil
+}
+
+// стройка — что печатается про постройку человеку. Коммит здесь не украшение:
+// «постройка встала» подтверждается именно им, а без него это наше слово
+// (`kb:WORLD-32`). Не измерен — так и сказано.
+func стройка(doorAddr string, b *build.Build) [][2]string {
+	коммит := b.Commit
+	if коммит == "" {
+		коммит = "не измерен — у схемы нет ни одного коммита"
+	}
+	return [][2]string{
+		{"дверь", doorAddr},
+		{"схема", b.Schema},
+		{"коммит", коммит},
+		{"встала в", b.Tree},
+		{"когда", b.Since},
+	}
 }
 
 func cmdJoin(s streams, args []string) error {
