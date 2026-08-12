@@ -1,8 +1,17 @@
-// Package field — сторона ЛОКАЦИИ у двери: вход в поле, выход и «кто в поле».
+// Package field — сторона ГОВОРЯЩЕГО С ДВЕРЬЮ: вход локации в поле, выход,
+// «кто в поле» и доступ юзера внутрь места.
 //
 // Регистрация локации И ЕСТЬ подключение к двери (`kb:WORLD-53`), поэтому здесь
 // нет ни «настроить маршрут», ни «прописать в список»: одно действие — Join, и
 // маршрут приезжает ответом на него.
+//
+// # Доступ внутрь места идёт ЧЕРЕЗ ДВЕРЬ, и это правило, а не удобство
+//
+// Мир даёт доступ до локаций и внутрь них по построению; отдай его инструменту
+// стройки — и это дыра (`kb:WORLD-56`). Поэтому Raise и Standing НЕ ходят к
+// месту напрямую по адресу: сперва дверь спрашивают, где место (маршрут
+// выводится из регистрации, а не угадывается по имени), и дальше идут ЕЁ
+// маршрутом. Места нет в поле — отказ называет это до всякой стройки.
 //
 // Правила имени, адреса и описания живут в двери (`internal/door`) и здесь НЕ
 // дублируются. Это не экономия строк: вторая копия правила разъезжается с
@@ -25,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/omnifield/world/core/internal/build"
 	"github.com/omnifield/world/core/internal/door"
 )
 
@@ -49,6 +59,13 @@ const (
 	// может стоять что угодно (в том числе раздача гигабайтного файла), и
 	// читать это целиком, чтобы потом сказать «ответила не дверь», незачем.
 	MaxAnswer = 64 << 10
+
+	// BuildTimeout — потолок разговора о стройке. Он свой и он длинный: за
+	// ручкой стоит `git clone` чужой схемы, а это сеть и диск — десяти секунд,
+	// которых хватает реестру, здесь не хватит и на маленький репозиторий.
+	// Потолок места (`build.CloneTimeout`) короче нашего сознательно: пусть
+	// откажет оно и своими словами, а не мы молчаливым обрывом.
+	BuildTimeout = 5 * time.Minute
 )
 
 // Refusal — отказ, названный по `kb:WORLD-31`: причина И выход. Форма одна для
@@ -88,10 +105,13 @@ type Joined struct {
 	Outcome door.Outcome `json:"outcome"`
 }
 
-// Client — дверь, какой её видит локация.
+// Client — дверь, какой её видят локация и юзер.
 type Client struct {
-	door  string
-	http  *http.Client
+	door string
+	http *http.Client
+	// slow — тот же разговор, но с потолком стройки: клон схемы длиннее любой
+	// ручки реестра, и мерить их одним таймаутом значит обрывать стройку молча.
+	slow  *http.Client
 	probe door.Probe
 	logf  func(string, ...any)
 	now   func() time.Time
@@ -115,6 +135,7 @@ func New(doorAddr string, probe door.Probe, logf func(string, ...any), now func(
 	return &Client{
 		door:  doorAddr,
 		http:  &http.Client{Timeout: DoorTimeout},
+		slow:  &http.Client{Timeout: BuildTimeout},
 		probe: probe,
 		logf:  logf,
 		now:   now,
@@ -199,12 +220,122 @@ func (c *Client) Who() ([]door.Location, error) {
 	return out.Locations, nil
 }
 
-// do — один разговор с дверью: запрос, трассировка, разбор отказа.
+// Raise — ПОСТАВИТЬ ПОСТРОЙКУ на место через мир: дверь доводит до места, место
+// исполняет. Внутрь контейнера при этом никто не заходит — в этом вся задача.
+//
+// replace — явная просьба снести стоящую постройку. Без неё чужая схема
+// получает отказ с выходом, а не молча затирает то, что на месте уже стоит.
+func (c *Client) Raise(name, schema string, replace bool) (*Raised, error) {
+	маршрут, err := c.Reach(name)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(map[string]any{"schema": schema, "replace": replace})
+	if err != nil {
+		return nil, refuse("build-invalid", "просьба о стройке не сериализуется: %v", err)
+	}
+
+	raw, err := c.talk(c.slow, http.MethodPost, маршрут+strings.TrimPrefix(build.Path, "/"), body)
+	if err != nil {
+		return nil, err
+	}
+	var out Raised
+	if err := json.Unmarshal(raw, &out); err != nil || out.Outcome == "" || out.Build == nil {
+		return nil, notAPlace(name, raw, "ответ на стройку не называет исход и постройку")
+	}
+	return &out, nil
+}
+
+// Standing — ЧТО НА МЕСТЕ СТОИТ. Пусто — законный ответ (`kb:WORLD-54`), а не
+// отказ: стройка идёт после входа в поле, а может не идти вовсе.
+func (c *Client) Standing(name string) (*Standing, error) {
+	маршрут, err := c.Reach(name)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, err := c.do(http.MethodGet, маршрут+strings.TrimPrefix(build.Path, "/"), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out Standing
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, notAPlace(name, raw, "ответ про постройку не разбирается")
+	}
+	if out.Built && out.Build == nil {
+		return nil, notAPlace(name, raw, "место сказало, что постройка есть, но не сказало какая")
+	}
+	return &out, nil
+}
+
+// Reach — МАРШРУТ ДО МЕСТА, спрошенный у двери. Не «/имя/», собранное из имени:
+// маршрут выводится из РЕГИСТРАЦИИ (`kb:WORLD-53`), и спросить его у двери —
+// это и есть «мир доводит до места». Заодно отсюда берётся единственный честный
+// ответ на «а есть ли такое место вообще».
+func (c *Client) Reach(name string) (string, error) {
+	if strings.TrimSpace(name) == "" {
+		return "", refuse("name-missing",
+			"не сказано, до какого места тянемся; имя задаётся WORLD_NAME либо -name, а кто сейчас в поле — world who")
+	}
+	локации, err := c.Who()
+	if err != nil {
+		return "", err
+	}
+	for _, l := range локации {
+		if l.Name == name {
+			return l.Route(), nil
+		}
+	}
+	return "", refuse("location-unknown",
+		"места %q в поле нет (дверь %s) — тянуться некуда: доступ внутрь места мир даёт по его МАРШРУТУ, а маршрут берётся из регистрации. "+
+			"Кто сейчас в поле — world who; локация входит в поле сама на подъёме — world join",
+		name, c.door)
+}
+
+// Raised — ответ места на стройку: чем кончилось и что теперь стоит.
+type Raised struct {
+	// Outcome — built · confirmed · replaced (`internal/build`).
+	Outcome build.Outcome `json:"outcome"`
+	Build   *build.Build  `json:"build"`
+}
+
+// Standing — ответ места на «что на тебе стоит». Пустое место отвечает
+// built=false и говорит словами, почему это законно.
+type Standing struct {
+	Built  bool         `json:"built"`
+	Build  *build.Build `json:"build"`
+	Detail string       `json:"detail"`
+}
+
+// notAPlace — по маршруту места ответил не сторож мира. Отдельный отказ, а не
+// «неверный JSON»: самая частая причина — за именем в поле стоит чужой
+// контейнер либо сторож старой редакции, и чинится это образом локации, а не
+// разбором ответа.
+func notAPlace(name string, raw []byte, что string) *Refusal {
+	отрывок := strings.TrimSpace(string(raw))
+	if len(отрывок) > 200 {
+		отрывок = отрывок[:200] + "…"
+	}
+	return &Refusal{
+		Code: "not-a-place",
+		Detail: fmt.Sprintf(
+			"по маршруту места %q отвечает не сторож мира: %s (ответ: %q). "+
+				"Доступ внутрь места даёт сторож — он приезжает образом локации; если место поднято чем-то другим, "+
+				"поставить в него постройку через мир нельзя (kb:WORLD-53)", name, что, отрывок),
+	}
+}
+
+// do — один разговор с дверью на обычном потолке.
+func (c *Client) do(method, path string, body []byte) ([]byte, error) {
+	return c.talk(c.http, method, path, body)
+}
+
+// talk — один разговор с дверью: запрос, трассировка, разбор отказа.
 //
 // Строка трассировки уходит на КАЖДЫЙ запрос по той же причине, что и у самой
 // двери: собеседник на другой машине, и без строки непонятно, дошли ли мы до
 // него вообще и сколько это заняло.
-func (c *Client) do(method, path string, body []byte) ([]byte, error) {
+func (c *Client) talk(hc *http.Client, method, path string, body []byte) ([]byte, error) {
 	url := "http://" + c.door + path
 
 	var rdr io.Reader
@@ -222,7 +353,7 @@ func (c *Client) do(method, path string, body []byte) ([]byte, error) {
 	}
 
 	started := c.now()
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		c.logf("field: %s %s дверь не ответила: %v dur=%s", method, url, err, c.now().Sub(started).Round(time.Microsecond))
 		return nil, refuse("door-unreachable",

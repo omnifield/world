@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/omnifield/world/core/internal/build"
 	"github.com/omnifield/world/core/internal/door"
 	"github.com/omnifield/world/core/internal/guard"
+	"github.com/omnifield/world/core/internal/schematest"
 )
 
 func fixedNow() time.Time { return time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC) }
@@ -70,7 +72,7 @@ func локация(t *testing.T, имя string) string {
 // именно им (`tasker:WORLD-81`).
 func локацияСоСносом(t *testing.T, имя string) (адрес string, снести func()) {
 	t.Helper()
-	srv := httptest.NewServer(guard.New(имя, "проба присутствия", молча, fixedNow))
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", nil, молча, fixedNow))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
 }
@@ -447,4 +449,138 @@ func TestНеудавшийсяРазговорТожеОставляетСтр�
 	if len(строки) != 1 || !strings.Contains(строки[0], "дверь не ответила") {
 		t.Errorf("строки трассировки: %+v", строки)
 	}
+}
+
+// ── доступ внутрь места: стройка через дверь ─────────────────────────────────
+
+// дверьСМаршрутами — дверь, которая не только ведёт реестр, но и ВОДИТ к
+// местам. Доступ внутрь места идёт по маршруту (`kb:WORLD-56`), и проверять его
+// на двери без маршрутизации значит проверять половину дороги.
+func дверьСМаршрутами(t *testing.T) string {
+	t.Helper()
+	reg, err := door.Open(filepath.Join(t.TempDir(), "field", "locations.json"))
+	if err != nil {
+		t.Fatalf("реестр локаций не поднялся: %v", err)
+	}
+	h := door.NewHandler(reg, молча, fixedNow, door.DialProbe(2*time.Second))
+
+	mux := http.NewServeMux()
+	mux.Handle(door.Prefix, h)
+	mux.Handle(door.Prefix+"/", h)
+	// Имени нет в поле — запрос уходит в раздачу, ровно как у живой двери.
+	mux.Handle("/", h.Route(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "витрина зоны web", http.StatusNotFound)
+	})))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// местоСоСтройкой — живая локация, в которую МОЖНО строить: тот же сторож, но с
+// каталогом под постройку.
+func местоСоСтройкой(t *testing.T, имя string) string {
+	t.Helper()
+	site := build.Open(filepath.Join(t.TempDir(), "стройка"), молча, fixedNow)
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", site, молча, fixedNow))
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// вПоле вводит место в поле и отдаёт клиента двери.
+func вПоле(t *testing.T, doorAddr, имя, адрес string) *Client {
+	t.Helper()
+	c := клиент(doorAddr)
+	if _, err := c.Join(Announce{Name: имя, Addr: адрес, Gives: "проба доступа внутрь места"}); err != nil {
+		t.Fatalf("место не вошло в поле: %v", err)
+	}
+	return c
+}
+
+// ПРИЁМКА со стороны клиента: доступ внутрь места идёт ЧЕРЕЗ МИР — дверь
+// доводит до места по маршруту из реестра, место исполняет. Докера здесь нет
+// вовсе, и в этом вся задача (`kb:WORLD-56`).
+func TestПостройкаВстаётЧерезДверьАНеМимоНеё(t *testing.T) {
+	схема := schematest.Схема(t, map[string]string{"README.md": "постройка пробы"})
+	doorAddr := дверьСМаршрутами(t)
+	c := вПоле(t, doorAddr, "probe-loc", местоСоСтройкой(t, "probe-loc"))
+
+	// До стройки место пустое, и это законный ответ.
+	пусто, err := c.Standing("probe-loc")
+	if err != nil {
+		t.Fatalf("что стоит на месте: %v", err)
+	}
+	if пусто.Built {
+		t.Fatalf("на свежем месте что-то стоит: %+v", пусто)
+	}
+
+	готово, err := c.Raise("probe-loc", схема, false)
+	if err != nil {
+		t.Fatalf("стройка через дверь: %v", err)
+	}
+	if готово.Outcome != build.OutcomeBuilt {
+		t.Errorf("исход: получено %q, ожидалось %q", готово.Outcome, build.OutcomeBuilt)
+	}
+	if готово.Build.Commit != schematest.Коммит(t, схема) {
+		t.Errorf("коммит: получено %q, ожидалось %q", готово.Build.Commit, schematest.Коммит(t, схема))
+	}
+
+	стоит, err := c.Standing("probe-loc")
+	if err != nil {
+		t.Fatalf("что стоит на месте: %v", err)
+	}
+	if !стоит.Built || стоит.Build.Schema != схема {
+		t.Errorf("место говорит не то, что на нём стоит: %+v", стоит)
+	}
+}
+
+// МЕСТА НЕТ В ПОЛЕ — отказ до всякой стройки, с причиной и выходом. Маршрут
+// берётся из регистрации, а не собирается из имени: иначе стройка ушла бы в
+// витрину и вернулась непонятным ответом.
+func TestДоМестаКоторогоНетВПолеДотянутьсяНельзя(t *testing.T) {
+	c := клиент(дверьСМаршрутами(t))
+
+	_, err := c.Raise("такого-места-нет", "/схема", false)
+
+	должноБыть(t, отказ(t, err), "location-unknown", "world who", "world join")
+
+	_, err = c.Standing("такого-места-нет")
+	должноБыть(t, отказ(t, err), "location-unknown", "world who")
+}
+
+// Имени не сказали вовсе — тянуться некуда, и это отдельный отказ: без него
+// пустое имя ушло бы в дверь и вернулось «места нет».
+func TestБезИмениМестаТянутьсяНекуда(t *testing.T) {
+	c := клиент(дверьСМаршрутами(t))
+
+	_, err := c.Raise("  ", "/схема", false)
+
+	должноБыть(t, отказ(t, err), "name-missing", "WORLD_NAME")
+}
+
+// Отказ МЕСТА доезжает до человека целиком — его словами, вместе с выходом.
+// Своя формулировка здесь потеряла бы выход, который место уже назвало.
+func TestОтказМестаДоезжаетЧерезДверьЦеликом(t *testing.T) {
+	schematest.Требуется(t)
+	doorAddr := дверьСМаршрутами(t)
+	c := вПоле(t, doorAddr, "probe-loc", местоСоСтройкой(t, "probe-loc"))
+
+	_, err := c.Raise("probe-loc", filepath.Join(t.TempDir(), "такой-схемы-нет"), false)
+
+	должноБыть(t, отказ(t, err), "schema-unreachable", "git ls-remote")
+}
+
+// За именем в поле стоит НЕ сторож мира — отказ называет это причиной, а не
+// «неверным JSON»: чинится оно образом локации, а не разбором ответа.
+func TestЗаМестомОтвечаетНеСторожМира(t *testing.T) {
+	чужой := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("я не сторож мира, я чужой контейнер"))
+	}))
+	t.Cleanup(чужой.Close)
+
+	doorAddr := дверьСМаршрутами(t)
+	c := вПоле(t, doorAddr, "probe-loc", strings.TrimPrefix(чужой.URL, "http://"))
+
+	_, err := c.Standing("probe-loc")
+
+	должноБыть(t, отказ(t, err), "not-a-place", "kb:WORLD-53")
 }

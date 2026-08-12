@@ -8,9 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/omnifield/world/core/internal/build"
 	"github.com/omnifield/world/core/internal/door"
 	"github.com/omnifield/world/core/internal/field"
 	"github.com/omnifield/world/core/internal/guard"
+	"github.com/omnifield/world/core/internal/schematest"
 )
 
 // прогон — одна подкоманда с разведёнными потоками: результат отдельно,
@@ -49,7 +51,7 @@ func сторожВПамяти(t *testing.T, имя string) string {
 // не изобразить пересоздание контейнера (`tasker:WORLD-81`).
 func сторожСоСносом(t *testing.T, имя string) (адрес string, снести func()) {
 	t.Helper()
-	srv := httptest.NewServer(guard.New(имя, "проба присутствия", func(string, ...any) {}, nil))
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", nil, func(string, ...any) {}, nil))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
 }
@@ -321,4 +323,160 @@ func TestПодсказкаПоказываетОбаРежима(t *testing.T) 
 	содержит(t, "подсказке", out,
 		"без подкоманды", "world guard", "world join", "world leave", "world who",
 		"WORLD_DOOR", "WORLD_SELF_ADDR", "core/README.md")
+	// Стройка — тоже руки, которые даёт мир, и не увидеть их в подсказке значит
+	// снова уйти внутрь места докером (`kb:WORLD-56`).
+	содержит(t, "подсказке", out,
+		"world build", "world what", "WORLD_SCHEMA", "WORLD_BUILD_DIR", "не заходя в контейнер")
+}
+
+// ── стройка на месте через мир ───────────────────────────────────────────────
+
+// дверьСМаршрутами — дверь, которая ведёт реестр И ВОДИТ к местам: доступ
+// внутрь места идёт по маршруту, а не мимо двери (`kb:WORLD-56`).
+func дверьСМаршрутами(t *testing.T) string {
+	t.Helper()
+	reg, err := door.Open(filepath.Join(t.TempDir(), "field", "locations.json"))
+	if err != nil {
+		t.Fatalf("реестр локаций не поднялся: %v", err)
+	}
+	молча := func(string, ...any) {}
+	h := door.NewHandler(reg, молча, nil, nil)
+	mux := http.NewServeMux()
+	mux.Handle(door.Prefix, h)
+	mux.Handle(door.Prefix+"/", h)
+	mux.Handle("/", h.Route(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "витрина зоны web", http.StatusNotFound)
+	})))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// местоСоСтройкой — локация, в которую можно строить.
+func местоСоСтройкой(t *testing.T, имя string) string {
+	t.Helper()
+	молча := func(string, ...any) {}
+	site := build.Open(filepath.Join(t.TempDir(), "стройка"), молча, nil)
+	srv := httptest.NewServer(guard.New(имя, "проба присутствия", site, молча, nil))
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// ПРИЁМКА ЗАДАЧИ через КОМАНДЫ, а не через клиента: поднял место → вошло в поле
+// → world build поставил постройку → world what говорит, что на месте стоит.
+// Докера в этом прогоне нет вовсе.
+func TestКомандыСтройкиСтавятПостройкуИГоворятЧтоСтоит(t *testing.T) {
+	схема := schematest.Схема(t, map[string]string{"README.md": "постройка пробы"})
+	t.Setenv("WORLD_DOOR", дверьСМаршрутами(t))
+	t.Setenv("WORLD_NAME", "probe-loc")
+	t.Setenv("WORLD_GIVES", "проба доступа внутрь места")
+	t.Setenv("WORLD_SELF_ADDR", местоСоСтройкой(t, "probe-loc"))
+
+	if код, _, errOut := прогон("join"); код != 0 {
+		t.Fatalf("join вернул %d: %s", код, errOut)
+	}
+
+	// До стройки место пустое, и команда говорит это вслух, а не молчит.
+	код, out, errOut := прогон("what")
+	if код != 0 {
+		t.Fatalf("what вернул %d: %s", код, errOut)
+	}
+	содержит(t, "выводе what до стройки", out, "пустое", "world build")
+
+	код, out, errOut = прогон("build", "-schema", схема)
+	if код != 0 {
+		t.Fatalf("build вернул %d: %s", код, errOut)
+	}
+	содержит(t, "выводе build", out, "ВСТАЛА", схема, schematest.Коммит(t, схема))
+
+	код, out, errOut = прогон("what")
+	if код != 0 {
+		t.Fatalf("what вернул %d: %s", код, errOut)
+	}
+	содержит(t, "выводе what после стройки", out, "стоит постройка", схема)
+
+	// Повтор назван повтором: «встала» здесь соврало бы ровно там, где человек
+	// проверяет, не затёр ли он сделанное.
+	код, out, _ = прогон("build", "-schema", схема)
+	if код != 0 {
+		t.Fatalf("повторный build вернул %d", код)
+	}
+	содержит(t, "выводе повторного build", out, "уже стоит")
+}
+
+// Отказ ТЗ живьём: тянемся к месту, которого в поле нет.
+func TestСтройкаВМестоКоторогоНетВПолеНазываетПричинуИВыход(t *testing.T) {
+	t.Setenv("WORLD_DOOR", дверьСМаршрутами(t))
+	t.Setenv("WORLD_NAME", "такого-места-нет")
+
+	код, _, errOut := прогон("build", "-schema", "/схемы/постройка")
+
+	if код != 1 {
+		t.Fatalf("код возврата: получено %d, ожидалась 1", код)
+	}
+	содержит(t, "отказе", errOut, "location-unknown", "world who", "world join")
+}
+
+// Отказ ТЗ живьём: схемы, которой нет. Отказ приезжает СЛОВАМИ МЕСТА — вместе с
+// тем, что сказал git, и с выходом.
+func TestСтройкаНесуществующейСхемыНазываетПричинуИВыход(t *testing.T) {
+	schematest.Требуется(t)
+	t.Setenv("WORLD_DOOR", дверьСМаршрутами(t))
+	t.Setenv("WORLD_NAME", "probe-loc")
+	t.Setenv("WORLD_GIVES", "проба доступа внутрь места")
+	t.Setenv("WORLD_SELF_ADDR", местоСоСтройкой(t, "probe-loc"))
+	if код, _, errOut := прогон("join"); код != 0 {
+		t.Fatalf("join вернул %d: %s", код, errOut)
+	}
+
+	код, _, errOut := прогон("build", "-schema", filepath.Join(t.TempDir(), "такой-схемы-нет"))
+
+	if код != 1 {
+		t.Fatalf("код возврата: получено %d, ожидалась 1", код)
+	}
+	содержит(t, "отказе", errOut, "schema-unreachable", "git ls-remote")
+}
+
+// Не сказали, ЧТО ставить: отказ называет и переменную, и флаг — локацию
+// поднимает докер по конфигу, а чинит человек руками.
+func TestСтройкаБезСхемыНазываетПеременнуюИФлаг(t *testing.T) {
+	t.Setenv("WORLD_DOOR", дверьСМаршрутами(t))
+	t.Setenv("WORLD_NAME", "probe-loc")
+	t.Setenv("WORLD_SCHEMA", "")
+
+	код, _, errOut := прогон("build")
+
+	if код != 1 {
+		t.Fatalf("код возврата: получено %d, ожидалась 1", код)
+	}
+	содержит(t, "отказе", errOut, "WORLD_SCHEMA", "-schema", "kb:WORLD-27")
+}
+
+// Замена — только по явной просьбе. Без -replace место отказывает словами, с
+// ним — говорит «заменена», а не выдаёт снос за обычную стройку.
+func TestЗаменаПостройкиТолькоПоЯвнойПросьбе(t *testing.T) {
+	перваяСхема := schematest.Схема(t, map[string]string{"первая.txt": "1"})
+	втораяСхема := schematest.Схема(t, map[string]string{"вторая.txt": "2"})
+	t.Setenv("WORLD_DOOR", дверьСМаршрутами(t))
+	t.Setenv("WORLD_NAME", "probe-loc")
+	t.Setenv("WORLD_GIVES", "проба доступа внутрь места")
+	t.Setenv("WORLD_SELF_ADDR", местоСоСтройкой(t, "probe-loc"))
+	if код, _, errOut := прогон("join"); код != 0 {
+		t.Fatalf("join вернул %d: %s", код, errOut)
+	}
+	if код, _, errOut := прогон("build", "-schema", перваяСхема); код != 0 {
+		t.Fatalf("первая стройка вернула %d: %s", код, errOut)
+	}
+
+	код, _, errOut := прогон("build", "-schema", втораяСхема)
+	if код != 1 {
+		t.Fatalf("вторая схема без -replace прошла молча — этого не может быть (код %d)", код)
+	}
+	содержит(t, "отказе", errOut, "build-present", "-replace")
+
+	код, out, errOut := прогон("build", "-schema", втораяСхема, "-replace")
+	if код != 0 {
+		t.Fatalf("замена вернула %d: %s", код, errOut)
+	}
+	содержит(t, "выводе замены", out, "ЗАМЕНЕНА", втораяСхема)
 }
