@@ -11,6 +11,8 @@
 #
 # Что появляется после подключения:
 #   WORLD_NAME · WORLD_GIVES · WORLD_DOOR · WORLD_NET   значения конфига (экспортированы)
+#   WORLD_BUILD_ADDR                                    то же, необязательное: где внутри
+#                                                       места стоит застройка (пусто — нет)
 #   PROJECT                                             имя компоуз-проекта локации
 #   COMPOSE[@]                                          вызов компоуза с этим конфигом
 #   CONFIG_KEY                                          « --config ФАЙЛ» для подсказок, если
@@ -31,7 +33,8 @@ SERVICE=world-location   # имя службы в файле запуска; а�
 
 env_name="${WORLD_NAME:-}"; env_gives="${WORLD_GIVES:-}"
 env_door="${WORLD_DOOR:-}"; env_net="${WORLD_NET:-}"
-WORLD_NAME=; WORLD_GIVES=; WORLD_DOOR=; WORLD_NET=
+env_build_addr="${WORLD_BUILD_ADDR:-}"
+WORLD_NAME=; WORLD_GIVES=; WORLD_DOOR=; WORLD_NET=; WORLD_BUILD_ADDR=
 
 lineno=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -53,14 +56,15 @@ while IFS= read -r line || [ -n "$line" ]; do
         "'"*"'") value="${value#\'}"; value="${value%\'}" ;;
     esac
     case "$key" in
-        WORLD_NAME|WORLD_GIVES|WORLD_DOOR|WORLD_NET) printf -v "$key" '%s' "$value" ;;
+        WORLD_NAME|WORLD_GIVES|WORLD_DOOR|WORLD_NET|WORLD_BUILD_ADDR) printf -v "$key" '%s' "$value" ;;
         *) warn "строка $lineno: ключ $key конфигу локации неизвестен, он его не читает" ;;
     esac
 done < "$CONFIG"
 
 # Конфиг СИЛЬНЕЕ окружения — и молчать об этом нельзя: человек, экспортировавший переменную,
 # должен узнать, что победил файл, здесь, а не по чужому имени в поле.
-for pair in "WORLD_NAME:$env_name" "WORLD_GIVES:$env_gives" "WORLD_DOOR:$env_door" "WORLD_NET:$env_net"; do
+for pair in "WORLD_NAME:$env_name" "WORLD_GIVES:$env_gives" "WORLD_DOOR:$env_door" "WORLD_NET:$env_net" \
+            "WORLD_BUILD_ADDR:$env_build_addr"; do
     var="${pair%%:*}"; was="${pair#*:}"
     [ -n "$was" ] || continue
     [ "$was" != "${!var}" ] || continue
@@ -89,7 +93,11 @@ esac
 
 WORLD_DOOR="${WORLD_DOOR:-door:8080}"
 WORLD_NET="${WORLD_NET:-omnifield-gateway}"
-export WORLD_NAME WORLD_GIVES WORLD_DOOR WORLD_NET
+# У адреса застройки умолчания НЕТ и быть не может: пустое место законно и остаётся нормой
+# (`core/README.md`, канон `WORLD2` 1.0). Пусто здесь значит «не заявлено» — маршрут места
+# отвечает присутствием сторожа, как и до появления этой настройки. Подставить сюда что-то
+# «разумное» значило бы завести маршрут в вещь, которой человек не поднимал.
+export WORLD_NAME WORLD_GIVES WORLD_DOOR WORLD_NET WORLD_BUILD_ADDR
 
 # Имя проекта — по имени локации, и это единственное, что разводит две локации на одной
 # машине. Без него компоуз взял бы имя каталога (`deploy`), и вторая локация молча заменила
