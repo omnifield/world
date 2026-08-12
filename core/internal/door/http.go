@@ -131,16 +131,29 @@ func (h *Handler) postLocation(t *trace, w http.ResponseWriter, r *http.Request)
 			"поле «gives» обязательно: локация без описания попадёт в список за дверью безымянной, и взять её осмысленно будет нельзя")
 	}
 
-	// Занятость имени спрашиваем РАНЬШЕ пробы адреса. Причина не в экономии:
-	// оба отказа верны, но блокирует именно занятое имя, а мир обязан называть
+	// ТОЖДЕСТВО МЕСТА. Имя занято другим адресом — вопрос не «пускать ли», а КТО
+	// пришёл: то же место вернулось после пересоздания или чужой встал на занятое
+	// имя. Мерка одна и честная — отвечает ли прежний по своему адресу
+	// (`kb:WORLD-53`: присутствие проверяется достижимостью). Граница мерки
+	// названа в доке пакета и в core/README.md.
+	//
+	// Спрашиваем это РАНЬШЕ пробы нового адреса. Причина не в экономии: оба
+	// отказа верны, но блокирует именно занятое имя, а мир обязан называть
 	// ПРИЧИНУ (`kb:WORLD-31`). Иначе локация с занятым именем и не поднятым
 	// адресом узнаёт про адрес, чинит его — и упирается в то же имя.
 	// Решающая проверка остаётся в Registry.Put, под тем же замком, что и
 	// запись: здесь мы только выбираем, что сказать, а не кому достанется имя.
+	var прежнийАдрес string
+	var прежнийМолчит error
 	if prev, занято := h.reg.Lookup(reg.Name); занято && prev.Addr != reg.Addr {
-		return errf(http.StatusConflict, "name-taken",
-			"имя %q уже занято локацией по адресу %s — возьми другое имя либо сними ту: DELETE %s/%s",
-			reg.Name, prev.Addr, Prefix, reg.Name)
+		err := h.probe(prev.Addr)
+		if err == nil {
+			return errf(http.StatusConflict, "name-taken",
+				"имя %q занято локацией по адресу %s, и она отвечает прямо сейчас — значит место стоит, "+
+					"и это не его возвращение, а другое место под тем же именем. Возьми другое имя либо сними стоящую: DELETE %s/%s",
+				reg.Name, prev.Addr, Prefix, reg.Name)
+		}
+		прежнийАдрес, прежнийМолчит = prev.Addr, err
 	}
 
 	// Адрес проверяем ДО записи: реестр — состояние поля, и запись о локации,
@@ -158,39 +171,61 @@ func (h *Handler) postLocation(t *trace, w http.ResponseWriter, r *http.Request)
 			reg.Addr, reg.Name)
 	}
 
-	loc := Location{
+	loc, исход, err := h.reg.Put(Location{
 		Name:  reg.Name,
 		Addr:  reg.Addr,
 		Gives: strings.TrimSpace(reg.Gives),
 		Since: h.now().UTC().Format(time.RFC3339),
-	}
-	created, err := h.reg.Put(loc)
+	}, прежнийАдрес != "")
 	if err != nil {
 		return storeError(err)
 	}
-	// Сбрасывать построенный маршрут здесь НЕ нужно, и это следствие правил, а
-	// не экономия: имя, уже стоящее в реестре, принимается только с тем же
-	// адресом (иначе name-taken), а смена адреса проходит через снятие, где
-	// маршрут и забывается. Плюс proxyFor всё равно сверяет адрес.
+
+	if исход == OutcomeReturned {
+		// Место вернулось по НОВОМУ адресу — построенный маршрут ведёт к
+		// ушедшему соседу, и его пул соединений держит того, кого уже нет.
+		// proxyFor и сам сверяет адрес, но забыть здесь надо явно: место ушло
+		// из поля целиком, и держать его соединения незачем.
+		h.forget(loc.Name)
+		// Возвращение — единственный случай, когда дверь МЕНЯЕТ смысл записи, а
+		// не только её поля. Строка в журнале называет, чем это подтверждено:
+		// без неё «то же место» остаётся словом.
+		h.logf("door: возвращение: %q сменила адрес %s → %s (прежний не ответил: %v); в поле с %s",
+			loc.Name, прежнийАдрес, loc.Addr, прежнийМолчит, loc.Since)
+	}
 
 	code := http.StatusOK
-	if created {
+	if исход == OutcomeCreated {
 		code = http.StatusCreated
 	}
 	// В ответе — МАРШРУТ, а не только «ок»: регистрация и есть подключение,
-	// и локация должна узнать из ответа, где она теперь достижима.
-	writeJSON(w, code, map[string]any{"location": loc, "route": loc.Route(), "created": created})
+	// и локация должна узнать из ответа, где она теперь достижима. И ИСХОД: три
+	// исхода в один флаг `created` не влезают, а вернувшееся место обязано
+	// узнать, что оно вернулось, а не создалось. `created` при этом остаётся —
+	// его читают уже написанные потребители, и ломать их нельзя.
+	writeJSON(w, code, map[string]any{
+		"location": loc,
+		"route":    loc.Route(),
+		"created":  исход == OutcomeCreated,
+		"outcome":  исход,
+	})
 	return nil
+}
+
+// listed — место в списке за дверью: сама запись плюс маршрут. Запись
+// ВСТРАИВАЕТСЯ, а не пересобирается по полю: список и реестр обязаны говорить
+// об одном месте одно и то же, а вторая копия перечня полей разъезжается с
+// первой молча — новое поле появилось бы в реестре и не появилось в списке.
+type listed struct {
+	Location
+	Route string `json:"route"`
 }
 
 func (h *Handler) getLocations(_ *trace, w http.ResponseWriter, _ *http.Request) *apiError {
 	locs := h.reg.List()
-	out := make([]map[string]any, 0, len(locs))
+	out := make([]listed, 0, len(locs))
 	for _, loc := range locs {
-		out = append(out, map[string]any{
-			"name": loc.Name, "addr": loc.Addr, "gives": loc.Gives,
-			"since": loc.Since, "route": loc.Route(),
-		})
+		out = append(out, listed{Location: loc, Route: loc.Route()})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "locations": out})
 	return nil
