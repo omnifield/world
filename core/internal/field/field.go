@@ -75,13 +75,17 @@ type Announce struct {
 	Gives string `json:"gives"`
 }
 
-// Joined — ответ двери на вход: где локация теперь достижима.
+// Joined — ответ двери на вход: где локация теперь достижима и ЧТО это было.
 type Joined struct {
 	Location door.Location `json:"location"`
 	Route    string        `json:"route"`
-	// Created=false — локация переобъявилась (рестарт, уточнённое описание).
-	// Это НЕ ошибка, а подтверждение присутствия (`tasker:WORLD-84`).
+	// Created=false — локация уже была в поле. Поле осталось прежним ради тех,
+	// кто читал только его; чем именно кончился вход, называет Outcome.
 	Created bool `json:"created"`
+	// Outcome — исход входа: created · confirmed · returned (`tasker:WORLD-81`).
+	// Возвращение (то же место по новому адресу) в флаг Created не влезает, а
+	// напечатать его человеку надо иначе, чем первый вход.
+	Outcome door.Outcome `json:"outcome"`
 }
 
 // Client — дверь, какой её видит локация.
@@ -151,6 +155,16 @@ func (c *Client) Join(a Announce) (*Joined, error) {
 	if err := json.Unmarshal(raw, &out); err != nil || out.Route == "" {
 		return nil, notADoor(c.door, http.StatusOK, raw,
 			"ответ на регистрацию не содержит маршрута")
+	}
+	if out.Outcome == "" {
+		// Дверь старше этой редакции: трёх исходов она не называет. Локация и
+		// дверь — РАЗНЫЕ образы с разной судьбой (`kb:WORLD-53`), и новый образ
+		// локации законно приезжает к старой двери. Выводим исход из прежнего
+		// поля, а не молчим: молчание напечаталось бы как «вошла».
+		out.Outcome = door.OutcomeCreated
+		if !out.Created {
+			out.Outcome = door.OutcomeConfirmed
+		}
 	}
 	return &out, nil
 }

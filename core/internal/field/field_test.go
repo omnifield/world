@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,18 +18,38 @@ import (
 
 func fixedNow() time.Time { return time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC) }
 
+// идущиеЧасы — время, которое ИДЁТ: на застывших часах «в поле с» и «вернулась»
+// совпадают, и проба тождества места не отличила бы сохранённую историю от
+// переписанной заново.
+func идущиеЧасы() func() time.Time {
+	var mu sync.Mutex
+	т := fixedNow()
+	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		т = т.Add(time.Minute)
+		return т
+	}
+}
+
 func молча(string, ...any) {}
 
 // дверь поднимает НАСТОЯЩУЮ дверь с настоящей пробой адреса. Заглушка здесь
 // была бы подделкой проверки: половина отказов клиента — это отказы двери,
 // и проверять их на выдуманном ответе значит проверять свою же выдумку.
 func дверь(t *testing.T) string {
+	return дверьСЧасами(t, fixedNow)
+}
+
+// дверьСЧасами — та же дверь с идущими часами: «в поле с» и «вернулась» на
+// застывшем времени неразличимы, и проба тождества позеленела бы впустую.
+func дверьСЧасами(t *testing.T, now func() time.Time) string {
 	t.Helper()
 	reg, err := door.Open(filepath.Join(t.TempDir(), "field", "locations.json"))
 	if err != nil {
 		t.Fatalf("реестр локаций не поднялся: %v", err)
 	}
-	h := door.NewHandler(reg, молча, fixedNow, door.DialProbe(2*time.Second))
+	h := door.NewHandler(reg, молча, now, door.DialProbe(2*time.Second))
 
 	mux := http.NewServeMux()
 	mux.Handle(door.Prefix, h)
@@ -40,10 +61,18 @@ func дверь(t *testing.T) string {
 
 // локация — живой сторож, каким его увидит дверь.
 func локация(t *testing.T, имя string) string {
+	адрес, _ := локацияСоСносом(t, имя)
+	return адрес
+}
+
+// локацияСоСносом — та же живая локация, но её можно СНЕСТИ посреди прогона:
+// пересоздание контейнера иначе не изобразить, а тождество места проверяется
+// именно им (`tasker:WORLD-81`).
+func локацияСоСносом(t *testing.T, имя string) (адрес string, снести func()) {
 	t.Helper()
 	srv := httptest.NewServer(guard.New(имя, "проба присутствия", молча, fixedNow))
 	t.Cleanup(srv.Close)
-	return strings.TrimPrefix(srv.URL, "http://")
+	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
 }
 
 // мёртвыйАдрес — адрес, по которому ГАРАНТИРОВАННО никого нет: слушатель поднят
@@ -143,6 +172,86 @@ func TestПовторныйВходТемЖеАдресомПодтвержда�
 	}
 	if второй.Created {
 		t.Errorf("повторный вход выдан за регистрацию — по этому полю печатается «вошла», а она уже была в поле")
+	}
+	if второй.Outcome != door.OutcomeConfirmed {
+		t.Errorf("исход: получено %q, ожидалось %q", второй.Outcome, door.OutcomeConfirmed)
+	}
+}
+
+// Пересоздали контейнер — адрес другой, место ТО ЖЕ (`tasker:WORLD-81`). Клиент
+// обязан донести исход до печати: «вошла» вместо «вернулась» это ровно та ложь,
+// ради которой задача и делалась.
+func TestВозвращениеПоНовомуАдресуДоезжаетДоКлиента(t *testing.T) {
+	идут := идущиеЧасы()
+	c := клиент(дверьСЧасами(t, идут))
+	прежний, снести := локацияСоСносом(t, "probe-loc")
+
+	первый, err := c.Join(Announce{Name: "probe-loc", Addr: прежний, Gives: "проба входа в поле"})
+	if err != nil {
+		t.Fatalf("первый вход: %v", err)
+	}
+
+	// Пересоздание: прежний контейнер снесён, новый встал по другому адресу.
+	снести()
+	новый := локация(t, "probe-loc")
+	вернулись, err := c.Join(Announce{Name: "probe-loc", Addr: новый, Gives: "проба входа в поле"})
+	if err != nil {
+		t.Fatalf("возвращение отвергнуто, а это то же место: %v", err)
+	}
+
+	if вернулись.Outcome != door.OutcomeReturned {
+		t.Fatalf("исход: получено %q, ожидалось %q", вернулись.Outcome, door.OutcomeReturned)
+	}
+	if вернулись.Location.Since != первый.Location.Since {
+		t.Errorf("время первого входа: получено %q, ожидалось %q", вернулись.Location.Since, первый.Location.Since)
+	}
+	if вернулись.Location.Returned == "" {
+		t.Error("метка возвращения пуста — по ней печатается «вернулась», и без неё это снова просто вход")
+	}
+	if вернулись.Location.Addr != новый {
+		t.Errorf("адрес: получено %q, ожидалось %q", вернулись.Location.Addr, новый)
+	}
+
+	// В поле по-прежнему ОДНА локация: вторая записью рядом — это ровно то, чего
+	// не должно случиться.
+	поле, err := c.Who()
+	if err != nil {
+		t.Fatalf("список поля не прочитан: %v", err)
+	}
+	if len(поле) != 1 || поле[0].Addr != новый {
+		t.Errorf("в поле: получено %+v, ожидалась одна probe-loc по новому адресу", поле)
+	}
+}
+
+// Дверь старше этой редакции исхода не называет: локация и дверь — разные
+// образы с разной судьбой, и новый образ законно приезжает к старой двери.
+// Молчание тогда печаталось бы как «вошла».
+func TestОтветБезИсходаВыводитсяИзПрежнегоПоля(t *testing.T) {
+	tests := []struct {
+		name    string
+		тело    string
+		ожидали door.Outcome
+	}{
+		{"создание", `{"created":true,"route":"/probe-loc/","location":{"name":"probe-loc"}}`, door.OutcomeCreated},
+		{"подтверждение", `{"created":false,"route":"/probe-loc/","location":{"name":"probe-loc"}}`, door.OutcomeConfirmed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			старая := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, tt.тело)
+			}))
+			t.Cleanup(старая.Close)
+
+			c := клиент(strings.TrimPrefix(старая.URL, "http://"))
+			вошли, err := c.Join(Announce{Name: "probe-loc", Addr: локация(t, "probe-loc"), Gives: "проба"})
+			if err != nil {
+				t.Fatalf("вход: %v", err)
+			}
+			if вошли.Outcome != tt.ожидали {
+				t.Errorf("исход: получено %q, ожидалось %q", вошли.Outcome, tt.ожидали)
+			}
+		})
 	}
 }
 
