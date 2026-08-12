@@ -269,6 +269,10 @@ $(printf '\033[1;32m✓ локация «%s» в поле\033[0m' "$WORLD_NAME")
   журнал локации      docker compose -p $PROJECT -f deploy/location-compose.yaml logs -f
   снять с поля        ./deploy/location-down.sh$CONFIG_KEY
 
+  чем место располагает изначально — ЛАНДШАФТ, а не инструменты:
+    git · node с npm · curl · ca-certificates       посмотреть: docker exec $CID git --version
+    склад под застройку  /place  (том ${PROJECT}_place — переживает пересоздание контейнера)
+
   внутри локации сейчас стоит СТОРОЖ и больше ничего — это законное состояние, а не
   недоделка: место существует, стройка внутри него идёт отдельно и может не идти вовсе.
 GOTOVO
