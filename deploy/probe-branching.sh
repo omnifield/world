@@ -622,7 +622,7 @@ else
     # Запрещённое перечислено поимённо: это другая схема локации, и заводится она под
     # задачу. Базовый ландшафт, растущий «на всякий случай», превращается во «всё сразу».
     extra=
-    for pkg in pnpm yarn python python3 go openssh-client; do
+    for pkg in pnpm yarn python python3 go openssh-client bash; do
         case "$apk" in *" $pkg"*) extra="$extra $pkg" ;; esac
     done
     [ -z "$extra" ] && good "сверх четырёх ничего не тащим" \
@@ -648,9 +648,23 @@ fi
 # Сторож бежит не из-под root, а писать в склад обязан именно он. Права каталога докер
 # переносит на пустой том при первом монтировании — не отдай мы каталог пользователю здесь,
 # том приехал бы принадлежащим root, и стройка отказала бы `build-dir-unusable`.
+# in_dockerfile <команда> <путь> — назван ли путь в аргументах такой команды образа.
+# Смотрим ПОСПИСОЧНО, а не «строка целиком совпала»: каталогов в одной команде может быть
+# несколько (`mkdir -p /home/world /place`), и сверка целой строкой краснела бы от порядка
+# слов — то есть стерегла бы форму записи вместо свойства.
+in_dockerfile() {
+    local cmd="$1" want="$2" line rest
+    while IFS= read -r line; do
+        case "$line" in *"$cmd"*) ;; *) continue ;; esac
+        rest=" ${line#*"$cmd"} "
+        case "$rest" in *" $want "*) return 0 ;; esac
+    done < "$HERE/Dockerfile.location"
+    return 1
+}
+
 part "24c. каталог стройки создан в образе и отдан пользователю сторожа"
-if grep -q "mkdir -p ${build_dir:-/place}" "$HERE/Dockerfile.location" \
-   && grep -q "chown world:world ${build_dir:-/place}" "$HERE/Dockerfile.location"; then
+if in_dockerfile 'mkdir -p' "${build_dir:-/place}" \
+   && in_dockerfile 'chown world:world' "${build_dir:-/place}"; then
     good "каталог создаётся и отдаётся world:world"
 else
     bad "каталог стройки не создан в образе либо не отдан пользователю world"
@@ -672,6 +686,40 @@ if grep -E '\$\{COMPOSE\[@\]\}" down' "$HERE/location-down.sh" | grep -q -- ' -v
 else
     good "склад снятие переживает; стереть его — отдельное действие"
 fi
+
+# ================================================================== 24f. МЕСТО ЖИЛОЕ
+# Инструменты без человека бесполезны: юзер строит на месте руками (`WORLD2` 1.0), и войти
+# он обязан МОЧЬ. На живом это стоило трёх упоров подряд (`tasker:WORLD-106`): дом записан
+# в паспорте, а каталога нет; оболочка `/sbin/nologin`; правки по живому контейнеру от root,
+# умирающие при первом пересоздании. Здесь стережётся объявленное в образе — живой вход
+# проверяет `probe-location.sh`.
+part "24f. в место можно войти работать: дом и живая оболочка"
+passwd_line=$(grep -n 'adduser' "$HERE/Dockerfile.location" | head -n1)
+case "$passwd_line" in
+    *'/sbin/nologin'*) bad "оболочка пользователя — /sbin/nologin: терминал в месте не стартует" ;;
+    *'-s /bin/sh'*)    good "оболочка пользователя — /bin/sh" ;;
+    *)                 bad "оболочка пользователя в образе не названа: ${passwd_line:-<adduser не найден>}" ;;
+esac
+case "$passwd_line" in
+    *'-H'*)             bad "дом пользователя не создаётся (-H): редактор упрётся в Permission denied" ;;
+    *'-h /home/world'*) good "дом пользователя объявлен: /home/world" ;;
+    *)                  bad "дом пользователя в образе не объявлен" ;;
+esac
+if in_dockerfile 'mkdir -p' /home/world && in_dockerfile 'chown world:world' /home/world; then
+    good "дом создан в образе и отдан world:world"
+else
+    bad "дом не создан в образе либо не отдан пользователю — вход в место упрётся в права"
+fi
+grep -q 'HOME="/home/world"' "$HERE/Dockerfile.location" \
+    && good "HOME назван явно — на него смотрят оболочка и редактор" \
+    || bad "HOME в образе не назван: редактор снова упрётся в пустой дом"
+
+# Дом и оболочка — про ЧЕЛОВЕКА, который входит. Служба как бежала не из-под root, так и
+# бежит: дай мы ей root «заодно», место стало бы удобнее ровно один раз.
+part "24g. сторож по-прежнему бежит не из-под root"
+grep -qE '^USER world' "$HERE/Dockerfile.location" \
+    && good "USER world в образе на месте" \
+    || bad "в образе локации нет USER world — сторож побежит из-под root"
 
 # ================================================================== 25. АДРЕС ЗАСТРОЙКИ
 # Мир не сканирует место и не угадывает: где внутри места стоит застройка — ЗАЯВЛЯЕТСЯ
