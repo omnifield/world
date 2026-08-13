@@ -662,9 +662,21 @@ in_dockerfile() {
     return 1
 }
 
+# owned_by_world <путь> — отдан ли путь пользователю сторожа. Отдельно от `in_dockerfile`
+# потому, что у `chown` бывают ключи (`-R`), и «команда» тут не начало строки, а её суть:
+# сверять надо, кому и что отдали, а не как записали.
+owned_by_world() {
+    local want="$1" line rest
+    while IFS= read -r line; do
+        case "$line" in *chown*world:world*) ;; *) continue ;; esac
+        rest=" ${line#*world:world} "
+        case "$rest" in *" $want "*) return 0 ;; esac
+    done < "$HERE/Dockerfile.location"
+    return 1
+}
+
 part "24c. каталог стройки создан в образе и отдан пользователю сторожа"
-if in_dockerfile 'mkdir -p' "${build_dir:-/place}" \
-   && in_dockerfile 'chown world:world' "${build_dir:-/place}"; then
+if in_dockerfile 'mkdir -p' "${build_dir:-/place}" && owned_by_world "${build_dir:-/place}"; then
     good "каталог создаётся и отдаётся world:world"
 else
     bad "каталог стройки не создан в образе либо не отдан пользователю world"
@@ -705,7 +717,7 @@ case "$passwd_line" in
     *'-h /home/world'*) good "дом пользователя объявлен: /home/world" ;;
     *)                  bad "дом пользователя в образе не объявлен" ;;
 esac
-if in_dockerfile 'mkdir -p' /home/world && in_dockerfile 'chown world:world' /home/world; then
+if in_dockerfile 'mkdir -p' /home/world && owned_by_world /home/world; then
     good "дом создан в образе и отдан world:world"
 else
     bad "дом не создан в образе либо не отдан пользователю — вход в место упрётся в права"
@@ -720,6 +732,101 @@ part "24g. сторож по-прежнему бежит не из-под root"
 grep -qE '^USER world' "$HERE/Dockerfile.location" \
     && good "USER world в образе на месте" \
     || bad "в образе локации нет USER world — сторож побежит из-под root"
+
+# ================================================================== 24h. МЕСТО-МАСТЕРСКАЯ
+# Жилое место — ещё не мастерская: в нём надо чем-то РАБОТАТЬ. Инструменты приносит юзер
+# (`WORLD2` 0.1 — мир не изготовитель, руки это юзер), а связка ключей приходит с ним из его
+# пространства (`3.0`). Живой упор 2026-08-13 (`tasker:WORLD-108`): ключей в месте не видно,
+# `npm i -g` падает `EACCES`, редактор открывает не тот каталог.
+part "24h. инструменты ставятся без root: префикс npm в доме и в PATH"
+prefix=$(sed -n 's/.*NPM_CONFIG_PREFIX="\([^"]*\)".*/\1/p' "$HERE/Dockerfile.location" | head -n1)
+if [ -z "$prefix" ]; then
+    bad "префикс npm в образе не задан — npm i -g уйдёт в /usr/local и упрётся в EACCES"
+else
+    case "$prefix" in
+        /home/world/*) good "префикс npm в доме пользователя: $prefix" ;;
+        *) bad "префикс npm вне дома пользователя ($prefix) — писать туда world не сможет" ;;
+    esac
+    # `PATH` образа — для неинтерактивной оболочки (`docker exec … sh -c`), профиль — для
+    # логина (терминал редактора). Одного мало: без первого не найдёт `docker exec`, без
+    # второго — терминал, и оба раза это выглядит как «поставилось, но не работает».
+    path_line=$(sed -n 's/.*PATH="\([^"]*\)".*/\1/p' "$HERE/Dockerfile.location" | head -n1)
+    case ":$path_line:" in
+        *":$prefix/bin:"*) good "каталог префикса в PATH образа" ;;
+        *) bad "каталог префикса не в PATH образа: ${path_line:-<PATH не задан>}" ;;
+    esac
+    # Спрашиваем ДВА разных факта, и оба точечно: что профиль вообще пишется и что в нём
+    # именно наш префикс. Ищи мы «есть ли где-то в файле слово profile.d и где-то путь» —
+    # проверка зеленела бы на осиротевшем `mkdir` и на упоминании в комментарии.
+    grep -q '> /etc/profile.d/' "$HERE/Dockerfile.location" \
+        && good "профиль для оболочки-логина пишется" \
+        || bad "профиль для оболочки-логина не пишется — терминал редактора поставленного не найдёт"
+    grep -qF "export PATH=$prefix/bin" "$HERE/Dockerfile.location" \
+        && good "и в профиле именно каталог префикса" \
+        || bad "в профиле нет каталога префикса ($prefix/bin) — PATH логина соберётся без него"
+    in_dockerfile 'mkdir -p' "$prefix" \
+        && good "каталог префикса создан в образе" \
+        || bad "каталог префикса в образе не создан"
+fi
+
+# Чем открывать место, знает САМО МЕСТО: метку читает привязка редактора, и настраивать у
+# себя человеку нечего. Пустая метка вернула бы ровно тот случай, с которого начали, —
+# редактор открывает дом, а работать надо в складе.
+part "24i. метка для редактора: заходит от world и сразу в склад"
+# Ищем ОБЪЯВЛЕНИЕ, а не упоминание: про метку сказано и в комментарии рядом, и первым
+# совпадением идёт именно он — сверяли бы мы комментарий, проверка молча стерегла бы текст.
+meta=$(grep -n '^LABEL devcontainer\.metadata' "$HERE/Dockerfile.location" | head -n1)
+if [ -z "$meta" ]; then
+    bad "метки devcontainer.metadata в образе нет — редактор откроет дом и от кого попало"
+else
+    case "$meta" in *'"remoteUser":"world"'*) good "remoteUser: world" ;;
+        *) bad "в метке не сказано remoteUser: world" ;; esac
+    case "$meta" in *'"workspaceFolder":"/place"'*) good "workspaceFolder: /place" ;;
+        *) bad "в метке не сказан workspaceFolder: /place — редактор откроет не склад" ;; esac
+fi
+
+# Связка ключей — состояние ПРОСТРАНСТВА ЮЗЕРА, и месту она доступна только вниз. Проверяем
+# три свойства надстройки: она только для чтения · том берётся готовый (внешний) · её нет в
+# основном файле запуска, то есть без имени в конфиге место поднимается как раньше.
+part "24j. связка ключей: надстройка, только чтение, том готовый"
+SECRETS_FILE="$HERE/location-secrets.yaml"
+if [ ! -f "$SECRETS_FILE" ]; then
+    bad "надстройки location-secrets.yaml нет — связку ключей месту не подключить"
+else
+    mount_line=$(grep -n 'secrets:/' "$SECRETS_FILE" | head -n1)
+    case "$mount_line" in
+        *':ro'*) good "связка монтируется только для чтения" ;;
+        '')      bad "в надстройке нет монтирования связки" ;;
+        *)       bad "связка монтируется НА ЗАПИСЬ — место начнёт владеть чужим состоянием: $mount_line" ;;
+    esac
+    grep -qE '^[[:space:]]*external:[[:space:]]*true' "$SECRETS_FILE" \
+        && good "том берётся готовый (external) — опечатка в имени станет отказом, а не пустым томом" \
+        || bad "том не объявлен внешним: опечатка заведёт пустой том, и связка «будет на месте» пустой"
+    grep -q 'secrets' "$HERE/location-compose.yaml" \
+        && bad "связка просочилась в основной файл запуска — место без неё перестанет подниматься" \
+        || good "в основном файле запуска связки нет: без имени в конфиге место встаёт как раньше"
+fi
+
+part "24k. связка названа → надстройка подключается, не названа → нет"
+loc_config 'WORLD_NAME=probe-place' 'WORLD_GIVES=проба' 'WORLD_SECRETS=omnifield-secrets'
+STUB_HAVE_LOC_IMAGE=1 STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
+    run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
+called "location-secrets.yaml"                     # надстройка уехала в вызов компоуза
+said "связка ключей omnifield-secrets приехала"    # и подъём сказал об этом человеку
+said "только чтение"
+
+loc_config 'WORLD_NAME=probe-place' 'WORLD_GIVES=проба'
+STUB_HAVE_LOC_IMAGE=1 STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
+    run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
+not_called "location-secrets.yaml"                 # без имени надстройки нет вовсе
+said "связки ключей не назвали"                    # и это сказано, а не проглочено
+
+# Снятие обязано видеть ТОТ ЖЕ состав файлов, что и подъём: разойдись они — компоуз считал
+# бы проектом не то же самое, и снятие оставило бы за собой контейнер.
+part "24l. снятие видит ту же надстройку, что и подъём"
+loc_config 'WORLD_NAME=probe-place' 'WORLD_GIVES=проба' 'WORLD_SECRETS=omnifield-secrets'
+run_case 0 "$HERE/location-down.sh" --config "$LOC_CFG"
+called "location-secrets.yaml"
 
 # ================================================================== 25. АДРЕС ЗАСТРОЙКИ
 # Мир не сканирует место и не угадывает: где внутри места стоит застройка — ЗАЯВЛЯЕТСЯ
