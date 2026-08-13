@@ -291,4 +291,11 @@ $(printf '\033[1;32m✓ локация «%s» в поле\033[0m' "$WORLD_NAME")
     git · node с npm · curl · ca-certificates       посмотреть: docker exec $CID git --version
     склад под застройку  /place  (том ${PROJECT}_place — переживает пересоздание контейнера)
 
+  ВОЙТИ В МЕСТО И РАБОТАТЬ РУКАМИ — место жилое, вход не от root:
+    docker exec -it $CID sh        и там: cd /place
+    правки делай в /place — всё, что вне тома, живёт до пересоздания контейнера
+    редактором: VS Code → Attach to Running Container (окно должно быть запущено
+    там, где есть докер). Git Bash подменяет пути вида /place — пиши //place
+    либо MSYS_NO_PATHCONV=1. Подробности: deploy/README.md, «Как войти в место»
+
 GOTOVO
