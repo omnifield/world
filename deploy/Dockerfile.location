@@ -52,6 +52,17 @@ LABEL org.opencontainers.image.title="omnifield location" \
       org.opencontainers.image.description="Локация поля: сторож «я здесь» и вход в поле одной командой" \
       org.opencontainers.image.source="https://github.com/omnifield/world"
 
+# Метка для редактора: чем открывать место, знает САМО МЕСТО, а не машина человека.
+# Привязка (VS Code → Attach to Running Container) читает `devcontainer.metadata` из образа
+# и заходит сразу тем пользователем и в тот каталог, которые здесь названы, — иначе каждый
+# настраивает это у себя, и каждый по-своему (живой упор: редактор открывал `/home/world`,
+# а работать надо в складе, `tasker:WORLD-108`).
+#
+# `remoteUser: world` — тот же пользователь, под которым бежит сторож: root здесь не нужен
+# и не даётся. `workspaceFolder: /place` — склад под застройку, единственное, что лежит на
+# томе: открытый дом означал бы работу во времянке (`WORLD2` 1.9).
+LABEL devcontainer.metadata='[{"remoteUser":"world","workspaceFolder":"/place"}]'
+
 # ------------------------------------------------------------------ ЛАНДШАФТ МЕСТА
 # То, что есть на месте ИЗНАЧАЛЬНО. Это не инструменты: мир не изготовил `git` и не выдаёт
 # его — он задаёт, каким место РОЖДАЕТСЯ (`tasker:WORLD-102`). Пустое место, на котором
@@ -97,8 +108,9 @@ RUN apk add --no-cache git nodejs npm ca-certificates curl
 # который входит, а не про права службы.
 RUN addgroup -S world \
  && adduser -S -G world -h /home/world -s /bin/sh world \
- && mkdir -p /home/world /place \
- && chown world:world /home/world /place
+ && mkdir -p /home/world /home/world/.npm-global /home/world/.secrets /place \
+ && chown -R world:world /home/world \
+ && chown world:world /place
 
 COPY --from=core /out/world /app/world
 
@@ -125,9 +137,29 @@ COPY --from=core /out/world /app/world
 # `HOME` назван явно рядом с ними: докер берёт его из паспорта пользователя не во всех
 # случаях, а редактор и оболочка на него смотрят. Пустой `HOME` — это ровно то падение,
 # с которого началась `tasker:WORLD-106`.
+#
+# ИНСТРУМЕНТЫ В МЕСТО ПРИНОСИТ ЮЗЕР, и место обязано позволять их СТАВИТЬ, а не только
+# смотреть (`WORLD2` 0.1: мир не изготовитель, руки — это юзер; 2.4: ландшафт задаёт, каким
+# место рождается). Без префикса `npm i -g` уходит в `/usr/local/lib/node_modules`, который
+# принадлежит root, и падает `EACCES` — то есть инструмент в место не поставить вовсе
+# (живой упор 2026-08-13, `tasker:WORLD-108`). Префикс — в доме пользователя, его каталог —
+# в `PATH` образа, значит виден и неинтерактивной оболочке (`docker exec … sh -c`).
+#
+# Поставленное этим способом — ВРЕМЯНКА (`WORLD2` 1.9): дом не на томе, и пересоздание
+# контейнера уносит его. Это осознанно: инструмент ставится заново одной командой, а на
+# томе живёт то, что построено (`/place`).
 ENV WORLD_ADDR=":8080" \
     WORLD_BUILD_DIR="/place" \
-    HOME="/home/world"
+    HOME="/home/world" \
+    NPM_CONFIG_PREFIX="/home/world/.npm-global" \
+    PATH="/home/world/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Оболочка-логин собирает `PATH` заново из `/etc/profile`, и `ENV` выше до неё не доезжает:
+# терминал редактора запускается именно так. Без этой строки `npm i -g` проходил бы, а
+# поставленное «не находилось» — отказ без причины на ровном месте.
+RUN mkdir -p /etc/profile.d \
+ && printf '%s\n' 'export PATH=/home/world/.npm-global/bin:$PATH' \
+    > /etc/profile.d/npm-global.sh
 
 USER world
 # Рабочий каталог СЛУЖБЫ — там лежит её бинарь. Человек, вошедший в место, работает не

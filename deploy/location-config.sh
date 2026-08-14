@@ -13,6 +13,8 @@
 #   WORLD_NAME · WORLD_GIVES · WORLD_DOOR · WORLD_NET   значения конфига (экспортированы)
 #   WORLD_BUILD_ADDR                                    то же, необязательное: где внутри
 #                                                       места стоит застройка (пусто — нет)
+#   WORLD_SECRETS                                       то же, необязательное: имя тома со
+#                                                       связкой ключей юзера (пусто — нет)
 #   PROJECT                                             имя компоуз-проекта локации
 #   COMPOSE[@]                                          вызов компоуза с этим конфигом
 #   CONFIG_KEY                                          « --config ФАЙЛ» для подсказок, если
@@ -33,8 +35,8 @@ SERVICE=world-location   # имя службы в файле запуска; а�
 
 env_name="${WORLD_NAME:-}"; env_gives="${WORLD_GIVES:-}"
 env_door="${WORLD_DOOR:-}"; env_net="${WORLD_NET:-}"
-env_build_addr="${WORLD_BUILD_ADDR:-}"
-WORLD_NAME=; WORLD_GIVES=; WORLD_DOOR=; WORLD_NET=; WORLD_BUILD_ADDR=
+env_build_addr="${WORLD_BUILD_ADDR:-}"; env_secrets="${WORLD_SECRETS:-}"
+WORLD_NAME=; WORLD_GIVES=; WORLD_DOOR=; WORLD_NET=; WORLD_BUILD_ADDR=; WORLD_SECRETS=
 
 lineno=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -56,7 +58,7 @@ while IFS= read -r line || [ -n "$line" ]; do
         "'"*"'") value="${value#\'}"; value="${value%\'}" ;;
     esac
     case "$key" in
-        WORLD_NAME|WORLD_GIVES|WORLD_DOOR|WORLD_NET|WORLD_BUILD_ADDR) printf -v "$key" '%s' "$value" ;;
+        WORLD_NAME|WORLD_GIVES|WORLD_DOOR|WORLD_NET|WORLD_BUILD_ADDR|WORLD_SECRETS) printf -v "$key" '%s' "$value" ;;
         *) warn "строка $lineno: ключ $key конфигу локации неизвестен, он его не читает" ;;
     esac
 done < "$CONFIG"
@@ -64,7 +66,7 @@ done < "$CONFIG"
 # Конфиг СИЛЬНЕЕ окружения — и молчать об этом нельзя: человек, экспортировавший переменную,
 # должен узнать, что победил файл, здесь, а не по чужому имени в поле.
 for pair in "WORLD_NAME:$env_name" "WORLD_GIVES:$env_gives" "WORLD_DOOR:$env_door" "WORLD_NET:$env_net" \
-            "WORLD_BUILD_ADDR:$env_build_addr"; do
+            "WORLD_BUILD_ADDR:$env_build_addr" "WORLD_SECRETS:$env_secrets"; do
     var="${pair%%:*}"; was="${pair#*:}"
     [ -n "$was" ] || continue
     [ "$was" != "${!var}" ] || continue
@@ -97,13 +99,22 @@ WORLD_NET="${WORLD_NET:-omnifield-gateway}"
 # (`core/README.md`, канон `WORLD2` 1.0). Пусто здесь значит «не заявлено» — маршрут места
 # отвечает присутствием сторожа, как и до появления этой настройки. Подставить сюда что-то
 # «разумное» значило бы завести маршрут в вещь, которой человек не поднимал.
-export WORLD_NAME WORLD_GIVES WORLD_DOOR WORLD_NET WORLD_BUILD_ADDR
+# У связки ключей умолчания тоже нет: назвать том за человека значило бы подключить месту
+# состояние, которого он не давал. Место без связки законно — оно просто отрезано от его
+# гита и складов, и это его выбор, а не отказ (`WORLD2` 3.0).
+export WORLD_NAME WORLD_GIVES WORLD_DOOR WORLD_NET WORLD_BUILD_ADDR WORLD_SECRETS
 
 # Имя проекта — по имени локации, и это единственное, что разводит две локации на одной
 # машине. Без него компоуз взял бы имя каталога (`deploy`), и вторая локация молча заменила
 # бы первую: для компоуза это была бы та же служба того же проекта.
 PROJECT="world-loc-$WORLD_NAME"
 COMPOSE=("docker" "compose" "-p" "$PROJECT" "--env-file" "$CONFIG" "-f" "$HERE/location-compose.yaml")
+
+# Связка ключей приезжает НАДСТРОЙКОЙ, вторым `-f`, и только когда она названа: монтирование
+# в компоузе не бывает условным (довод целиком — в шапке `location-secrets.yaml`). Надстройку
+# добавляют ОБА скрипта, потому что вызов компоуза у них общий: разойдись они — снятие
+# смотрело бы на другой состав файлов, чем подъём.
+[ -z "$WORLD_SECRETS" ] || COMPOSE+=("-f" "$HERE/location-secrets.yaml")
 
 # Конфиг не умолчальный — значит все дальнейшие подсказки обязаны его называть: команда,
 # в которой конфиг не назван, поднимет и снимет ДРУГУЮ локацию.
