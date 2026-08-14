@@ -1,0 +1,317 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/omnifield/world/control/internal/run"
+)
+
+// Ручки проверяются ЦЕЛИКОМ, вместе с формой ответа: пульт (`web`) делается по этой же
+// таблице, и разъехавшаяся форма — это не косметика, а неработающий вход.
+
+type стенд struct {
+	*httptest.Server
+	fake  *run.Fake
+	keys  string
+	scope string
+	log   []string
+}
+
+func поднять(t *testing.T, answer func(run.Command) (run.Result, error)) *стенд {
+	t.Helper()
+	dir := t.TempDir()
+	st := &стенд{
+		fake:  &run.Fake{Answer: answer},
+		keys:  filepath.Join(dir, "keys"),
+		scope: filepath.Join(dir, "scope"),
+	}
+	h := New(Options{
+		Runner:     st.fake,
+		RemoteSh:   "/opt/world/deploy/remote.sh",
+		Docker:     "docker",
+		KeysDir:    st.keys,
+		DoorPort:   8080,
+		SSHTimeout: 5,
+		Now:        func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) },
+		NewToken:   func() (string, error) { return "метка", nil },
+		Logf:       func(f string, a ...any) { st.log = append(st.log, f) },
+	})
+	st.Server = httptest.NewServer(h)
+	t.Cleanup(st.Close)
+	return st
+}
+
+func (s *стенд) зов(t *testing.T, method, path, body, token string) (int, map[string]any) {
+	t.Helper()
+	var rd *strings.Reader = strings.NewReader(body)
+	req, err := http.NewRequest(method, s.URL+path, rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("%s %s: ответ не разобрался: %v", method, path, err)
+	}
+	return resp.StatusCode, out
+}
+
+// отказ проверяет, что «нет» сказано ТРОЙКОЙ. Пустое «не получилось» — провал мира.
+func отказ(t *testing.T, body map[string]any, want string) {
+	t.Helper()
+	code, _ := body["code"].(string)
+	why, _ := body["why"].(string)
+	ways, _ := body["ways"].([]any)
+	if code != want {
+		t.Fatalf("код отказа %q вместо %q (%v)", code, want, body)
+	}
+	if strings.TrimSpace(why) == "" {
+		t.Fatalf("отказ %s без причины — человеку нечего чинить", want)
+	}
+	if len(ways) == 0 {
+		t.Fatalf("отказ %s без выхода — тупик (WORLD2 2.3)", want)
+	}
+}
+
+func докерОтвечает(c run.Command) (run.Result, error) {
+	switch {
+	case len(c.Args) > 1 && c.Args[0] == "context":
+		return run.Result{Out: "world-vps\tssh://world@10.8.0.5\n"}, nil
+	case strings.HasSuffix(c.Name, "remote.sh"):
+		return run.Result{}, nil
+	}
+	return run.Result{Out: "healthy"}, nil
+}
+
+// ── вход ─────────────────────────────────────────────────────────────────────
+
+func TestПервыйВходЗаводитЛичностьЗдесь(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+
+	status, body := st.зов(t, "POST", "/api/session",
+		`{"addr":"`+st.scope+`","create":true,"name":"егор","brand":"омнифилд"}`, "")
+	if status != http.StatusCreated {
+		t.Fatalf("вход отдал %d: %v", status, body)
+	}
+	if body["name"] != "егор" || body["brand"] != "омнифилд" || body["created"] != true {
+		t.Fatalf("ответ входа собрался не так: %v", body)
+	}
+	if body["token"] != "метка" {
+		t.Fatalf("метка сессии не отдана — курлом в контроллер не походишь: %v", body)
+	}
+
+	status, body = st.зов(t, "GET", "/api/me", "", "метка")
+	if status != http.StatusOK || body["name"] != "егор" {
+		t.Fatalf("«кто я» отдал %d: %v", status, body)
+	}
+	scope, _ := body["scope"].(map[string]any)
+	if scope["here"] != true {
+		t.Fatalf("скоуп назвался не тем местом: %v", scope)
+	}
+}
+
+func TestБезВходаНиРесурсовНиПолей(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	for _, path := range []string{"/api/me", "/api/resources", "/api/fields"} {
+		status, body := st.зов(t, "GET", path, "", "")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("%s без входа отдал %d: %v", path, status, body)
+		}
+		отказ(t, body, "not-signed-in")
+	}
+	if len(st.fake.Calls()) != 0 {
+		t.Fatalf("контроллер пошёл к докеру, не спросив, кто пришёл: %s", st.fake.Line(0))
+	}
+}
+
+func TestЧужаяМеткаНеПускает(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body := st.зов(t, "GET", "/api/me", "", "не-та-метка")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("чужая метка пустила: %d %v", status, body)
+	}
+	отказ(t, body, "not-signed-in")
+}
+
+func TestВходБезСкоупаПредлагаетЗавестиЕго(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	status, body := st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`"}`, "")
+	if status != http.StatusNotFound {
+		t.Fatalf("ждали «скоупа нет», получили %d: %v", status, body)
+	}
+	отказ(t, body, "no-scope")
+}
+
+func TestКредыКСкоупуЗдесьНеПроглатываютсяМолча(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	status, body := st.зов(t, "POST", "/api/session",
+		`{"addr":"`+st.scope+`","creds":"ключ","create":true,"name":"егор"}`, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("креды к местному скоупу приняты молча: %d %v", status, body)
+	}
+	отказ(t, body, "creds-here")
+}
+
+func TestКредыКЧужомуСкоупуЛожатсяВСвязку(t *testing.T) {
+	st := поднять(t, func(c run.Command) (run.Result, error) {
+		if c.Name == "ssh" {
+			return run.Result{Out: `{"name":"егор","brand":"омнифилд"}`}, nil
+		}
+		return докерОтвечает(c)
+	})
+
+	status, body := st.зов(t, "POST", "/api/session",
+		`{"addr":"world@10.8.0.5:/srv/scope","creds":"-----ключ-----"}`, "")
+	if status != http.StatusOK {
+		t.Fatalf("вход по связи отдал %d: %v", status, body)
+	}
+	if !st.fake.Called("ssh", "-i "+filepath.Join(st.keys, "scope-key")) {
+		t.Fatalf("ssh пошёл не тем ключом: %s", st.fake.Line(0))
+	}
+}
+
+// ── источники ресурса ────────────────────────────────────────────────────────
+
+func TestИсточниковСтановитсяДва(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.5","creds":"ключ"}`, "метка")
+	if status != http.StatusCreated {
+		t.Fatalf("ресурс не добавился: %d %v", status, body)
+	}
+	list, _ := body["resources"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("источников %d, а человек обязан увидеть два: %v", len(list), body)
+	}
+	first, _ := list[0].(map[string]any)
+	if first["here"] != true {
+		t.Fatalf("первым обязан идти ресурс контроллера: %v", first)
+	}
+	if !st.fake.Called("remote.sh", "add", "vps") {
+		t.Fatal("подъём двери написан заново вместо готового")
+	}
+}
+
+func TestСнятиеГоворитЧтоОсталосьНаМашине(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body := st.зов(t, "DELETE", "/api/resources/vps", "", "метка")
+	if status != http.StatusOK {
+		t.Fatalf("снятие отдало %d: %v", status, body)
+	}
+	dropped, _ := body["dropped"].(map[string]any)
+	left, _ := dropped["left"].([]any)
+	if len(left) == 0 {
+		t.Fatalf("сказали «сняли», не назвав оставленного: %v", dropped)
+	}
+}
+
+func TestОтказПодъёмаДоезжаетДоПульта(t *testing.T) {
+	st := поднять(t, func(c run.Command) (run.Result, error) {
+		if strings.HasSuffix(c.Name, "remote.sh") {
+			return run.Result{
+				Out:  "REMOTE-REFUSAL: access-denied\n",
+				Err:  "✗ отказ: ресурс world@10.8.0.5 не принял ключ\n  выход: положи ключ юзеру на той машине\n",
+				Code: 1,
+			}, nil
+		}
+		return докерОтвечает(c)
+	})
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body := st.зов(t, "POST", "/api/resources", `{"name":"vps","addr":"world@10.8.0.5"}`, "метка")
+	if status != http.StatusBadGateway {
+		t.Fatalf("отказ подъёма отдан как %d: %v", status, body)
+	}
+	отказ(t, body, "access-denied")
+	if body["from"] != "deploy/remote.sh" {
+		t.Fatalf("не названо, чей отказ: %v", body)
+	}
+}
+
+// ── поля ─────────────────────────────────────────────────────────────────────
+
+func TestПоляПустыИЗаводятся(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body := st.зов(t, "GET", "/api/fields", "", "метка")
+	fields, _ := body["fields"].([]any)
+	if status != http.StatusOK || len(fields) != 0 {
+		t.Fatalf("список полей: %d %v", status, body)
+	}
+
+	status, body = st.зов(t, "POST", "/api/fields", `{"name":"дом"}`, "метка")
+	if status != http.StatusCreated {
+		t.Fatalf("поле не завелось: %d %v", status, body)
+	}
+	// Говорим вслух, что поле не поднято: молчание тут выглядело бы как «подняли».
+	if note, _ := body["note"].(string); !strings.Contains(note, "не поднимается") {
+		t.Fatalf("не сказано, чего не произошло: %v", body)
+	}
+}
+
+// ── форма ────────────────────────────────────────────────────────────────────
+
+func TestНеТаРучкаИНеТотГлагол(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+
+	status, body := st.зов(t, "GET", "/api/такой-нет", "", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("неизвестная ручка отдала %d", status)
+	}
+	отказ(t, body, "unknown-endpoint")
+
+	status, body = st.зов(t, "PUT", "/api/session", "{}", "")
+	if status != http.StatusMethodNotAllowed {
+		t.Fatalf("не тот глагол отдал %d: %v", status, body)
+	}
+	отказ(t, body, "wrong-method")
+}
+
+func TestКривоеТелоНазываетсяОтдельно(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+
+	_, body := st.зов(t, "POST", "/api/session", "", "")
+	отказ(t, body, "no-body")
+
+	_, body = st.зов(t, "POST", "/api/session", "{это не json", "")
+	отказ(t, body, "bad-body")
+
+	// Лишнее поле — опечатка либо чужой контракт. Принять и промолчать нельзя: молча
+	// проглоченное поле выглядит как сработавшее.
+	_, body = st.зов(t, "POST", "/api/session", `{"addr":"/x","адрес":"/y"}`, "")
+	отказ(t, body, "bad-body")
+}
+
+func TestТрассаПишетсяВсегда(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "GET", "/api/me", "", "")
+	if len(st.log) != 1 {
+		t.Fatalf("строк трассы %d вместо одной: %v", len(st.log), st.log)
+	}
+	for _, want := range []string{"name=", "http=", "refusal=", "dur="} {
+		if !strings.Contains(st.log[0], want) {
+			t.Fatalf("в трассе нет %q: %s", want, st.log[0])
+		}
+	}
+}
