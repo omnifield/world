@@ -27,6 +27,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -36,6 +37,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/omnifield/world/control/internal/pult"
 	"github.com/omnifield/world/control/internal/refusal"
 	"github.com/omnifield/world/control/internal/resource"
 	"github.com/omnifield/world/control/internal/run"
@@ -57,8 +59,11 @@ type Options struct {
 	KeysDir    string
 	DoorPort   int
 	SSHTimeout int
-	Logf       func(string, ...any)
-	Now        func() time.Time
+	// PultDir — где лежит СОБРАННЫЙ пульт. Пусто — раздавать нечего, и контроллер
+	// скажет об этом кодом `no-pult`, а не пустой страницей.
+	PultDir string
+	Logf    func(string, ...any)
+	Now     func() time.Time
 	// NewToken — откуда берётся токен сессии. Подменяется в тестах, чтобы ответ был
 	// предсказуем; в жизни — crypto/rand.
 	NewToken func() (string, error)
@@ -66,9 +71,10 @@ type Options struct {
 
 // Handler — ручки контроллера.
 type Handler struct {
-	opt Options
-	res *resource.Manager
-	mux *http.ServeMux
+	opt  Options
+	res  *resource.Manager
+	pult *pult.Handler
+	mux  *http.ServeMux
 
 	mu   sync.Mutex
 	sess *session
@@ -106,7 +112,8 @@ func New(opt Options) *Handler {
 			KeysDir:  opt.KeysDir,
 			Port:     opt.DoorPort,
 		},
-		mux: http.NewServeMux(),
+		pult: pult.New(opt.PultDir),
+		mux:  http.NewServeMux(),
 	}
 
 	h.mux.HandleFunc("POST /api/session", h.wrap("session", h.postSession))
@@ -122,9 +129,27 @@ func New(opt Options) *Handler {
 	for _, p := range []string{"/api/session", "/api/me", "/api/resources", "/api/resources/{name}", "/api/fields"} {
 		h.mux.HandleFunc(p, h.wrap("wrong-method", wrongMethod))
 	}
-	h.mux.HandleFunc("/", h.wrap("unknown", unknownEndpoint))
+
+	// ГРАНИЦА МЕЖДУ РУЧКАМИ И ПУЛЬТОМ — две строки ниже, и они не симметричны намеренно.
+	//
+	// Всё, что начинается на `/api/`, остаётся ручками ДО КОНЦА: неизвестный путь под этим
+	// префиксом — это промах машины, и отвечать ему страницей нельзя (клиент ждёт JSON и
+	// получил бы HTML). Всё остальное — пульт. Без явного `/api/` пульт перехватывал бы
+	// опечатки в ручках, а человек видел бы «страницы нет» там, где ошибся в имени ручки.
+	//
+	// `/api` без косой черты записан отдельно: без него `ServeMux` отвечает на него
+	// перенаправлением на `/api/`, и клиент получил бы 301 вместо внятного отказа.
+	h.mux.HandleFunc("/api/", h.wrap("unknown", unknownEndpoint))
+	h.mux.HandleFunc("/api", h.wrap("unknown", unknownEndpoint))
+	h.mux.HandleFunc("/", h.wrap("pult", h.servePult))
 
 	return h
+}
+
+// servePult отдаёт лицо для человека. Само лицо зона не рисует — оно приезжает собранным
+// из зоны `web`; здесь только раздача и внятный отказ, когда раздавать нечего.
+func (h *Handler) servePult(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	return h.pult.Serve(w, r)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
@@ -142,7 +167,7 @@ func (h *Handler) wrap(name string, fn func(http.ResponseWriter, *http.Request) 
 		var code string
 		if ref := fn(rec, r); ref != nil {
 			code = ref.Code
-			writeJSON(rec, ref.Status, ref)
+			writeRefusal(rec, r, ref)
 		}
 		if code == "" {
 			code = "-"
@@ -486,6 +511,46 @@ func unknownEndpoint(_ http.ResponseWriter, r *http.Request) *refusal.Refusal {
 		"такой ручки у контроллера нет: "+r.URL.Path,
 		"список ручек — в control/README.md",
 		"их семь: /api/session, /api/me, /api/resources, /api/fields")
+}
+
+// writeRefusal печатает отказ ОДИН И ТОТ ЖЕ, но подаёт его двумя способами: машине —
+// JSON, человеку в браузере — читаемый текст. Источник у обоих один (`*refusal.Refusal`),
+// поэтому разъехаться им нечем: второго текста отказа здесь не пишется.
+//
+// Зачем это вообще понадобилось. Контроллер теперь отдаёт страницу, и человек приходит на
+// него адресной строкой. Пульта в сборке нет — он увидел бы `{"code":"no-pult",…}` и решал
+// бы, что сломался сам контроллер. Пульт же ходит сюда `fetch`, а тот шлёт `Accept: */*` и
+// получает JSON, как и раньше.
+//
+// HTML здесь НЕ рисуется намеренно: лицо для человека — зона `web`, и рисовать своё
+// «красивое» рядом с ним значит завести второе лицо мира. Текст отказа — наше дело,
+// оформление — нет.
+func writeRefusal(w http.ResponseWriter, r *http.Request, ref *refusal.Refusal) {
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		writeJSON(w, ref.Status, ref)
+		return
+	}
+
+	var text strings.Builder
+	fmt.Fprintf(&text, "отказ: %s\n\n%s\n", ref.Code, ref.Why)
+	if ref.From != "" {
+		fmt.Fprintf(&text, "\nэто отказ инструмента %s — код его, не наш\n", ref.From)
+	}
+	if len(ref.Ways) > 0 {
+		text.WriteString("\nвыходы:\n")
+		for _, way := range ref.Ways {
+			fmt.Fprintf(&text, "  · %s\n", way)
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	// Код отказа уезжает и заголовком: браузер показывает текст, а тот, кто смотрит
+	// глазами в инструменты разработчика, видит машинное имя, по которому спросить.
+	w.Header().Set("X-Control-Refusal", ref.Code)
+	w.WriteHeader(ref.Status)
+	if _, err := io.WriteString(w, text.String()); err != nil {
+		log.Printf("control: отказ не записан: %v", err)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

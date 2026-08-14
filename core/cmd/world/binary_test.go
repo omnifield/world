@@ -264,8 +264,8 @@ func TestЖивойОтказДвериНеВидно(t *testing.T) {
 	}
 }
 
-// окружениеДвери — раскладка мира на время пробы: своё состояние поля, свои
-// прогоны, витрины нет (её отсутствие дверь переживает, `tasker:WORLD-34`).
+// окружениеДвери — раскладка мира на время пробы: своё состояние поля и свои
+// прогоны. Больше двери настраивать нечего: лица она не раздаёт.
 func окружениеДвери(t *testing.T, addr string) []string {
 	t.Helper()
 	dir := t.TempDir()
@@ -273,7 +273,6 @@ func окружениеДвери(t *testing.T, addr string) []string {
 		"WORLD_ADDR=" + addr,
 		"WORLD_DOOR_FILE=" + filepath.Join(dir, "field", "locations.json"),
 		"WORLD_STAND_DIR=" + filepath.Join(dir, "stand"),
-		"WORLD_WEB_DIR=" + filepath.Join(dir, "нет-витрины"),
 	}
 }
 

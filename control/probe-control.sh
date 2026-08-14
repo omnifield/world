@@ -64,6 +64,9 @@ BIN="$TMP/control"
 CALLS="$TMP/calls"
 KEYS="$TMP/keys"
 SCOPE="$TMP/scope"
+# Каталог пульта — свой, пустой по умолчанию: «пульта нет» это ЗАКОННОЕ состояние, и
+# проверять его надо ровно так же, как раздачу.
+PULT="$TMP/pult"
 SRV_PID=""
 TOKEN=""
 
@@ -125,6 +128,7 @@ start_server() {
     CALLS="$CALLS" REFUSE_FILE="$TMP/refuse" \
     CONTROL_ADDR="127.0.0.1:$PORT" CONTROL_DOCKER="$docker" CONTROL_REMOTE_SH="$remote" \
     CONTROL_KEYS="$KEYS" CONTROL_SSH_TIMEOUT=2 CONTROL_TOOL_TIMEOUT=20 \
+    CONTROL_PULT="$PULT" \
         "$BIN" > "$TMP/server.log" 2>&1 &
     SRV_PID=$!
 
@@ -155,6 +159,33 @@ call() {
     [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
     [ -n "$body" ] && args+=(--data "$body")
     STATUS="$(curl "${args[@]}" "$BASE$path" 2>/dev/null || echo 000)"
+    BODY="$(cat "$TMP/body" 2>/dev/null || true)"
+}
+
+# put_pult [содержимое index.html] — кладём то, что приезжает из зоны `web` собранным.
+# Содержимое неважно: зона `control` пульт не рисует, она его отдаёт.
+put_pult() {
+    rm -rf "$PULT"; mkdir -p "$PULT/assets"
+    printf '%s' "${1:-<!doctype html>лицо мира}" > "$PULT/index.html"
+    printf '// пульт' > "$PULT/assets/index-XY.js"
+}
+
+# browser МЕТОД ПУТЬ — тот же запрос, но так, как его шлёт адресная строка. Пульт ходит
+# сюда `fetch` (Accept: */*) и обязан по-прежнему получать JSON.
+HEADERS=""
+browser() {
+    STATUS="$(curl -s -X "${1:-GET}" -H 'Accept: text/html' -D "$TMP/headers" \
+        -o "$TMP/body" -w '%{http_code}' "$BASE$2" 2>/dev/null || echo 000)"
+    BODY="$(cat "$TMP/body" 2>/dev/null || true)"
+    HEADERS="$(cat "$TMP/headers" 2>/dev/null || true)"
+}
+
+# raw_get ПУТЬ — запрос путём КАК ЕСТЬ, без нормализации на стороне curl. Нужен ровно для
+# проверки обхода: без `--path-as-is` curl схлопывает `..` сам, и проверка зеленеет, даже
+# если контроллер путь не чистит вовсе. Такая ложно-зелёная проверка уже стоила соседней
+# зоне ревью (`WORLD2-96`, пункт 1) — здесь она закрыта флагом, а не надеждой.
+raw_get() {
+    STATUS="$(curl -s --path-as-is -o "$TMP/body" -w '%{http_code}' "$BASE$1" 2>/dev/null || echo 000)"
     BODY="$(cat "$TMP/body" 2>/dev/null || true)"
 }
 
@@ -270,6 +301,51 @@ green() {
         bad "след после снятия" "ключ остался в связке"
     fi
 
+    part "ЗЕЛЁНЫЙ — пульт раздаётся тем же адресом, что и ручки"
+    put_pult
+    start_server || { bad "подъём контроллера" "процесс не поднялся"; return; }
+
+    call GET /
+    want_status 200 "корень отдаёт пульт"
+    want_has "лицо мира" "по корню приехала страница, а не JSON"
+
+    call GET /assets/index-XY.js
+    want_status 200 "файлы сборки отдаются"
+
+    # Граница ручек и пульта. Перехватит пульт ручку — машина получит страницу вместо
+    # JSON; перехватит ручка пульт — человек увидит JSON вместо лица.
+    call GET /api/me
+    want_refusal not-signed-in "ручка не перехвачена пультом"
+    call GET /api/мее
+    want_refusal unknown-endpoint "опечатка в имени ручки осталась промахом машины"
+    call GET /api
+    want_status 404 "/api отвечает отказом, а не перенаправлением"
+
+    # Настоящий пульт зоны `web`, если он собран рядом. Заглушка проверяет раздачу, а этот
+    # кусок — что раздаётся ИМЕННО ТО, что собирает соседняя зона.
+    if [ -s "$ROOT/web/dist/index.html" ] && ! grep -q '/src/main.tsx' "$ROOT/web/dist/index.html"; then
+        # Каталог пульта на время подменяем настоящим и возвращаем обратно: остальные
+        # проверки работают с заглушкой, и оставить им чужой каталог значит проверять
+        # потом не то, что думаешь.
+        saved_pult="$PULT"; PULT="$ROOT/web/dist"
+        start_server || { bad "подъём с настоящим пультом" "процесс не поднялся"; PULT="$saved_pult"; return; }
+        call GET /
+        want_status 200 "настоящий собранный пульт зоны web раздаётся"
+        asset="$(sed -n 's/.*src="\(\/assets\/[^"]*\)".*/\1/p' "$ROOT/web/dist/index.html" | head -1)"
+        if [ -n "$asset" ]; then
+            call GET "$asset"
+            want_status 200 "файл настоящей сборки ($asset) отдаётся"
+        else
+            skip "файл настоящей сборки" "в index.html не нашлось ссылки на /assets/ — нечего дёрнуть"
+        fi
+        PULT="$saved_pult"
+    else
+        skip "настоящий собранный пульт зоны web" \
+            "рядом нет web/dist со сборкой — проверена только раздача заглушки" \
+            "собрать: ./deploy/build.sh --only-web (для этого шага нужно поле)"
+    fi
+    stop_server
+
     # Шов с зоной `deploy`: имена контекста и контейнера двери — ЕЁ, у нас они повторены.
     # Разъедутся молча — список ресурсов опустеет при живых дверях.
     part "ЗЕЛЁНЫЙ — шов с зоной deploy"
@@ -285,9 +361,19 @@ green() {
             bad "имя двери" "в deploy/remote.sh оно уже другое — «жив ли» будет врать"
         fi
     else
-        skip "шов с deploy" "deploy/remote.sh рядом нет — сверять не с чем"
+        skip "шов с deploy (имена)" "deploy/remote.sh рядом нет — сверять не с чем"
     fi
-    stop_server
+    # Второй шов: откуда образ контроллера берёт собранный пульт. Путь принадлежит зоне
+    # `deploy` (`build.sh`), у нас он повторён в Dockerfile и в up.sh.
+    if [ -f "$ROOT/deploy/build.sh" ]; then
+        if grep -q 'OUT="\$HERE/.build/web-dist"' "$ROOT/deploy/build.sh"; then
+            ok "каталог собранного пульта тот же, что у соседа (deploy/.build/web-dist)"
+        else
+            bad "каталог пульта" "в deploy/build.sh он уже другой — образ контроллера уедет без лица"
+        fi
+    else
+        skip "шов с deploy (каталог пульта)" "deploy/build.sh рядом нет — сверять не с чем"
+    fi
 }
 
 # ------------------------------------------------------------------ красный
@@ -367,6 +453,60 @@ red() {
             ok "недостижимый скоуп назван ступенью связи, а не общим «не получилось»" ;;
         *)  bad "недостижимый скоуп" "ждали ступень связи, получили:" "$BODY" ;;
     esac
+    stop_server
+
+    part "КРАСНЫЙ — пульта нет и пульт не тот"
+    rm -rf "$PULT"
+    start_server || { bad "подъём контроллера" "процесс не поднялся"; return; }
+
+    call GET /
+    want_refusal no-pult "пульта в сборке нет — сказано кодом, а не пустой страницей"
+
+    # Тот же отказ человеку в браузере: читаемым текстом, с тем же кодом в заголовке.
+    browser GET /
+    case "$BODY" in
+        \{*) bad "отказ человеку" "в браузер приехал JSON:" "$BODY" ;;
+        *no-pult*) ok "человеку в браузере отказ приехал читаемым текстом" ;;
+        *)  bad "отказ человеку" "в тексте нет кода отказа:" "$BODY" ;;
+    esac
+    case "$HEADERS" in
+        *"X-Control-Refusal: no-pult"*) ok "машинный код уехал заголовком" ;;
+        *) bad "код в заголовке" "заголовка X-Control-Refusal нет:" "$(printf '%s' "$HEADERS" | head -3)" ;;
+    esac
+    stop_server
+
+    # Исходник вместо сборки — отдельный отказ: он открывается и НЕ ПОКАЗЫВАЕТ НИЧЕГО,
+    # и человек ищет поломку в мире, а не в раскладке.
+    put_pult '<script type="module" src="/src/main.tsx"></script>'
+    start_server || { bad "подъём контроллера" "процесс не поднялся"; return; }
+    call GET /
+    want_refusal pult-not-built "исходник зоны web вместо сборки назван отдельно"
+    stop_server
+
+    put_pult
+    start_server || { bad "подъём контроллера" "процесс не поднялся"; return; }
+    call GET /assets/
+    want_refusal unknown-page "каталог не листается"
+    case "$BODY" in
+        *index-XY.js*) bad "список файлов" "перечень файлов образа уехал наружу: $BODY" ;;
+        *) ok "перечня файлов в ответе нет" ;;
+    esac
+
+    # Обход пути. Проверка стережёт ИТОГ ВСЕЙ СТОЙКИ, а не одну мою строку: `..` чистят
+    # оба слоя — маршрутизатор `net/http` (он отвечает перенаправлением на вычищенный путь)
+    # и сама раздача. Поэтому она НЕ покраснеет, если убрать чистку только у раздачи, и
+    # честно об этом говорит: за мою строку отвечает тест `TestОбходПутиНеРаботает`, где
+    # раздача зовётся напрямую, мимо маршрутизатора. Молча выдавать это за проверку своего
+    # кода нельзя — ровно такая ложная зелень уже стоила ревью соседней зоне (`WORLD2-96`).
+    printf 'ключ юзера' > "$TMP/секрет"
+    raw_get "/../$(basename "$TMP/секрет")"
+    case "$BODY" in
+        *"ключ юзера"*) bad "обход пути" "чтение ушло за каталог пульта — а прав у контроллера много" ;;
+        *) ok "обход пути наружу не отдаёт чужой файл (стойка целиком: маршрутизатор + раздача)" ;;
+    esac
+
+    call POST /
+    want_refusal wrong-method "в страницу не постучаться глаголом ручки"
     stop_server
 
     part "КРАСНЫЙ — инструмента нет вовсе"

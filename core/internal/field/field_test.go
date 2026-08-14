@@ -467,9 +467,10 @@ func дверьСМаршрутами(t *testing.T) string {
 	mux := http.NewServeMux()
 	mux.Handle(door.Prefix, h)
 	mux.Handle(door.Prefix+"/", h)
-	// Имени нет в поле — запрос уходит в раздачу, ровно как у живой двери.
+	// Имени нет в поле — запрос упирается в названный отказ, ровно как у живой
+	// двери (у неё это noFace: смотреть за дверью нечего).
 	mux.Handle("/", h.Route(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "витрина зоны web", http.StatusNotFound)
+		http.Error(w, "за дверью такого маршрута нет", http.StatusNotFound)
 	})))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

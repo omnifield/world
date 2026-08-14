@@ -873,10 +873,64 @@ else
     esac
 fi
 
-# ================================================================== 26. подсказки
+# ================================================================== 26. ОБРАЗ КОНТРОЛЛЕРА
+# Лицо для человека живёт при контроллере (`WORLD2` 3.7), значит собранный пульт обязан
+# приехать в ЕГО образе. Стережём три вещи, и все три — про порядок и границы, а не про то,
+# «собралось ли»:
+#
+#   · пульта нет — образ контроллера не складывается вовсе (иначе он уедет с пустым лицом);
+#   · шагу контроллера ПОЛЕ НЕ НУЖНО: склад не спрашивается, сборщик не зовётся;
+#   · пульт собирается ОДИН раз на оба образа — второй сборки в зоне не заводится.
+part "26. --only-control без собранного пульта → отказ, образ контроллера НЕ складывается"
+rm -rf "$OUT"
+run_case 1 "$HERE/build.sh" --only-control
+said "собранного пульта"
+not_called "control/compose.yaml build"
+
+part "26b. --only-control с готовым пультом → складывает образ и НЕ собирает пульт заново"
+mkdir -p "$OUT"; printf 'собранный пульт\n' > "$OUT/index.html"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --only-control
+called "control/compose.yaml build"
+not_called "$NODE_IMAGE"                             # сборщик пульта не звался
+not_called "probe-web:4873"                          # склад не спрашивался: поля тут не надо
+not_called "compose -f $HERE/compose.yaml build"     # образ мира не трогали
+
+part "26c. --control → шаг 1, потом шаг 3; образ МИРА при этом не складывается"
+rm -rf "$OUT"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --control
+called "$NODE_IMAGE"
+called "control/compose.yaml build"
+not_called "compose -f $HERE/compose.yaml build"
+[ -s "$OUT/index.html" ] && good "пульт собран и лежит там, откуда его берёт образ контроллера" \
+                         || bad "пульта в $OUT нет — образу контроллера нечего складывать"
+# Один артефакт на оба образа. Заведись вторая сборка — лицо в контроллере и лицо в двери
+# разъехались бы молча, и «почему в контроллере пульт старее» стало бы вопросом без ответа.
+built=$(grep -c "^run .*$NODE_IMAGE" "$STUB_LOG")
+[ "$built" = 1 ] && good "пульт собран ровно один раз (сборщик звался $built раз)" \
+                 || bad "сборщик пульта звался $built раз — второй сборки в зоне быть не должно"
+
+part "26d. умолчание не изменилось: ./deploy/build.sh собирает мир и НЕ трогает контроллер"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh"
+called "compose -f $HERE/compose.yaml build"
+not_called "control/compose.yaml build"
+
+# Раскладку контроллера (контекст, Dockerfile, имя образа) держит ЕГО зона. Заведись её
+# копия здесь — сборка из этой зоны однажды сложила бы не тот образ, который потом
+# поднимают, и разъехались бы они молча.
+part "26e. копии раскладки контроллера в зоне deploy нет"
+dubli=$(grep -rn 'omnifield/world-control\|-f control/Dockerfile' "$HERE" \
+            --include='*.sh' --include='*.yaml' 2>/dev/null \
+        | grep -v 'probe-branching.sh' || true)
+[ -z "$dubli" ] && good "имя образа контроллера и путь к его Dockerfile в зоне не продублированы" \
+                || { bad "в зоне завелась копия раскладки контроллера:"; printf '%s\n' "$dubli" >&2; }
+
+# ================================================================== 27. подсказки
 # `--help` обязан работать там, где докера нет вовсе, — иначе человек не узнает про ключи
 # ровно тогда, когда они ему и нужны.
-part "26. подсказки и непонятный ключ"
+part "27. подсказки и непонятный ключ"
 run_case 0 "$HERE/up.sh" --help
 run_case 0 "$HERE/build.sh" --help
 run_case 0 "$HERE/probe.sh" --help

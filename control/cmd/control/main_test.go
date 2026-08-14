@@ -17,6 +17,7 @@ func TestПодсказкаНазываетВсеРучки(t *testing.T) {
 		"POST   /api/session", "GET    /api/me",
 		"GET    /api/resources", "POST   /api/resources", "DELETE /api/resources/{имя}",
 		"GET    /api/fields", "POST   /api/fields",
+		"GET    /                     пульт",
 	} {
 		if !strings.Contains(sb.String(), path) {
 			t.Fatalf("в подсказке нет ручки %q — человек о ней не узнает", path)
@@ -30,6 +31,7 @@ func TestПодсказкаНазываетВсеЗначения(t *testing.T) 
 	for _, name := range []string{
 		"CONTROL_ADDR", "CONTROL_KEYS", "CONTROL_REMOTE_SH",
 		"CONTROL_DOCKER", "CONTROL_DOOR_PORT", "CONTROL_TOOL_TIMEOUT", "CONTROL_SSH_TIMEOUT",
+		"CONTROL_PULT",
 	} {
 		if !strings.Contains(sb.String(), name) {
 			t.Fatalf("в подсказке нет значения %s — неназванная настройка равна отсутствующей", name)
@@ -67,5 +69,8 @@ func TestУмолчанияСовпадаютСФайломЗапуска(t *tes
 	}
 	if !strings.Contains(string(data), "CONTROL_REMOTE_SH: /opt/world/deploy/remote.sh") {
 		t.Fatal("путь к подъёму двери в файле запуска разъехался с тем, что кладёт образ")
+	}
+	if !strings.Contains(string(data), "CONTROL_PULT: /opt/world/pult") {
+		t.Fatal("путь к пульту в файле запуска разъехался с тем, куда его кладёт образ")
 	}
 }
