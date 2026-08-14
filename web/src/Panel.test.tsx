@@ -1,156 +1,146 @@
-// Пробы экрана: три состояния, и каждое проверяется по тому, ЧТО написано человеку, а не по
-// тому, что компонент не упал (`kb:WORLD-32`).
+// Пробы пульта целиком: два экрана и переход между ними.
 //
-// Отдельно стережём главное правило первой версии: пульт не может уметь больше консоли, а
-// консоли ещё нет — значит на экране нет ни одной кнопки управления полем.
+// Пульт — это та же сборка мира, повёрнутая к человеку, а не второй мир на фронте. Отсюда
+// главное, что здесь стерегут: до входа пульт НИЧЕГО у мира не спрашивает, потому что до
+// входа ни ресурсов, ни полей не существует (`WORLD2-102`).
 import { afterEach, describe, expect, it } from "vitest";
-import { render } from "solid-js/web";
 
 import { Panel } from "./Panel.jsx";
-import type { FieldView } from "./door.js";
+import type { Answer, Control, Field, Identity, Resource, Session } from "./control.js";
+import { дождаться, нажать, осесть, смонтировать } from "./probe-dom.jsx";
 
-let dispose: (() => void) | undefined;
-let host: HTMLDivElement | undefined;
+let проба: { корень: HTMLElement; снять: () => void } | undefined;
 
 afterEach(() => {
-  dispose?.();
-  host?.remove();
-  dispose = undefined;
-  host = undefined;
+  проба?.снять();
+  проба = undefined;
 });
 
-/** Монтирует пульт на заданном ответе двери и ждёт, пока уедет состояние загрузки. */
-async function показать(view: FieldView): Promise<HTMLElement> {
-  host = document.createElement("div");
-  document.body.append(host);
-  dispose = render(() => <Panel read={async () => view} />, host);
-
-  for (let i = 0; i < 50; i += 1) {
-    const block = host.querySelector<HTMLElement>("[data-state]");
-    if (block && block.dataset.state !== "loading") return block;
-    await new Promise((done) => setTimeout(done, 0));
-  }
-  throw new Error("пульт не ушёл из состояния загрузки");
-}
-
-const ЛОКАЦИЯ = {
-  name: "baser",
-  addr: "baser:3500",
-  gives: "консоль продукта: кладёт обвесы в клон",
-  since: "2026-08-10T19:00:00Z",
-  route: "/baser/",
+const ВОШЁЛ: Session = {
+  name: "егор",
+  brand: "омнифилд",
+  scope: { addr: "/scope/егор", here: true, path: "/scope/егор" },
+  since: "",
+  created: false,
+  token: "метка-1",
 };
 
-describe("список есть", () => {
-  it("показывает имя, что даёт, адрес и ссылку — по строке на локацию", async () => {
-    const block = await показать({
-      kind: "field",
-      locations: [ЛОКАЦИЯ, { ...ЛОКАЦИЯ, name: "probe-web", route: "/probe-web/" }],
-    });
+const Я: Identity = { ...ВОШЁЛ, since: "2026-08-14T19:00:00Z" };
 
-    expect(block.dataset.state).toBe("field");
-    expect(block.querySelectorAll(".pult__loc")).toHaveLength(2);
-    expect(block.querySelector("[data-count]")?.textContent).toBe("2");
+const ok = <T,>(value: T): Answer<T> => ({ kind: "ok", value });
 
-    const первая = block.querySelector<HTMLElement>('[data-loc="baser"]');
-    expect(первая?.textContent).toContain(ЛОКАЦИЯ.gives);
-    expect(первая?.textContent).toContain(ЛОКАЦИЯ.addr);
-
-    const ссылка = первая?.querySelector<HTMLAnchorElement>("a.pult__name");
-    expect(ссылка?.textContent).toBe("baser");
-    // Ссылка ведёт по МАРШРУТУ ОТ ДВЕРИ, а не по собранному из имени адресу.
-    expect(ссылка?.getAttribute("href")).toBe("/baser/");
-  });
-
-  it("локация без даты регистрации показывается без даты, а не с пустым «в поле с»", async () => {
-    const block = await показать({ kind: "field", locations: [{ ...ЛОКАЦИЯ, since: "" }] });
-
-    expect(block.textContent).toContain("baser");
-    expect(block.textContent).not.toContain("в поле с");
-  });
-});
-
-describe("список пуст", () => {
-  it("говорит словами, что в поле никого, и не красит это отказом", async () => {
-    const block = await показать({ kind: "field", locations: [] });
-
-    expect(block.dataset.state).toBe("empty");
-    expect(block.textContent).toContain("В поле сейчас никого");
-    // `kb:WORLD-2`: пустая роль — законное состояние. Ни слова «ошибка», ни красной каймы.
-    expect(block.classList.contains("pult__refusal")).toBe(false);
-    expect(block.textContent).toContain("законное состояние");
-  });
-
-  it("пустой экран пустым не остаётся: текста в блоке заметно больше заголовка", async () => {
-    // Проба стережёт ровно провал «показали ничего»: убери объяснение — и она покраснеет.
-    const block = await показать({ kind: "field", locations: [] });
-
-    expect((block.textContent ?? "").trim().length).toBeGreaterThan(120);
-  });
-});
-
-describe("дверь недоступна", () => {
-  const отказ: FieldView = {
-    kind: "refusal",
-    refusal: {
-      code: "door-unreachable",
-      reason: "дверь не отвечает по /api/locations: Failed to fetch",
-      exit: "подними сервис мира (из core/: `go run ./cmd/world`) и обнови страницу",
-      from: "panel",
+function контроллер(правки: Partial<Control> = {}) {
+  const ручки: string[] = [];
+  const control: Control = {
+    async enter() {
+      ручки.push("enter");
+      return ok(ВОШЁЛ);
     },
+    async me() {
+      ручки.push("me");
+      return ok(Я);
+    },
+    async resources() {
+      ручки.push("resources");
+      return ok([] as Resource[]);
+    },
+    async addResource() {
+      throw new Error("не звали");
+    },
+    async fields() {
+      ручки.push("fields");
+      return ok([] as Field[]);
+    },
+    async addField() {
+      throw new Error("не звали");
+    },
+    ...правки,
   };
+  return { control, ручки };
+}
 
-  it("называет причину и выход, а не «что-то пошло не так»", async () => {
-    const block = await показать(отказ);
+describe("до входа", () => {
+  it("виден экран входа, а экрана мира нет вовсе", async () => {
+    const { control } = контроллер();
+    проба = смонтировать(() => <Panel control={control} />);
+    await осесть();
 
-    expect(block.dataset.state).toBe("refusal");
-    expect(block.textContent).toContain("дверь не отвечает");
-    expect(block.querySelector(".pult__exit")?.textContent).toContain("go run ./cmd/world");
-    expect(block.textContent).toContain("door-unreachable");
-    expect(block.textContent).not.toContain("что-то пошло не так");
+    expect(проба.корень.querySelector("[data-screen='sign-in']")).not.toBeNull();
+    expect(проба.корень.querySelector("[data-screen='world']")).toBeNull();
   });
 
-  it("говорит, КТО произнёс отказ — пульт или дверь", async () => {
-    const свой = await показать(отказ);
-    expect(свой.querySelector(".pult__who")?.textContent).toContain("пультом");
+  it("пульт не спрашивает у контроллера ничего — спрашивать пока не о чем", async () => {
+    const { control, ручки } = контроллер();
+    проба = смонтировать(() => <Panel control={control} />);
+    await осесть();
 
-    dispose?.();
-    host?.remove();
-
-    const чужой = await показать({
-      kind: "refusal",
-      refusal: { code: "unknown-endpoint", reason: "такой ручки нет; есть GET /api/locations", exit: "", from: "door" },
-    });
-    expect(чужой.querySelector(".pult__who")?.textContent).toContain("дверью");
-  });
-
-  it("отказ двери показывается без пустого блока «что делать»", async () => {
-    // Выход у отказа двери назван внутри её же текста. Пустой заголовок «Что делать:» без
-    // содержимого — это ровно та серая кнопка без объяснения, которую канон запрещает.
-    const block = await показать({
-      kind: "refusal",
-      refusal: { code: "name-taken", reason: "имя занято — возьми другое либо сними ту", exit: "", from: "door" },
-    });
-
-    expect(block.querySelector(".pult__exit")).toBeNull();
-    expect(block.textContent).not.toContain("Что делать");
+    expect(ручки).toEqual([]);
   });
 });
 
-describe("пульт не умеет больше консоли", () => {
-  it("на экране нет управления полем — только «Спросить снова»", async () => {
-    // `kb:WORLD-53`: всё, что можно из консоли, можно из пульта. Консоли ещё нет — значит
-    // и в пульте управления нет. Появится кнопка раньше консоли — проба покраснеет.
-    for (const view of [
-      { kind: "field", locations: [ЛОКАЦИЯ] },
-      { kind: "field", locations: [] },
-    ] satisfies FieldView[]) {
-      const block = await показать(view);
-      const кнопки = [...block.querySelectorAll("button")].map((b) => b.textContent?.trim());
+describe("после входа", () => {
+  it("экран сменяется на мир", async () => {
+    const { control } = контроллер();
+    проба = смонтировать(() => <Panel control={control} />);
 
-      expect(кнопки).toEqual(["Спросить снова"]);
-      dispose?.();
-      host?.remove();
-    }
+    нажать(проба.корень, "Войти");
+    await дождаться(
+      () => проба?.корень.querySelector("[data-screen='world']"),
+      "экран мира",
+    );
+
+    expect(проба.корень.querySelector("[data-screen='sign-in']")).toBeNull();
+  });
+
+  it("скоуп завели прямо сейчас — сказано, что он заведён здесь", async () => {
+    // Молчание тут выглядело бы как «вошёл в существующий»: человек не узнал бы, что на
+    // ресурсе контроллера только что появилась его личность.
+    const { control } = контроллер({
+      async enter() {
+        return ok({ ...ВОШЁЛ, created: true });
+      },
+    });
+    проба = смонтировать(() => <Panel control={control} />);
+
+    нажать(проба.корень, "Войти");
+    const сказано = await дождаться(
+      () => проба?.корень.querySelector<HTMLElement>("[data-state='created']"),
+      "слова о заведённом скоупе",
+    );
+
+    expect(сказано.textContent).toContain("заведён здесь");
+  });
+});
+
+describe("сессии контроллера не стало", () => {
+  it("отказ «не входили» возвращает на экран входа кнопкой, а не тупиком", async () => {
+    // Сессия контроллера живёт в памяти его процесса: он перезапустился — вход надо повторить.
+    // Без этого выхода человек остался бы на экране мира, который не может ничего показать.
+    const { control } = контроллер({
+      async me() {
+        return {
+          kind: "refusal",
+          refusal: {
+            code: "not-signed-in",
+            why: "в скоуп ещё не входили",
+            ways: ["войди: POST /api/session"],
+            said: "control",
+          },
+        };
+      },
+    });
+    проба = смонтировать(() => <Panel control={control} />);
+
+    нажать(проба.корень, "Войти");
+    await дождаться(
+      () => проба?.корень.querySelector("[data-refusal='not-signed-in']"),
+      "отказ «не входили»",
+    );
+
+    нажать(проба.корень, "Войти заново");
+    await осесть();
+
+    expect(проба.корень.querySelector("[data-screen='sign-in']")).not.toBeNull();
+    expect(проба.корень.querySelector("[data-screen='world']")).toBeNull();
   });
 });
