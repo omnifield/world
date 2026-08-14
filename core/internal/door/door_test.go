@@ -201,7 +201,7 @@ func TestРегистрацияДаётМаршрутСразу(t *testing.T) {
 		t.Errorf("ответ: получено %+v, ожидалась новая локация с временем регистрации", ответ)
 	}
 
-	маршрут := h.Route(статикаНеОтвечает(t))
+	маршрут := h.Route(фолбэкНеОтвечает(t))
 	if rec := запрос(маршрут, http.MethodGet, "/baser/api/x?q=1", ""); rec.Body.String() != "я локация" {
 		t.Fatalf("через дверь пришло %q, ожидалось %q (код %d)", rec.Body.String(), "я локация", rec.Code)
 	}
@@ -210,12 +210,12 @@ func TestРегистрацияДаётМаршрутСразу(t *testing.T) {
 	}
 }
 
-// статикаНеОтвечает — заглушка fallback'а: если запрос до неё дошёл, значит
+// фолбэкНеОтвечает — заглушка fallback'а: если запрос до неё дошёл, значит
 // маршрут локации НЕ сработал, и тест обязан это увидеть, а не проглотить.
-func статикаНеОтвечает(t *testing.T) http.Handler {
+func фолбэкНеОтвечает(t *testing.T) http.Handler {
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "статика: "+r.URL.Path, http.StatusNotFound)
+		http.Error(w, "фолбэк: "+r.URL.Path, http.StatusNotFound)
 	})
 }
 
@@ -224,7 +224,7 @@ func TestЗапросДоезжаетДоЛокацииЦеликом(t *testing
 	e := локация(t, "принято")
 	запрос(h, http.MethodPost, Prefix, регистрация("baser", e.адрес(), "консоль сборки"))
 
-	маршрут := h.Route(статикаНеОтвечает(t))
+	маршрут := h.Route(фолбэкНеОтвечает(t))
 	rec := запрос(маршрут, http.MethodPost, "/baser/api/build?force=1", `{"схема":"дом"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("код ответа: получено %d (%s), ожидалось %d", rec.Code, rec.Body.String(), http.StatusOK)
@@ -252,7 +252,7 @@ func TestИмяБезЗавершающегоСлэшаВедётВЛокаци�
 	e := локация(t, "я локация")
 	запрос(h, http.MethodPost, Prefix, регистрация("baser", e.адрес(), "консоль сборки"))
 
-	rec := запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser?q=1", "")
+	rec := запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser?q=1", "")
 	if rec.Code != http.StatusPermanentRedirect {
 		t.Fatalf("код ответа: получено %d, ожидалось %d", rec.Code, http.StatusPermanentRedirect)
 	}
@@ -268,7 +268,7 @@ func TestСнятиеУбираетМаршрут(t *testing.T) {
 	e := локация(t, "я локация")
 	запрос(h, http.MethodPost, Prefix, регистрация("baser", e.адрес(), "консоль сборки"))
 
-	маршрут := h.Route(статикаНеОтвечает(t))
+	маршрут := h.Route(фолбэкНеОтвечает(t))
 	if rec := запрос(маршрут, http.MethodGet, "/baser/", ""); rec.Code != http.StatusOK {
 		t.Fatalf("до снятия маршрут обязан работать: получено %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -278,7 +278,7 @@ func TestСнятиеУбираетМаршрут(t *testing.T) {
 	}
 
 	rec := запрос(маршрут, http.MethodGet, "/baser/", "")
-	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "статика:") {
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "фолбэк:") {
 		t.Errorf("после снятия маршрут обязан исчезнуть: получено %d (%s)", rec.Code, rec.Body.String())
 	}
 }
@@ -300,7 +300,7 @@ func TestСписокПереживаетРестарт(t *testing.T) {
 	if len(locs) != 1 || locs[0].Name != "baser" || locs[0].Addr != e.адрес() {
 		t.Fatalf("поле после рестарта: получено %+v, ожидалась одна локация baser", locs)
 	}
-	if rec := запрос(после.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/", ""); rec.Body.String() != "я локация" {
+	if rec := запрос(после.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/", ""); rec.Body.String() != "я локация" {
 		t.Errorf("маршрут после рестарта: получено %q (код %d)", rec.Body.String(), rec.Code)
 	}
 }
@@ -401,7 +401,7 @@ func TestПересозданиеСДругимАдресомДаётТоЖеМ�
 	}
 	// Маршрут строим ДО пересоздания: иначе проверка «маршрут перевёлся» прошла
 	// бы на пустом кэше, то есть не проверила бы ничего.
-	if rec := запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/", ""); rec.Body.String() != "старый дом" {
+	if rec := запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/", ""); rec.Body.String() != "старый дом" {
 		t.Fatalf("до пересоздания маршрут ведёт в %q (код %d)", rec.Body.String(), rec.Code)
 	}
 
@@ -448,7 +448,7 @@ func TestПересозданиеСДругимАдресомДаётТоЖеМ�
 
 	// Маршрут обязан перевестись на новый адрес — иначе «то же место» верно
 	// только на бумаге, а запросы уезжают в снесённый контейнер.
-	if rec := запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/", ""); rec.Body.String() != "новый дом" {
+	if rec := запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/", ""); rec.Body.String() != "новый дом" {
 		t.Errorf("после возвращения маршрут ведёт в %q, ожидалось %q (код %d)", rec.Body.String(), "новый дом", rec.Code)
 	}
 	// Возвращение — единственный случай, когда дверь меняет смысл записи;
@@ -606,7 +606,7 @@ func TestСнятиеЗабываетПостроенныйМаршрут(t *tes
 	h, _, _ := дверь(t, nil)
 	e := локация(t, "я локация")
 	запрос(h, http.MethodPost, Prefix, регистрация("baser", e.адрес(), "консоль"))
-	запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/", "")
+	запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/", "")
 
 	if len(h.proxies) != 1 {
 		t.Fatalf("построенных маршрутов %d, ожидался один", len(h.proxies))
@@ -631,7 +631,7 @@ func TestПереездЛокацииЧерезСнятиеПереводитМ�
 	// Проверяется не реестр, а ПОСТРОЕННЫЙ маршрут: он кэшируется между
 	// запросами, и забыть его при снятии — ровно тот дефект, из-за которого
 	// переехавшая локация продолжала бы отвечать со старого адреса.
-	rec := запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/", "")
+	rec := запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/", "")
 	if rec.Body.String() != "новый дом" {
 		t.Errorf("после переезда получено %q, ожидалось %q", rec.Body.String(), "новый дом")
 	}
@@ -662,12 +662,12 @@ func TestПостроенныйМаршрутПересобираетсяПри�
 	}
 }
 
-func TestЧужоеИмяУходитВСтатику(t *testing.T) {
+func TestЧужоеИмяУходитВФолбэк(t *testing.T) {
 	h, _, _ := дверь(t, nil)
 
-	rec := запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/незнакомец/", "")
-	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "статика:") {
-		t.Errorf("незарегистрированное имя: получено %d (%s), ожидался уход в статику", rec.Code, rec.Body.String())
+	rec := запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/незнакомец/", "")
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "фолбэк:") {
+		t.Errorf("незарегистрированное имя: получено %d (%s), ожидался уход в фолбэк", rec.Code, rec.Body.String())
 	}
 }
 
@@ -726,7 +726,7 @@ func TestОтказЛокацияНеОтвечаетНаМаршруте(t *tes
 	h, _, _ := дверь(t, func(string) error { return nil })
 	запрос(h, http.MethodPost, Prefix, регистрация("baser", мёртвый, "консоль"))
 
-	rec := запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/", "")
+	rec := запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/", "")
 	отказ(t, rec, http.StatusBadGateway, "location-unreachable", "DELETE /api/locations/baser")
 	if !strings.Contains(rec.Body.String(), "baser") {
 		t.Errorf("отказ не назвал локацию: %s", rec.Body.String())
@@ -1051,7 +1051,7 @@ func TestТрассировкаМаршрутаНазываетАдресЛок�
 	h, ж, _ := дверь(t, nil)
 	e := локация(t, "я локация")
 	запрос(h, http.MethodPost, Prefix, регистрация("baser", e.адрес(), "консоль"))
-	запрос(h.Route(статикаНеОтвечает(t)), http.MethodGet, "/baser/x", "")
+	запрос(h.Route(фолбэкНеОтвечает(t)), http.MethodGet, "/baser/x", "")
 
 	for _, кусок := range []string{"door: → baser GET /baser/x", "addr=" + e.адрес(), "code=200"} {
 		if !strings.Contains(ж.всё(), кусок) {
