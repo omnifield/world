@@ -29,6 +29,41 @@
   outline-offset: 2px;
 }
 
+[data-slot="button"][data-disabled],
+[data-slot="button"]:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Ввод одевается той же зацепкой, что и кнопка: одно правило на весь кит, а не поле поимённо. */
+[data-slot="input"],
+[data-slot="textarea"] {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--background);
+  color: var(--foreground);
+  font: inherit;
+}
+
+[data-slot="textarea"] {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  resize: vertical;
+}
+
+[data-slot="input"]:focus-visible,
+[data-slot="textarea"]:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+[data-slot="label"] {
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+
 .pult {
   width: min(48rem, 92vw);
   margin: 0 auto;
@@ -76,21 +111,40 @@
   max-width: 42rem;
 }
 
-/* Отказ виден как отказ, но не кричит: кайма и заголовок, а не красная заливка. Красным
-   красят поломку, а отказ мира — это работающее правило (kb:WORLD-31). */
+/* Отказ виден как отказ, но не кричит: кайма и код, а не красная заливка. Красным красят
+   поломку, а отказ мира — это работающее правило (`WORLD2` 2.3). */
 .pult__refusal {
-  border-color: var(--destructive);
+  border: 1px solid var(--destructive);
+  border-radius: var(--radius-md);
+  padding: 0.875rem 1rem;
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+  width: 100%;
 }
 
-.pult__refusal h2 {
+.pult__code {
+  margin: 0;
   color: var(--destructive);
   font-family: var(--font-mono);
-  font-size: 1rem;
+  font-size: 0.95rem;
+}
+
+.pult__reason {
+  margin: 0;
 }
 
 .pult__exit {
   padding-left: 0.75rem;
   border-left: 2px solid var(--border);
+}
+
+/* Выходы списком, а не абзацем: склеенные в строку, они перестают быть выходами. */
+.pult__ways {
+  margin: 0.25rem 0 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 0.2rem;
 }
 
 .pult__who {
@@ -106,7 +160,7 @@
   width: 100%;
 }
 
-.pult__loc {
+.pult__item {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 0.875rem 1rem;
@@ -117,15 +171,52 @@
 .pult__name {
   font-weight: 600;
   color: var(--foreground);
-  text-decoration: none;
 }
 
-.pult__name:hover {
-  text-decoration: underline;
+/* Приписка рядом с именем — та же строка, но тише: «здесь стоит контроллер», дата заведения. */
+.pult__aside {
+  font-weight: 400;
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
 }
 
-.pult__gives {
+/* Экран мира — три блока подряд, каждый отвечает за себя. */
+.pult__world {
+  display: grid;
+  gap: 1.5rem;
+}
+
+.pult__form {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+  width: 100%;
+  max-width: 34rem;
+}
+
+.pult__form h3 {
+  margin: 0.5rem 0 0;
+  font-size: 1rem;
+}
+
+.pult__field {
+  display: grid;
+  gap: 0.25rem;
+  width: 100%;
+}
+
+.pult__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+/* Слова контроллера о том, чего НЕ произошло. Не отказ — поэтому не каймой отказа. */
+.pult__note {
   margin: 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border);
+  color: var(--muted-foreground);
 }
 
 .pult__facts {
