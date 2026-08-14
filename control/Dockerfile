@@ -38,9 +38,30 @@ COPY --from=build /out/control /usr/local/bin/control
 COPY deploy/remote.sh /opt/world/deploy/remote.sh
 COPY deploy/compose.yaml /opt/world/deploy/compose.yaml
 
+# ── лицо для человека ────────────────────────────────────────────────────────
+# Собранный пульт — КАК ЕСТЬ, из результата первого шага сборки. Исходников зоны `web`
+# здесь нет по построению: копируется каталог сборки, а не зона.
+#
+# Пульт СОБИРАЕТСЯ НЕ ЗДЕСЬ, и это не лень. Пакеты пульта лежат на складе локации
+# `probe-web`, видном только соседям по сети `omnifield-gateway`, а произвольной сети
+# внутри `docker build` buildkit не даёт — сосед на этом уже обжёгся (`deploy/Dockerfile`,
+# `tasker:WORLD-37`). Поэтому пульт собирается ДО этого шага, обычным контейнером в сети,
+# и сюда приезжает готовым. Ноды в образе контроллера нет вовсе — ни в одном слое.
+COPY deploy/.build/web-dist/ /opt/world/pult/
+
+# Пустой каталог COPY проглотит молча, и образ уехал бы с лицом, которого нет. Ловим
+# ЗДЕСЬ, а не на первом запросе снаружи: контроллер в этом случае поднимется и честно
+# ответит `no-pult` — но образ уже разошёлся, а человек уже открыл адрес.
+RUN test -s /opt/world/pult/index.html || { \
+        echo "СБОРКА ОСТАНОВЛЕНА: в deploy/.build/web-dist нет собранного пульта."; \
+        echo "выход: собери его первым шагом — ./deploy/build.sh --only-web"; \
+        exit 1; \
+    }
+
 ENV CONTROL_ADDR=":8090" \
     CONTROL_REMOTE_SH="/opt/world/deploy/remote.sh" \
     CONTROL_KEYS="/root/.ssh" \
+    CONTROL_PULT="/opt/world/pult" \
     CONTROL_DOCKER="docker"
 
 # Связка ключей и контексты докера — это СОСТОЯНИЕ контроллера, и оба лежат в томах

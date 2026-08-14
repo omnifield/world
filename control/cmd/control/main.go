@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/omnifield/world/control/internal/api"
+	"github.com/omnifield/world/control/internal/pult"
 	"github.com/omnifield/world/control/internal/run"
 )
 
@@ -43,6 +44,11 @@ const (
 	defaultToolTimeout = 300
 	// Сколько ждём ответа ssh при работе со скоупом. Меньше — быстрее краснеет.
 	defaultSSHTimeout = 10
+	// Где лежит СОБРАННЫЙ пульт. Умолчание — результат сборки зоны `web`, как его видит
+	// запуск из `control/`: разработчику `go run` плюс `pnpm dev` рядом должны работать
+	// без единой настройки. Образ кладёт пульт в `/opt/world/pult` и называет путь явно —
+	// умолчание относительное, а таких каталогов в образе нет.
+	defaultPultDir = "../web/dist"
 )
 
 func main() {
@@ -61,6 +67,7 @@ func main() {
 	addr := env("CONTROL_ADDR", defaultAddr)
 	keys := env("CONTROL_KEYS", filepath.Join(home(), ".ssh"))
 	remoteSh := env("CONTROL_REMOTE_SH", defaultRemoteSh)
+	pultDir := env("CONTROL_PULT", defaultPultDir)
 
 	handler := api.New(api.Options{
 		Runner:     run.Exec{Timeout: time.Duration(number("CONTROL_TOOL_TIMEOUT", defaultToolTimeout)) * time.Second},
@@ -69,11 +76,16 @@ func main() {
 		KeysDir:    keys,
 		DoorPort:   number("CONTROL_DOOR_PORT", defaultDoorPort),
 		SSHTimeout: number("CONTROL_SSH_TIMEOUT", defaultSSHTimeout),
+		PultDir:    pultDir,
 	})
 
 	log.Printf("control: руки юзера на %s", addr)
 	log.Printf("control: подъём двери — %s; докер — %s; связка — %s",
 		remoteSh, env("CONTROL_DOCKER", "docker"), keys)
+	// Состояние пульта называется В СТАРТОВОЙ СТРОКЕ, а не только на первом запросе:
+	// образ, уехавший без пульта, обнаруживается иначе тогда, когда человек уже открыл
+	// адрес и увидел отказ. Поднятию это не мешает — ручки работают и без лица.
+	log.Printf("control: пульт — %s", pult.New(pultDir).State())
 	// Проверяем то, чем будем пользоваться, СРАЗУ и говорим вслух: инструмент, которого
 	// нет, обнаружится иначе только в момент, когда человек уже нажал «добавить ресурс».
 	if _, err := os.Stat(remoteSh); err != nil {
@@ -104,11 +116,14 @@ func usage(w io.Writer) {
   DELETE /api/resources/{имя}  снять ресурс; в ответе — что осталось на той машине
   GET    /api/fields           поля юзера
   POST   /api/fields           завести поле
+  GET    /                     пульт — лицо для человека, собранное зоной web
+
 
 Значения:
   CONTROL_ADDR=:8090                 где слушать
   CONTROL_KEYS=~/.ssh                связка контроллера: ключи ресурсов и config
   CONTROL_REMOTE_SH=../deploy/remote.sh   готовый подъём двери — его контроллер зовёт
+  CONTROL_PULT=../web/dist           где лежит СОБРАННЫЙ пульт (в образе /opt/world/pult)
   CONTROL_DOCKER=docker              чем говорим с докером
   CONTROL_DOOR_PORT=8080             хост-порт двери на добавляемом ресурсе
   CONTROL_TOOL_TIMEOUT=300           сколько секунд ждём внешний инструмент

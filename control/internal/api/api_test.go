@@ -2,8 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +22,7 @@ type стенд struct {
 	fake  *run.Fake
 	keys  string
 	scope string
+	pult  string
 	log   []string
 }
 
@@ -30,12 +33,14 @@ func поднять(t *testing.T, answer func(run.Command) (run.Result, error)) 
 		fake:  &run.Fake{Answer: answer},
 		keys:  filepath.Join(dir, "keys"),
 		scope: filepath.Join(dir, "scope"),
+		pult:  filepath.Join(dir, "pult"),
 	}
 	h := New(Options{
 		Runner:     st.fake,
 		RemoteSh:   "/opt/world/deploy/remote.sh",
 		Docker:     "docker",
 		KeysDir:    st.keys,
+		PultDir:    st.pult,
 		DoorPort:   8080,
 		SSHTimeout: 5,
 		Now:        func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) },
@@ -45,6 +50,36 @@ func поднять(t *testing.T, answer func(run.Command) (run.Result, error)) 
 	st.Server = httptest.NewServer(h)
 	t.Cleanup(st.Close)
 	return st
+}
+
+// положитьПульт кладёт то, что приезжает из зоны `web` собранным. Содержимое неважно:
+// зона `control` пульт не рисует, она его отдаёт.
+func (s *стенд) положитьПульт(t *testing.T) {
+	t.Helper()
+	if err := os.MkdirAll(s.pult, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.pult, "index.html"), []byte("<!doctype html>пульт"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// зовБраузером — тот же запрос, но так, как его шлёт адресная строка. Пульт ходит сюда
+// `fetch`, а тот шлёт `Accept: */*` — и обязан получать JSON, как и раньше.
+func (s *стенд) зовБраузером(t *testing.T, path string) (int, string, string) {
+	t.Helper()
+	req, err := http.NewRequest("GET", s.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body), resp.Header.Get("X-Control-Refusal")
 }
 
 func (s *стенд) зов(t *testing.T, method, path, body, token string) (int, map[string]any) {
@@ -314,4 +349,103 @@ func TestТрассаПишетсяВсегда(t *testing.T) {
 			t.Fatalf("в трассе нет %q: %s", want, st.log[0])
 		}
 	}
+}
+
+// ── пульт и ручки одним адресом ──────────────────────────────────────────────
+
+func TestПультРаздаётсяТемЖеАдресом(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.положитьПульт(t)
+
+	status, body, _ := st.зовБраузером(t, "/")
+	if status != http.StatusOK || !strings.Contains(body, "пульт") {
+		t.Fatalf("корень отдал %d: %q", status, body)
+	}
+}
+
+// Граница между ручками и пультом — то, ради чего в маршрутах есть отдельный `/api/`.
+// Перехватит пульт ручку — машина получит страницу вместо JSON и не разберёт её; перехватит
+// ручка пульт — человек увидит JSON вместо лица.
+func TestРучкиИПультНеПерехватываютДругДруга(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.положитьПульт(t)
+
+	// ручка на месте, хотя пульт лежит рядом
+	status, body := st.зов(t, "GET", "/api/me", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("ручка перехвачена пультом: %d %v", status, body)
+	}
+	отказ(t, body, "not-signed-in")
+
+	// опечатка в ИМЕНИ РУЧКИ остаётся промахом машины, а не «страницы нет»
+	status, body = st.зов(t, "GET", "/api/мее", "", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("неизвестная ручка отдала %d: %v", status, body)
+	}
+	отказ(t, body, "unknown-endpoint")
+
+	// `/api` без косой черты — тоже отказ, а не перенаправление
+	status, body = st.зов(t, "GET", "/api", "", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("/api отдал %d (перенаправление вместо отказа?): %v", status, body)
+	}
+	отказ(t, body, "unknown-endpoint")
+
+	// а вот путь мимо ручек — это уже пульт, и он отвечает страницей
+	if status, page, _ := st.зовБраузером(t, "/"); status != http.StatusOK || !strings.Contains(page, "пульт") {
+		t.Fatalf("корень перестал быть пультом: %d %q", status, page)
+	}
+}
+
+func TestПультаНетГоворитсяВслух(t *testing.T) {
+	st := поднять(t, докерОтвечает) // пульт НЕ положен
+
+	status, body := st.зов(t, "GET", "/", "", "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("пустой пульт отдал %d: %v", status, body)
+	}
+	отказ(t, body, "no-pult")
+
+	// Ручки при этом работают — и отказ обязан об этом говорить.
+	if !strings.Contains(strings.Join(waysOf(t, body), " "), "/api/me") {
+		t.Fatalf("отказ не сказал, что ручки живы: %v", body)
+	}
+}
+
+// Тот же отказ, две подачи: машине JSON, человеку в браузере — читаемый текст. Источник
+// один, поэтому разъехаться им нечем.
+func TestОтказЧеловекуЧитаемыйАМашинеJSON(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+
+	status, page, code := st.зовБраузером(t, "/")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("браузеру отдано %d", status)
+	}
+	if strings.HasPrefix(strings.TrimSpace(page), "{") {
+		t.Fatalf("человеку в браузере приехал JSON: %q", page)
+	}
+	for _, want := range []string{"no-pult", "выходы:", "build.sh"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("в тексте отказа нет %q:\n%s", want, page)
+		}
+	}
+	if code != "no-pult" {
+		t.Fatalf("машинный код не уехал заголовком: %q", code)
+	}
+
+	// А `fetch` пульта (Accept: */*) обязан по-прежнему получать JSON.
+	_, body := st.зов(t, "GET", "/", "", "")
+	отказ(t, body, "no-pult")
+}
+
+func waysOf(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	var out []string
+	ways, _ := body["ways"].([]any)
+	for _, w := range ways {
+		if s, ok := w.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
