@@ -174,7 +174,12 @@ case "$1" in
                     *location-compose.yaml*)  echo "omnifield/location:dev" ;;
                     # Имя образа контроллера принадлежит зоне `control`, и спрашивают его
                     # у неё же — так делают и сборка, и выпуск. Отвечаем за неё.
-                    *control/compose.yaml*)   echo "omnifield/world-control:dev" ;;
+                    #
+                    # Имя ЗАДАЁТСЯ СЦЕНАРИЕМ: соседняя задача той же истории (`WORLD2-112`)
+                    # пропишет туда полный адрес с реестром, а бывают и адреса с портом.
+                    # Проверять выпуск только на сегодняшнем имени значит проверять его на
+                    # том единственном случае, где он и так работает.
+                    *control/compose.yaml*)   echo "${STUB_CONTROL_IMAGE:-omnifield/world-control:dev}" ;;
                     *)                        echo "omnifield/world:dev" ;;
                 esac
                 exit 0 ;;
@@ -1112,6 +1117,52 @@ not_called "tag omnifield/world-control"
 publik=$(grep -nE '^[[:space:]]*(--push|--release|--publish)\)' "$HERE/build.sh" || true)
 [ -z "$publik" ] && good "в build.sh нет ключа публикации — выпуск живёт отдельной командой" \
                  || { bad "в сборку завёлся ключ публикации:"; printf '%s\n' "$publik" >&2; }
+
+# ================================================================== 29h…29k. СТЫКИ
+# Сценарии выше стерегут ШТАТНЫЙ ход: ключ отдельно, состояние отдельно. Три находки ревью
+# (`WORLD2-111`) прошли мимо них все три — и все три жили на СТЫКЕ: ключ плюс состояние
+# дерева, имя плюс реестр, имя плюс порт. Проба, которая проверяет каждую вещь в одиночку,
+# такие места не видит по устройству, а не по строгости. Здесь — стыки.
+
+part "29h. --dry-run на ГРЯЗНОМ дереве: показывает план, говорит про грязь, не отказывает"
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 \
+    run_case 0 "$HERE/release.sh" --dry-run
+said "не сделано НИЧЕГО"
+said "ghcr.io/omnifield/world-control:sha-abc1234"
+said "дерево не чисто"                     # про грязь сказано вслух
+not_called "push"
+not_called "control/compose.yaml build"
+# Отказ, который советует выходом сам себя, — диагноз, а не отказ. Здесь отказа нет вовсе,
+# и проверяем именно это: холостой ход не может отправить человека делать холостой ход.
+grep -qF '✗ не выпущено' "$STUB_DIR/out" \
+    && { bad "холостой ход ОТКАЗАЛ на грязном дереве"; tail -n 6 "$STUB_DIR/out" >&2; } \
+    || good "холостой ход не отказывает — и не советует выходом сам себя"
+
+part "29i. имя от control УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
+STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "push ghcr.io/omnifield/world-control:sha-abc1234"
+not_called "ghcr.io/ghcr.io"               # двойного реестра нет ни в метке, ни в push
+said "реестр взят из имени зоны control"   # и сказано, откуда он взялся
+
+part "29j. в имени ПОРТ реестра → тег отрезан, имя цело"
+STUB_CONTROL_IMAGE=registry.local:5000/omnifield/world-control:dev \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "push registry.local:5000/omnifield/world-control:sha-abc1234"
+called "push registry.local:5000/omnifield/world-control:latest"
+not_called "push ghcr.io"
+
+# Стык, которого в находках не было, но он того же рода: реестр назван ДВАЖДЫ и по-разному.
+# Молча выбрать нельзя — выпуск отдал бы вещь не туда, откуда её потом тянут.
+part "29k. реестр назван дважды и по-разному → отказ, а не догадка"
+WORLD_REGISTRY=example.test STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "два разных реестра"
+not_called "push"
+not_called "control/compose.yaml build"    # отказ ДО сборки: собирать нечего и незачем
 
 # ================================================================== итог
 part "── итог"
