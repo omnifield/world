@@ -131,8 +131,12 @@ case "$1" in
         # `image inspect --format …{{RepoDigests}}…` — вопрос выпуска: под каким digest'ом
         # образ лёг в реестр. Отвечаем подставным: проверяется, что его СПРАШИВАЮТ и
         # печатают, а не то, чему он равен.
+        #
+        # Отвечаем ИМЕНЕМ ТОГО ЖЕ образа, а не одной зашитой строкой: образов теперь два, и
+        # с общим ответом «спросили у обоих» было бы не отличить от «спросили дважды у
+        # одного» — а в выводе выпуска это ровно та ошибка, ради которой digest и печатают.
         case "$ALL" in
-            *RepoDigests*) echo "ghcr.io/omnifield/world-control@sha256:podstava"; exit 0 ;;
+            *RepoDigests*) last="${!#}"; printf '%s@sha256:podstava\n' "${last%:*}"; exit 0 ;;
         esac
         case "$3" in
             omnifield/world:dev)    [ -n "${STUB_HAVE_IMAGE:-}" ]     && exit 0 || exit 1 ;;
@@ -180,6 +184,10 @@ case "$1" in
                     # Проверять выпуск только на сегодняшнем имени значит проверять его на
                     # том единственном случае, где он и так работает.
                     *control/compose.yaml*)   echo "${STUB_CONTROL_IMAGE:-omnifield/world-control:dev}" ;;
+                    # Имя образа МИРА принадлежит зоне `deploy` и живёт в её файле запуска.
+                    # Выпуск спрашивает его там же, где чужое, — и сценарием оно так же
+                    # крутится: у двери те же три случая разбора, что и у контроллера.
+                    *deploy/compose.yaml*)    echo "${STUB_WORLD_IMAGE:-omnifield/world:dev}" ;;
                     *)                        echo "omnifield/world:dev" ;;
                 esac
                 exit 0 ;;
@@ -1044,18 +1052,35 @@ kontekst=$(grep -nE '^![[:space:]]*(deploy|web)/' "$HERE/Dockerfile.dockerignore
 # надо не «сработало ли», а ГРАНИЦЫ — что выпуск делает только по прямой просьбе, метит
 # правдой и не молчит, когда реестр отказал.
 #
-# Тегов два, и они разной природы: подвижный `latest` и неподвижный `sha-<коммит>`. Проба
-# держит именно это различие — что неподвижный уезжает ПЕРВЫМ и что метка выведена из
-# коммита, а не придумана.
+# Тегов у образа два, и они разной природы: подвижный `latest` и неподвижный `sha-<коммит>`.
+# Образов теперь ТОЖЕ два — дверь и контроллер (`WORLD2-119`), — значит push'ей четыре, и
+# проба держит два свойства этой четвёрки:
+#
+#   · оба образа собраны и помечены ОДНИМ `sha`: по тегу видно, что они одной сборки;
+#   · порядок отдачи — неподвижные первыми, а внутри пары дверь раньше пульта. Пульт
+#     раскладывает двери, и новый пульт при отсутствующей двери ломается у юзера.
+#
+# Порядок проверяется НОМЕРАМИ СТРОК в журнале, а не фактом вызова: перепутанный порядок
+# оставляет ровно те же четыре записи и по одному `called` неотличим.
+ranshe() {   # ranshe ОПИСАНИЕ N M — строка N в журнале должна быть раньше строки M
+    local what="$1" a="$2" b="$3"
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then good "$what"
+    else bad "$what — не так: строки ${a:-нет} и ${b:-нет}"; fi
+}
+
 part "29. выпуск: --dry-run не трогает ничего"
 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh" --dry-run
+said "ghcr.io/omnifield/world:sha-abc1234"
+said "ghcr.io/omnifield/world:latest"
 said "ghcr.io/omnifield/world-control:sha-abc1234"
 said "ghcr.io/omnifield/world-control:latest"
 said "не сделано НИЧЕГО"
 not_called "push"                                    # в реестр не ходили
 not_called "tag omnifield/world-control"             # и меток не ставили
+not_called "tag omnifield/world:dev"                 # ни у контроллера, ни у двери
 not_called "control/compose.yaml build"              # и не собирали
+not_called "compose -f $HERE/compose.yaml build"     # ни того, ни другого образа
 
 part "29b. дерево не чисто → отказ: тег назвал бы не тот коммит"
 STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
@@ -1064,6 +1089,7 @@ said "дерево не чисто"
 said "git -C"                                        # выход исполним: показано, где смотреть
 not_called "push"
 not_called "control/compose.yaml build"              # до сборки дело не дошло
+not_called "compose -f $HERE/compose.yaml build"
 
 part "29c. выпуск не из репозитория → отказ, метить нечем"
 STUB_GIT_REPO= STUB_HAVE_PROBE=1 \
@@ -1071,36 +1097,58 @@ STUB_GIT_REPO= STUB_HAVE_PROBE=1 \
 said "не из репозитория"
 not_called "push"
 
-# Штатный ход. Здесь же — ПОРЯДОК тегов: неподвижный уезжает первым, чтобы упавший второй
-# push оставил в реестре полноценный выпуск, а не `latest` без опоры.
-part "29d. штатный выпуск: собрал, пометил двумя тегами, отдал — неподвижный первым"
+# Штатный ход. Здесь же — ПОРЯДОК четырёх push'ей и один `sha` на оба образа.
+part "29d. штатный выпуск: собрал ОБА, пометил каждый двумя тегами, отдал четыре"
 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
-called "control/compose.yaml build"                  # собрал своей же сборкой
+called "compose -f $HERE/compose.yaml build"         # дверь собрана своей же сборкой
+called "control/compose.yaml build"                  # и контроллер — ею же
+called "tag omnifield/world:dev ghcr.io/omnifield/world:sha-abc1234"
+called "tag omnifield/world:dev ghcr.io/omnifield/world:latest"
 called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:sha-abc1234"
 called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:latest"
+called "push ghcr.io/omnifield/world:sha-abc1234"
+called "push ghcr.io/omnifield/world:latest"
 called "push ghcr.io/omnifield/world-control:sha-abc1234"
 called "push ghcr.io/omnifield/world-control:latest"
-n_fixed=$(grep -n '^push .*:sha-abc1234$'  "$STUB_LOG" | head -n1 | cut -d: -f1)
-n_moving=$(grep -n '^push .*:latest$'      "$STUB_LOG" | head -n1 | cut -d: -f1)
-[ -n "$n_fixed" ] && [ -n "$n_moving" ] && [ "$n_fixed" -lt "$n_moving" ] \
-    && good "неподвижный тег отдан раньше подвижного" \
-    || bad "порядок тегов не тот: sha на строке ${n_fixed:-нет}, latest на ${n_moving:-нет}"
-# Первый выпуск создаёт ПРИВАТНЫЙ пакет (умолчание GitHub) — молча оставить это значит
-# отдать юзеру `denied`, который выглядит как «образа нет».
-said "ПРИВАТНЫЙ пакет"
 
-part "29e. реестр не принял → отказ называет вход, подвижный тег НЕ уезжает"
+n_dver_fixed=$(grep -n  '^push .*/world:sha-abc1234$'         "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_pult_fixed=$(grep -n  '^push .*/world-control:sha-abc1234$' "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_dver_mov=$(grep -n    '^push .*/world:latest$'              "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_pult_mov=$(grep -n    '^push .*/world-control:latest$'      "$STUB_LOG" | head -n1 | cut -d: -f1)
+ranshe "неподвижный тег двери отдан раньше её подвижного"        "$n_dver_fixed" "$n_dver_mov"
+ranshe "неподвижный тег пульта отдан раньше его подвижного"      "$n_pult_fixed" "$n_pult_mov"
+ranshe "ОБА неподвижных уехали раньше первого подвижного"        "$n_pult_fixed" "$n_dver_mov"
+ranshe "дверь раньше пульта: неподвижные"                        "$n_dver_fixed" "$n_pult_fixed"
+ranshe "дверь раньше пульта: подвижные"                          "$n_dver_mov"   "$n_pult_mov"
+
+# Один коммит на оба образа — это и есть предмет выпуска. Метка `sha-` обязана быть ровно
+# одна на всю четвёрку: разъедься она, «пульт и дверь одной сборки» стало бы неправдой,
+# которую снаружи не отличить.
+shas=$(grep '^push ' "$STUB_LOG" | sed -n 's/.*:\(sha-[0-9a-f]*\)$/\1/p' | sort -u | wc -l)
+[ "$shas" = 1 ] && good "неподвижный тег у обоих образов ОДИН" \
+                || bad "неподвижных меток на четвёрку оказалось $shas — образы разъехались"
+said "одна сборка"
+# Первый выпуск создаёт ПРИВАТНЫЙ пакет (умолчание GitHub) — молча оставить это значит
+# отдать юзеру `denied`, который выглядит как «образа нет». Пакетов теперь два.
+said "ПРИВАТНЫЙ пакет"
+# Digest спрашивается у ОБОИХ, а не у одного: половина ссылки хуже, чем никакой.
+called "image inspect --format .* ghcr.io/omnifield/world:sha-abc1234"
+called "image inspect --format .* ghcr.io/omnifield/world-control:sha-abc1234"
+
+part "29e. реестр не принял → отказ называет вход; дальше первого тега не уехало НИЧЕГО"
 STUB_PUSH=denied STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh"
 said "docker login"
 said "write:packages"
-called "push ghcr.io/omnifield/world-control:sha-abc1234"
-not_called "push ghcr.io/omnifield/world-control:latest"
+called "push ghcr.io/omnifield/world:sha-abc1234"     # первым идёт неподвижный тег двери
+not_called "push ghcr.io/omnifield/world:latest"
+not_called "push ghcr.io/omnifield/world-control"     # до пульта дело не дошло вовсе
 
-part "29f. реестр — значение: сказали другой, поехало туда, а не в ghcr"
+part "29f. реестр — значение: сказали другой, поехали туда ОБА, а не в ghcr"
 WORLD_REGISTRY=example.test STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
+called "push example.test/omnifield/world:sha-abc1234"
 called "push example.test/omnifield/world-control:sha-abc1234"
 not_called "push ghcr.io"
 
@@ -1128,10 +1176,12 @@ part "29h. --dry-run на ГРЯЗНОМ дереве: показывает пл
 STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 \
     run_case 0 "$HERE/release.sh" --dry-run
 said "не сделано НИЧЕГО"
+said "ghcr.io/omnifield/world:sha-abc1234"
 said "ghcr.io/omnifield/world-control:sha-abc1234"
 said "дерево не чисто"                     # про грязь сказано вслух
 not_called "push"
 not_called "control/compose.yaml build"
+not_called "compose -f $HERE/compose.yaml build"
 # Отказ, который советует выходом сам себя, — диагноз, а не отказ. Здесь отказа нет вовсе,
 # и проверяем именно это: холостой ход не может отправить человека делать холостой ход.
 grep -qF '✗ не выпущено' "$STUB_DIR/out" \
@@ -1146,13 +1196,19 @@ called "push ghcr.io/omnifield/world-control:sha-abc1234"
 not_called "ghcr.io/ghcr.io"               # двойного реестра нет ни в метке, ни в push
 said "реестр взят из имени зоны control"   # и сказано, откуда он взялся
 
-part "29j. в имени ПОРТ реестра → тег отрезан, имя цело"
+part "29j. в имени ПОРТ реестра → тег отрезан, имя цело; реестры у образов РАЗНЫЕ"
 STUB_CONTROL_IMAGE=registry.local:5000/omnifield/world-control:dev \
 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "push registry.local:5000/omnifield/world-control:sha-abc1234"
 called "push registry.local:5000/omnifield/world-control:latest"
-not_called "push ghcr.io"
+not_called "push ghcr.io/omnifield/world-control"
+# Реестр у каждого образа СВОЙ — имя называет его само, и совпадать они не обязаны. Дверь
+# при этом уезжает в свой, а не за компанию в чужой.
+called "push ghcr.io/omnifield/world:sha-abc1234"
+# И вход назван для ОБОИХ: совет «залогинься» с одним реестром отправил бы человека
+# наполовину, а узнал бы он об этом на третьем push'е — когда два тега уже уехали.
+said "ghcr.io и registry.local:5000"
 
 # Стык, которого в находках не было, но он того же рода: реестр назван ДВАЖДЫ и по-разному.
 # Молча выбрать нельзя — выпуск отдал бы вещь не туда, откуда её потом тянут.
@@ -1163,6 +1219,57 @@ STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
 said "два разных реестра"
 not_called "push"
 not_called "control/compose.yaml build"    # отказ ДО сборки: собирать нечего и незачем
+
+# ================================================================== 29l…29p. ДВА ОБРАЗА
+# Сценарии выше пришли из времени, когда выпускался один контроллер, и стерегут его же.
+# Здесь — то, что появилось вместе со вторым образом (`WORLD2-119`): своё имя у двери, общая
+# судьба у пары и место, где половина выпуска могла бы уехать молча.
+
+# Разбор имени у двери ТОТ ЖЕ, что у контроллера, и проверяется он отдельно намеренно: общий
+# код разъезжается не сразу, а когда его чинят с одной стороны.
+part "29l. имя двери УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
+STUB_WORLD_IMAGE=ghcr.io/omnifield/world:latest \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "push ghcr.io/omnifield/world:sha-abc1234"
+not_called "ghcr.io/ghcr.io"
+said "реестр взят из имени зоны deploy"
+
+part "29m. реестр двери назван дважды и по-разному → отказ, а не догадка"
+WORLD_REGISTRY=example.test STUB_WORLD_IMAGE=ghcr.io/omnifield/world:latest \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "два разных реестра"
+not_called "push"
+not_called "compose -f $HERE/compose.yaml build"
+
+# ГЛАВНОЕ СВОЙСТВО ПАРЫ: сборка обоих идёт ДО первой отдачи. Сборка контроллера падает чаще
+# всех — ей единственной нужно поле, — и упади она после отдачи двери, в реестре осталась бы
+# половина выпуска. Проверяем, что дверь при этом собралась (значит порядок настоящий, а не
+# случайно спасший нас отказ раньше времени), а в реестр не ушло ни одного вызова.
+part "29n. сборка контроллера упала → не отдано НИЧЕГО, хотя дверь собралась"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=fail \
+    run_case 1 "$HERE/release.sh"
+called "compose -f $HERE/compose.yaml build"   # дверь собралась — до пульта дошли
+said "не отдано ничего"
+not_called "push"
+not_called "tag "
+
+part "29o. оба образа названы одинаково → отказ: второй лёг бы поверх первого"
+STUB_WORLD_IMAGE=omnifield/world-control:dev \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "названы одинаково"
+not_called "push"
+not_called "compose -f $HERE/compose.yaml build"   # отказ ДО сборки
+
+# Имена образов принадлежат ЗОНАМ и спрашиваются у их файлов запуска. Копии в выпуске нет ни
+# у чужого имени (это стережёт 26e по всей зоне), ни у своего — а своё как раз и подмывает
+# записать «для наглядности»: файл-то наш. Разъедется оно так же молча.
+part "29p. копий имён образов в release.sh нет — ни чужого, ни своего"
+kopii=$(grep -n 'omnifield/world' "$HERE/release.sh" || true)
+[ -z "$kopii" ] && good "release.sh не хранит ни одного имени образа — спрашивает у зон" \
+                || { bad "в выпуске завелась копия имени образа:"; printf '%s\n' "$kopii" >&2; }
 
 # ================================================================== итог
 part "── итог"
