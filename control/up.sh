@@ -89,7 +89,7 @@ usage() {
 
 Отказ печатается двумя строками: причина и выход — человеку, `CONTROL-REFUSAL: <код>` —
 машине. Коды: no-docker · no-compose · no-daemon · no-compose-file · no-image-name ·
-no-registry · no-image-tag · image-denied · pull-failed · no-image-local ·
+no-registry · no-image-tag · image-denied · pull-failed · no-image-local · bad-value ·
 no-pult-artifact · port-busy · up-failed · control-silent · no-container.
 USAGE
 }
@@ -181,6 +181,7 @@ pull_image() {
             refuse image-denied \
                 "реестр не отдал $image: доступ закрыт" \
                 "ПЕРВЫЙ выпуск создаёт ПРИВАТНЫЙ пакет — таково умолчание реестра, и снаружи это выглядит как «образа нет». Открывает его хозяин организации, один раз, руками" \
+                "тем же «denied» реестр отвечает и на образ, которого у него нет вовсе: этих двух случаев докер не различает — проверь имя, прежде чем идти в настройки пакета" \
                 "если пакет закрыт намеренно — войди своим ключом: docker login ${image%%/*}" \
                 "$(offline_way "$image")" ;;
         *"manifest unknown"*|*"manifest for"*|*"no such manifest"*|*"not found"*)
@@ -207,16 +208,24 @@ pull_image() {
 # Тег отвечает «что просили», digest — «что приехало»; без второго `latest` неотличим от
 # `latest` недельной давности.
 report_running() {
-    local asked real digest created
+    local asked real digest created gone=
     asked="$(docker inspect --format '{{.Config.Image}}' "$NAME" 2>/dev/null || true)"
     real="$(docker inspect --format '{{.Image}}' "$NAME" 2>/dev/null || true)"
-    if [ -n "$real" ]; then
+    # Спрашиваем образ ОТДЕЛЬНО от чтения его полей: пустой ответ на поле и «образа нет
+    # вовсе» — разные вещи, а выглядят одинаково. Первое значит «собран здесь», второе —
+    # «контейнер живёт образом, которого на машине уже нет», и выдать одно за другое
+    # значит соврать ровно там, где этот вывод и читают.
+    if [ -n "$real" ] && docker image inspect "$real" >/dev/null 2>&1; then
         digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' "$real" 2>/dev/null || true)"
         created="$(docker image inspect --format '{{.Created}}' "$real" 2>/dev/null || true)"
+    else
+        gone=1
     fi
     say ""
     say "поднят образ : ${asked:-НЕИЗВЕСТЕН — докер не сказал, чем поднят контейнер}"
-    if [ -n "${digest:-}" ]; then
+    if [ -n "$gone" ]; then
+        say "  digest     : не спросить — образа, которым поднят контейнер, на машине уже нет"
+    elif [ -n "${digest:-}" ]; then
         say "  digest     : ${digest#*@}"
     else
         # Молчать тут нельзя: пустая строка читается как «всё в порядке», а это ровно тот
@@ -229,6 +238,17 @@ report_running() {
 
 # ------------------------------------------------------------------ up
 cmd_up() {
+    # Значение, которого мы не понимаем, не проглатывается молча — то же правило, что и у
+    # ручек контроллера с лишним полем в теле. Написавший `CONTROL_OFFLINE=true` ждал
+    # офлайна, а получил бы поход в реестр и отказ про сеть: причину не свою и не ту.
+    case "$OFFLINE" in
+        0|1) ;;
+        *) refuse bad-value \
+            "CONTROL_OFFLINE=$OFFLINE — такого значения нет, а угадывать за тебя нельзя" \
+            "спрашивать реестр (как обычно): убери переменную либо CONTROL_OFFLINE=0" \
+            "не спрашивать и поднять то, что уже лежит здесь: CONTROL_OFFLINE=1" ;;
+    esac
+
     need_tools
 
     step "порт $BIND:$PORT"

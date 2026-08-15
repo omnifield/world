@@ -272,10 +272,20 @@ case "$1" in
         esac
         exit 0 ;;
     image)
+        # Образа нет — значит НЕТ НИ ОДНОГО его поля. Отвечать «полей не знаю, а digest
+        # вот» умеет только плохая заглушка: настоящий докер отказывает на любой вопрос
+        # про исчезнувший образ, и проверка, построенная на поблажке, зеленела бы зря.
+        case "$ALL" in
+            *sha256:*) [ -n "${STUB_IMAGE_GONE:-}" ] && exit 1 ;;
+        esac
         case "$ALL" in
             *RepoDigests*)  printf '%s\n' "${STUB_DIGEST-}"; exit 0 ;;
             *.Created*)     echo '2026-08-15T00:00:00Z';     exit 0 ;;
-            # `image inspect ИМЯ` без формата — вопрос «лежит ли образ здесь».
+            # `image inspect` без формата — вопрос «лежит ли образ здесь», и вопросов этих
+            # ДВА РАЗНЫХ: про ИМЯ (можно ли поднять офлайн) и про sha (жив ли ещё тот
+            # образ, которым поднят контейнер). Слить их значило бы проверять один случай
+            # вместо двух.
+            *sha256:*)      [ -z "${STUB_IMAGE_GONE:-}" ] && exit 0 || exit 1 ;;
             *)              [ -n "${STUB_HAVE_LOCAL:-}" ] && exit 0 || exit 1 ;;
         esac ;;
     compose)
@@ -307,14 +317,12 @@ put_up_pult() {
 }
 
 # Сценарий по умолчанию: реестр отвечает, образа на машине нет, digest у притянутого есть.
-STUB_PULL=ok; STUB_HAVE_LOCAL=; STUB_OFFLINE=0
-STUB_IMAGE=ghcr.io/omnifield/world-control:latest
-STUB_DIGEST=ghcr.io/omnifield/world-control@sha256:podstava
 reset_stub() {
-    STUB_PULL=ok; STUB_HAVE_LOCAL=; STUB_OFFLINE=0
+    STUB_PULL=ok; STUB_HAVE_LOCAL=; STUB_OFFLINE=0; STUB_IMAGE_GONE=
     STUB_IMAGE=ghcr.io/omnifield/world-control:latest
     STUB_DIGEST=ghcr.io/omnifield/world-control@sha256:podstava
 }
+reset_stub
 
 # run_up [ключи…] — позвать подъём с подставным докером. Итог кладём в UP_CODE, UP_OUT
 # (вывод целиком: и человеку, и машинный код) и UP_CALLS (журнал вызовов докера).
@@ -323,7 +331,7 @@ run_up() {
     UP_CODE=0
     UP_LOG="$TMP/up-calls" PATH="$UP_STUB:$PATH" \
     STUB_PULL="$STUB_PULL" STUB_IMAGE="$STUB_IMAGE" STUB_DIGEST="$STUB_DIGEST" \
-    STUB_HAVE_LOCAL="$STUB_HAVE_LOCAL" \
+    STUB_HAVE_LOCAL="$STUB_HAVE_LOCAL" STUB_IMAGE_GONE="$STUB_IMAGE_GONE" \
     CONTROL_OFFLINE="$STUB_OFFLINE" CONTROL_WAIT=3 \
         bash "$UP_ROOT/control/up.sh" "$@" >"$TMP/up-out" 2>&1 || UP_CODE=$?
     UP_OUT="$(cat "$TMP/up-out" 2>/dev/null || true)"
@@ -349,6 +357,7 @@ want_up_code() {
 want_called()     { case "$UP_CALLS" in *"$1"*) ok "$2" ;; *) bad "$2" "в журнале вызовов докера нет «$1»:" "$UP_CALLS" ;; esac; }
 want_not_called() { case "$UP_CALLS" in *"$1"*) bad "$2" "докера позвали с «$1» — а не должны были:" "$UP_CALLS" ;; *) ok "$2" ;; esac; }
 want_said()       { case "$UP_OUT" in *"$1"*) ok "$2" ;; *) bad "$2" "в выводе подъёма нет «$1»:" "$UP_OUT" ;; esac; }
+want_not_said()   { case "$UP_OUT" in *"$1"*) bad "$2" "подъём сказал «$1» — а это неправда:" "$UP_OUT" ;; *) ok "$2" ;; esac; }
 
 # ------------------------------------------------------------------ сборка
 part "собираю контроллер"
@@ -550,6 +559,16 @@ up_green() {
     want_said "digest" "образ без digest'а не выдаётся за притянутый — сказано и про это"
     reset_stub
 
+    # Пара, которую поодиночке не поймать: «полей у образа нет» и «образа нет вовсе»
+    # выглядят одинаково — пустым ответом. Первое значит «собран здесь», второе — «тем
+    # образом, которым поднят контейнер, на машине уже никто не располагает». Выдать одно
+    # за другое значит соврать ровно в той строке, ради которой всё это и печатается.
+    STUB_IMAGE_GONE=1
+    run_up
+    want_not_said "собран на этой машине" "исчезнувший образ не выдан за собранный здесь"
+    want_said "уже нет" "про исчезнувший образ сказано, что спросить не у чего"
+    reset_stub
+
     part "ЗЕЛЁНЫЙ — реестр не спрашивали, и это названо вслух"
     STUB_HAVE_LOCAL=1; STUB_OFFLINE=1
     run_up
@@ -747,6 +766,9 @@ up_red() {
     part "КРАСНЫЙ — офлайн и ключи не по адресу"
     reset_stub; STUB_OFFLINE=1; STUB_HAVE_LOCAL=; run_up
     want_up_code no-image-local "офлайн без образа на машине — поднимать нечего"
+
+    reset_stub; STUB_OFFLINE=true; run_up
+    want_up_code bad-value "значение, которого мы не понимаем, не проглатывается молча"
 
     reset_stub; run_up --build      # пульта в этом корне нет
     want_up_code no-pult-artifact "--build без собранного пульта отказывает ДО сборки"
