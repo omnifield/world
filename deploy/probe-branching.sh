@@ -15,7 +15,13 @@
 # │    (`./deploy/probe.sh`) обязателен отдельно и ничем не заменяется;                 │
 # │  · ДОКЕР ЗДЕСЬ ПОДСТАВНОЙ — скрипт-заглушка в `PATH`, который пишет журнал вызовов   │
 # │    и отвечает по сценарию. Он не запускает контейнеров и за докер себя не выдаёт:    │
-# │    в отчёте это сказано прямо, а не подразумевается.                                │
+# │    в отчёте это сказано прямо, а не подразумевается;                                │
+# │  · ГИТ ТОЖЕ ПОДСТАВНОЙ — им проверяется ВЫПУСК, который метит образ коммитом и не    │
+# │    выпускает из грязного дерева. Настоящим гитом оба исхода не проверить, не         │
+# │    пачкая рабочую копию, а проба чужую работу трогать не вправе;                    │
+# │  · В РЕЕСТР ОНА НЕ ХОДИТ. Ни одной настоящей публикации: сценарии выпуска смотрят,   │
+# │    что было бы отдано и в каком порядке. Живой выпуск — это настоящий `push`, и      │
+# │    заменить его пробой нельзя.                                                      │
 # └─────────────────────────────────────────────────────────────────────────────────────┘
 #
 # Зачем она нужна, если есть живая проба. Развилка «образ есть — не собирать» по кодам
@@ -51,14 +57,16 @@ usage() {
     cat <<'USAGE'
 Проба ветвления: ./deploy/probe-branching.sh
 
-  Прогоняет up.sh и build.sh на ПОДСТАВНОМ докере и смотрит журнал вызовов:
-  что было вызвано и чего вызвано не было. Докера на машине не требует.
+  Прогоняет up.sh, build.sh и release.sh на ПОДСТАВНЫХ докере и гите и
+  смотрит журнал вызовов: что было вызвано и чего вызвано не было. Ни докера,
+  ни выхода в реестр на машине не требует.
 
   ГРАНИЦЫ, за которые эта проба не отвечает:
     · она проверяет ВЕТВЛЕНИЕ, а не подъём: встал ли мир — здесь не знают;
     · ЗЕЛЁНАЯ ОНА НЕ ЗНАЧИТ, ЧТО МИР ПОДНИМАЕТСЯ — живой прогон
       (./deploy/probe.sh) обязателен отдельно и ничем не заменяется;
-    · докер подставной, контейнеров не запускается ни одного.
+    · докер и гит подставные, контейнеров не запускается ни одного;
+    · В РЕЕСТР НЕ ХОДИТ ВОВСЕ — ни одной публикации, ни настоящей, ни пробной.
 
   Трогает на диске: deploy/.build/web-dist (настоящая сборка отодвигается
   и возвращается в конце). Разрушительного для живого мира — ничего:
@@ -120,10 +128,24 @@ case "$1" in
     network) exit 0 ;;
     pull) [ -n "${STUB_PULL_OK:-}" ] && exit 0 || exit 1 ;;
     image)
+        # `image inspect --format …{{RepoDigests}}…` — вопрос выпуска: под каким digest'ом
+        # образ лёг в реестр. Отвечаем подставным: проверяется, что его СПРАШИВАЮТ и
+        # печатают, а не то, чему он равен.
+        case "$ALL" in
+            *RepoDigests*) echo "ghcr.io/omnifield/world-control@sha256:podstava"; exit 0 ;;
+        esac
         case "$3" in
             omnifield/world:dev)    [ -n "${STUB_HAVE_IMAGE:-}" ]     && exit 0 || exit 1 ;;
             omnifield/location:dev) [ -n "${STUB_HAVE_LOC_IMAGE:-}" ] && exit 0 || exit 1 ;;
             *)                      [ -n "${STUB_HAVE_PROBE:-}" ]     && exit 0 || exit 1 ;;
+        esac ;;
+    tag) exit 0 ;;
+    push)
+        # Реестр отвечает по сценарию. `denied` — это и «не залогинен», и «нет прав на
+        # организацию»: докер их не различает, и отказ выпуска обязан назвать оба.
+        case "${STUB_PUSH:-ok}" in
+            ok) exit 0 ;;
+            *)  echo 'denied: requested access to the resource is denied' >&2; exit 1 ;;
         esac ;;
     exec)
         # `docker exec` в живой локации: стук в сторожа и команды входа в поле. Тем же
@@ -149,8 +171,16 @@ case "$1" in
         case "$1" in
             config)
                 case "$ALL" in
-                    *location-compose.yaml*) echo "omnifield/location:dev" ;;
-                    *)                       echo "omnifield/world:dev" ;;
+                    *location-compose.yaml*)  echo "omnifield/location:dev" ;;
+                    # Имя образа контроллера принадлежит зоне `control`, и спрашивают его
+                    # у неё же — так делают и сборка, и выпуск. Отвечаем за неё.
+                    #
+                    # Имя ЗАДАЁТСЯ СЦЕНАРИЕМ: соседняя задача той же истории (`WORLD2-112`)
+                    # пропишет туда полный адрес с реестром, а бывают и адреса с портом.
+                    # Проверять выпуск только на сегодняшнем имени значит проверять его на
+                    # том единственном случае, где он и так работает.
+                    *control/compose.yaml*)   echo "${STUB_CONTROL_IMAGE:-omnifield/world-control:dev}" ;;
+                    *)                        echo "omnifield/world:dev" ;;
                 esac
                 exit 0 ;;
             ps) echo "podstavnoy-kontejner-id"; exit 0 ;;
@@ -202,6 +232,32 @@ case "$1" in
 esac
 STUB
 chmod +x "$STUB_DIR/docker"
+
+# ------------------------------------------------------------------ подставной git
+# Выпуск (`release.sh`) метит образ КОММИТОМ и отказывается выпускать из грязного дерева.
+# Проверить оба исхода настоящим гитом нельзя, не пачкая настоящее дерево, — а проба,
+# которая ради своего сценария правит рабочую копию, однажды съест чужую работу. Поэтому
+# гит здесь подставной, ровно как докер: он отвечает по сценарию и ничего не трогает.
+#
+# Знает он три вопроса и больше ничему не учится: репозиторий ли это, чисто ли дерево, какой
+# коммит. Ровно те три, что задаёт выпуск.
+cat > "$STUB_DIR/git" <<'STUBGIT'
+#!/usr/bin/env bash
+# ПОДСТАВНОЙ git: отвечает по сценарию, рабочей копии не касается.
+printf 'git %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+while [ $# -gt 0 ]; do case "$1" in -C) shift 2 ;; *) break ;; esac; done
+case "$1" in
+    rev-parse)
+        case "$*" in
+            *--git-dir*) [ -n "${STUB_GIT_REPO-1}" ] && { echo .git; exit 0; }; exit 128 ;;
+            *HEAD*)      printf '%s\n' "${STUB_GIT_SHA:-abc1234}"; exit 0 ;;
+        esac ;;
+    status) [ -n "${STUB_GIT_DIRTY:-}" ] && printf ' M deploy/probe.sh\n'; exit 0 ;;
+esac
+exit 0
+STUBGIT
+chmod +x "$STUB_DIR/git"
+
 export PATH="$STUB_DIR:$PATH"
 export STUB_NODE_IMAGE="$NODE_IMAGE"
 export STUB_LOG="$STUB_DIR/log"
@@ -982,6 +1038,131 @@ sloy=$(grep -nE '^[[:space:]]*(COPY|ENV|RUN|VOLUME).*(web-dist|/app/web)' "$HERE
 kontekst=$(grep -nE '^![[:space:]]*(deploy|web)/' "$HERE/Dockerfile.dockerignore" || true)
 [ -z "$kontekst" ] && good "в контекст сборки образа мира открыт только core/" \
                    || { bad "в контекст сборки двери снова пускают зону с вебом:"; printf '%s\n' "$kontekst" >&2; }
+
+# ================================================================== 29. ВЫПУСК
+# Выпуск отдаёт вещь НАРУЖУ, и это необратимо: опубликованное уже скачали. Значит стеречь
+# надо не «сработало ли», а ГРАНИЦЫ — что выпуск делает только по прямой просьбе, метит
+# правдой и не молчит, когда реестр отказал.
+#
+# Тегов два, и они разной природы: подвижный `latest` и неподвижный `sha-<коммит>`. Проба
+# держит именно это различие — что неподвижный уезжает ПЕРВЫМ и что метка выведена из
+# коммита, а не придумана.
+part "29. выпуск: --dry-run не трогает ничего"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh" --dry-run
+said "ghcr.io/omnifield/world-control:sha-abc1234"
+said "ghcr.io/omnifield/world-control:latest"
+said "не сделано НИЧЕГО"
+not_called "push"                                    # в реестр не ходили
+not_called "tag omnifield/world-control"             # и меток не ставили
+not_called "control/compose.yaml build"              # и не собирали
+
+part "29b. дерево не чисто → отказ: тег назвал бы не тот коммит"
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "дерево не чисто"
+said "git -C"                                        # выход исполним: показано, где смотреть
+not_called "push"
+not_called "control/compose.yaml build"              # до сборки дело не дошло
+
+part "29c. выпуск не из репозитория → отказ, метить нечем"
+STUB_GIT_REPO= STUB_HAVE_PROBE=1 \
+    run_case 1 "$HERE/release.sh"
+said "не из репозитория"
+not_called "push"
+
+# Штатный ход. Здесь же — ПОРЯДОК тегов: неподвижный уезжает первым, чтобы упавший второй
+# push оставил в реестре полноценный выпуск, а не `latest` без опоры.
+part "29d. штатный выпуск: собрал, пометил двумя тегами, отдал — неподвижный первым"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "control/compose.yaml build"                  # собрал своей же сборкой
+called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:sha-abc1234"
+called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:latest"
+called "push ghcr.io/omnifield/world-control:sha-abc1234"
+called "push ghcr.io/omnifield/world-control:latest"
+n_fixed=$(grep -n '^push .*:sha-abc1234$'  "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_moving=$(grep -n '^push .*:latest$'      "$STUB_LOG" | head -n1 | cut -d: -f1)
+[ -n "$n_fixed" ] && [ -n "$n_moving" ] && [ "$n_fixed" -lt "$n_moving" ] \
+    && good "неподвижный тег отдан раньше подвижного" \
+    || bad "порядок тегов не тот: sha на строке ${n_fixed:-нет}, latest на ${n_moving:-нет}"
+# Первый выпуск создаёт ПРИВАТНЫЙ пакет (умолчание GitHub) — молча оставить это значит
+# отдать юзеру `denied`, который выглядит как «образа нет».
+said "ПРИВАТНЫЙ пакет"
+
+part "29e. реестр не принял → отказ называет вход, подвижный тег НЕ уезжает"
+STUB_PUSH=denied STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "docker login"
+said "write:packages"
+called "push ghcr.io/omnifield/world-control:sha-abc1234"
+not_called "push ghcr.io/omnifield/world-control:latest"
+
+part "29f. реестр — значение: сказали другой, поехало туда, а не в ghcr"
+WORLD_REGISTRY=example.test STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "push example.test/omnifield/world-control:sha-abc1234"
+not_called "push ghcr.io"
+
+# Главная граница всей затеи: обычная сборка публиковать не умеет. Проверяем её же
+# командой — не «нет ключа», а «ни одного вызова в реестр».
+part "29g. обычная сборка НЕ публикует — ни метки, ни push"
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --control
+called "control/compose.yaml build"
+not_called "push"
+not_called "tag omnifield/world-control"
+
+# И то же самое про файлы: ключа выпуска в сборке нет вовсе — ни `--push`, ни `--release`.
+publik=$(grep -nE '^[[:space:]]*(--push|--release|--publish)\)' "$HERE/build.sh" || true)
+[ -z "$publik" ] && good "в build.sh нет ключа публикации — выпуск живёт отдельной командой" \
+                 || { bad "в сборку завёлся ключ публикации:"; printf '%s\n' "$publik" >&2; }
+
+# ================================================================== 29h…29k. СТЫКИ
+# Сценарии выше стерегут ШТАТНЫЙ ход: ключ отдельно, состояние отдельно. Три находки ревью
+# (`WORLD2-111`) прошли мимо них все три — и все три жили на СТЫКЕ: ключ плюс состояние
+# дерева, имя плюс реестр, имя плюс порт. Проба, которая проверяет каждую вещь в одиночку,
+# такие места не видит по устройству, а не по строгости. Здесь — стыки.
+
+part "29h. --dry-run на ГРЯЗНОМ дереве: показывает план, говорит про грязь, не отказывает"
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 \
+    run_case 0 "$HERE/release.sh" --dry-run
+said "не сделано НИЧЕГО"
+said "ghcr.io/omnifield/world-control:sha-abc1234"
+said "дерево не чисто"                     # про грязь сказано вслух
+not_called "push"
+not_called "control/compose.yaml build"
+# Отказ, который советует выходом сам себя, — диагноз, а не отказ. Здесь отказа нет вовсе,
+# и проверяем именно это: холостой ход не может отправить человека делать холостой ход.
+grep -qF '✗ не выпущено' "$STUB_DIR/out" \
+    && { bad "холостой ход ОТКАЗАЛ на грязном дереве"; tail -n 6 "$STUB_DIR/out" >&2; } \
+    || good "холостой ход не отказывает — и не советует выходом сам себя"
+
+part "29i. имя от control УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
+STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "push ghcr.io/omnifield/world-control:sha-abc1234"
+not_called "ghcr.io/ghcr.io"               # двойного реестра нет ни в метке, ни в push
+said "реестр взят из имени зоны control"   # и сказано, откуда он взялся
+
+part "29j. в имени ПОРТ реестра → тег отрезан, имя цело"
+STUB_CONTROL_IMAGE=registry.local:5000/omnifield/world-control:dev \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "push registry.local:5000/omnifield/world-control:sha-abc1234"
+called "push registry.local:5000/omnifield/world-control:latest"
+not_called "push ghcr.io"
+
+# Стык, которого в находках не было, но он того же рода: реестр назван ДВАЖДЫ и по-разному.
+# Молча выбрать нельзя — выпуск отдал бы вещь не туда, откуда её потом тянут.
+part "29k. реестр назван дважды и по-разному → отказ, а не догадка"
+WORLD_REGISTRY=example.test STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "два разных реестра"
+not_called "push"
+not_called "control/compose.yaml build"    # отказ ДО сборки: собирать нечего и незачем
 
 # ================================================================== итог
 part "── итог"
