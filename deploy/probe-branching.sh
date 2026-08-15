@@ -139,7 +139,7 @@ case "$1" in
             *RepoDigests*) last="${!#}"; printf '%s@sha256:podstava\n' "${last%:*}"; exit 0 ;;
         esac
         case "$3" in
-            omnifield/world:dev)    [ -n "${STUB_HAVE_IMAGE:-}" ]     && exit 0 || exit 1 ;;
+            ghcr.io/omnifield/world:latest) [ -n "${STUB_HAVE_IMAGE:-}" ] && exit 0 || exit 1 ;;
             omnifield/location:dev) [ -n "${STUB_HAVE_LOC_IMAGE:-}" ] && exit 0 || exit 1 ;;
             *)                      [ -n "${STUB_HAVE_PROBE:-}" ]     && exit 0 || exit 1 ;;
         esac ;;
@@ -187,8 +187,8 @@ case "$1" in
                     # Имя образа МИРА принадлежит зоне `deploy` и живёт в её файле запуска.
                     # Выпуск спрашивает его там же, где чужое, — и сценарием оно так же
                     # крутится: у двери те же три случая разбора, что и у контроллера.
-                    *deploy/compose.yaml*)    echo "${STUB_WORLD_IMAGE:-omnifield/world:dev}" ;;
-                    *)                        echo "omnifield/world:dev" ;;
+                    *deploy/compose.yaml*)    echo "${STUB_WORLD_IMAGE:-ghcr.io/omnifield/world:latest}" ;;
+                    *)                        echo "ghcr.io/omnifield/world:latest" ;;
                 esac
                 exit 0 ;;
             ps) echo "podstavnoy-kontejner-id"; exit 0 ;;
@@ -1040,12 +1040,22 @@ sloy=$(grep -nE '^[[:space:]]*(COPY|ENV|RUN|VOLUME).*(web-dist|/app/web)' "$HERE
 [ -z "$sloy" ] && good "в Dockerfile двери нет слоя под веб — ни COPY, ни каталога" \
                || { bad "в образ двери снова кладут веб:"; printf '%s\n' "$sloy" >&2; }
 
-# 3. и в контекст сборки он не попадает вовсе: белый список открывает один `core/`. Пустишь
-#    обратно `deploy/` или `web/` — и `COPY` вернётся первым, кому покажется, что раз файлы
-#    рядом, значит их сюда и клали.
-kontekst=$(grep -nE '^![[:space:]]*(deploy|web)/' "$HERE/Dockerfile.dockerignore" || true)
-[ -z "$kontekst" ] && good "в контекст сборки образа мира открыт только core/" \
-                   || { bad "в контекст сборки двери снова пускают зону с вебом:"; printf '%s\n' "$kontekst" >&2; }
+# 3. и в контекст сборки он не попадает вовсе: белый список открывает один каталог `core/` и
+#    один ФАЙЛ — точку входа образа (`WORLD2-121`). Пустишь обратно `deploy/` или `web/`
+#    целиком — и `COPY` вернётся первым, кому покажется, что раз файлы рядом, значит их сюда
+#    и клали. Поэтому исключение проверяется поимённо: не «есть ли что-то из deploy», а
+#    «ровно ли этот один файл».
+razresheno='deploy/door-entry.sh'
+kontekst=$(grep -nE '^![[:space:]]*(deploy|web)/' "$HERE/Dockerfile.dockerignore" \
+           | grep -vE "^[0-9]+:![[:space:]]*${razresheno}\$" || true)
+[ -z "$kontekst" ] && good "в контекст сборки образа мира открыты только core/ и $razresheno" \
+                   || { bad "в контекст сборки двери снова пускают лишнее:"; printf '%s\n' "$kontekst" >&2; }
+
+# 3b. и сама точка входа в контексте ЕСТЬ — иначе `COPY` в Dockerfile упал бы на сборке, а
+#     проба выше зеленела бы: «лишнего не пускают» и «нужное пускают» — разные утверждения.
+grep -qE "^![[:space:]]*${razresheno}\$" "$HERE/Dockerfile.dockerignore" \
+    && good "точка входа образа открыта в контексте поимённо" \
+    || bad "точки входа $razresheno в контексте сборки нет — образ не соберётся"
 
 # ================================================================== 29. ВЫПУСК
 # Выпуск отдаёт вещь НАРУЖУ, и это необратимо: опубликованное уже скачали. Значит стеречь
@@ -1078,7 +1088,7 @@ said "ghcr.io/omnifield/world-control:latest"
 said "не сделано НИЧЕГО"
 not_called "push"                                    # в реестр не ходили
 not_called "tag omnifield/world-control"             # и меток не ставили
-not_called "tag omnifield/world:dev"                 # ни у контроллера, ни у двери
+not_called "tag ghcr.io/omnifield/world:latest"      # ни у контроллера, ни у двери
 not_called "control/compose.yaml build"              # и не собирали
 not_called "compose -f $HERE/compose.yaml build"     # ни того, ни другого образа
 
@@ -1103,8 +1113,12 @@ STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "compose -f $HERE/compose.yaml build"         # дверь собрана своей же сборкой
 called "control/compose.yaml build"                  # и контроллер — ею же
-called "tag omnifield/world:dev ghcr.io/omnifield/world:sha-abc1234"
-called "tag omnifield/world:dev ghcr.io/omnifield/world:latest"
+called "tag ghcr.io/omnifield/world:latest ghcr.io/omnifield/world:sha-abc1234"
+# Подвижная метка двери совпадает с её локальным именем — образ метится сам собой. Это не
+# лишний вызов, а следствие того, что имя в файле запуска и есть то, что публикуют
+# (`WORLD2-121`): докер такую метку принимает молча, и выпуску не приходится знать,
+# совпало имя или нет.
+called "tag ghcr.io/omnifield/world:latest ghcr.io/omnifield/world:latest"
 called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:sha-abc1234"
 called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:latest"
 called "push ghcr.io/omnifield/world:sha-abc1234"
@@ -1145,8 +1159,14 @@ called "push ghcr.io/omnifield/world:sha-abc1234"     # первым идёт н
 not_called "push ghcr.io/omnifield/world:latest"
 not_called "push ghcr.io/omnifield/world-control"     # до пульта дело не дошло вовсе
 
-part "29f. реестр — значение: сказали другой, поехали туда ОБА, а не в ghcr"
-WORLD_REGISTRY=example.test STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+# Реестр остаётся ЗНАЧЕНИЕМ, а не зашитым словом, — но решает он только там, где имя его не
+# несёт. Сегодняшние имена обоих образов несут реестр сами (`WORLD2-121`), поэтому сценарий
+# берёт имена БЕЗ реестра: иначе он проверял бы не переменную, а отказ «два разных реестра»
+# (его стерегут 29k и 29m).
+part "29f. реестр — значение: имена его не несут, сказали другой → поехали туда ОБА"
+WORLD_REGISTRY=example.test \
+STUB_WORLD_IMAGE=omnifield/world:dev STUB_CONTROL_IMAGE=omnifield/world-control:dev \
+STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "push example.test/omnifield/world:sha-abc1234"
 called "push example.test/omnifield/world-control:sha-abc1234"
@@ -1270,6 +1290,233 @@ part "29p. копий имён образов в release.sh нет — ни чу
 kopii=$(grep -n 'omnifield/world' "$HERE/release.sh" || true)
 [ -z "$kopii" ] && good "release.sh не хранит ни одного имени образа — спрашивает у зон" \
                 || { bad "в выпуске завелась копия имени образа:"; printf '%s\n' "$kopii" >&2; }
+
+# ================================================================== 30. ТОЧКА ВХОДА ОБРАЗА
+# `deploy/door-entry.sh` — то, что делает дверь ИЗНУТРИ образа: проверяет состояние,
+# поднимает мир, дожидается ответа двери и говорит, видно ли её в поле (`WORLD2-121`).
+# Раньше это делал `up.sh` снаружи, но на машине юзера снаружи нет ничего.
+#
+# ПРОГОНЯЕМ НАСТОЯЩИЙ ФАЙЛ, а не его пересказ: кладём рядом с ним подставной мир, даём
+# подставной `wget` и подсовываем временное состояние. Ровно ради этого точка входа и
+# осталась ОТДЕЛЬНЫМ ФАЙЛОМ: строку `RUN cat > … <<EOF` в Dockerfile нельзя ни прочитать,
+# ни прогнать — её проверяет только живой подъём, то есть юзер.
+#
+# ЧЕГО ЭТА ЧАСТЬ НЕ ПРОВЕРЯЕТ: она не поднимает контейнер и не знает про докер вовсе.
+# «Видно ли меня в поле» здесь отвечает подставной `wget`, а не настоящая сеть; настоящее
+# имя в общей сети проверяет живая проба из ЧУЖОГО контейнера (`probe.sh`, проверка 6).
+part "30. точка входа образа двери — прогоняется без докера"
+
+ENTRY_DIR="$STUB_DIR/obraz"
+ENTRY_STATE="$STUB_DIR/sostoyanie"
+ENTRY_WLOG="$STUB_DIR/mir.log"
+mkdir -p "$ENTRY_DIR"
+cp "$HERE/door-entry.sh" "$ENTRY_DIR/door-entry.sh"
+
+# Подставной мир: живёт сколько сказали, пишет в свой журнал, что с ним делали. По этому
+# журналу видно то, чего не видно по коду возврата, — запускали ли его вообще и дошёл ли
+# до него сигнал.
+cat > "$ENTRY_DIR/world" <<'MIR'
+#!/bin/sh
+printf 'мир запущен\n' >> "${STUB_WORLD_LOG:-/dev/null}"
+trap 'printf "мир получил TERM\n" >> "${STUB_WORLD_LOG:-/dev/null}"; exit 0' TERM
+i=0
+while [ "$i" -lt "${STUB_WORLD_LIFE:-2}" ]; do sleep 1; i=$((i + 1)); done
+exit "${STUB_WORLD_CODE:-0}"
+MIR
+
+# Подставной `wget` — тот самый стук, которым точка входа проверяет дверь. Разводим два
+# адреса: петля (жива ли дверь) и контрактное имя (видно ли нас в поле).
+cat > "$ENTRY_DIR/wget" <<'WGET'
+#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        http://127.0.0.1:*) exit "${STUB_KNOCK_LOCAL:-0}" ;;
+        http://*)           exit "${STUB_KNOCK_FIELD:-0}" ;;
+    esac
+done
+exit 1
+WGET
+chmod +x "$ENTRY_DIR/world" "$ENTRY_DIR/wget"
+
+# entry_case ОЖИДАЕМЫЙ-КОД ПЕРЕМЕННЫЕ… — прогон точки входа с чистым состоянием.
+entry_case() {
+    local want="$1"; shift
+    rm -rf "$ENTRY_STATE"; mkdir -p "$ENTRY_STATE/field" "$ENTRY_STATE/stand"
+    : > "$ENTRY_WLOG"
+    env PATH="$ENTRY_DIR:$PATH" \
+        WORLD_DOOR_FILE="$ENTRY_STATE/field/locations.json" \
+        WORLD_STAND_DIR="$ENTRY_STATE/stand" \
+        WORLD_WAIT=2 STUB_WORLD_LOG="$ENTRY_WLOG" "$@" \
+        "$ENTRY_DIR/door-entry.sh" > "$STUB_DIR/out" 2>&1
+    local got=$?
+    if [ "$got" = "$want" ]; then good "код возврата $got"
+    else bad "код возврата $got, ждали $want"; tail -n 8 "$STUB_DIR/out" >&2; fi
+}
+# otkaz КОД — точка входа обязана отказать ИМЕННО этим кодом. Стережём код, а не
+# формулировку: проба, привязанная к буквам, зеленеет на верной правке (`WORLD2` 4.2).
+otkaz() {
+    if grep -q "^WORLD-REFUSAL: $1\$" "$STUB_DIR/out"; then good "отказ кодом $1"
+    else
+        local got; got="$(sed -n 's/^WORLD-REFUSAL: //p' "$STUB_DIR/out" | head -n1)"
+        bad "ждали отказ $1, получили «${got:-отказа нет вовсе}»"
+        tail -n 6 "$STUB_DIR/out" >&2
+    fi
+}
+ne_otkaz() {
+    grep -q '^WORLD-REFUSAL: ' "$STUB_DIR/out" \
+        && { bad "отказ там, где его быть не должно"; grep '^WORLD-REFUSAL: ' "$STUB_DIR/out" >&2; } \
+        || good "отказа нет — подъём состоялся"
+}
+mir_zapuskali() {
+    grep -q 'мир запущен' "$ENTRY_WLOG" && good "мир запускался" \
+                                        || bad "мир не запускался, а должен был"
+}
+mir_ne_zapuskali() {
+    grep -q 'мир запущен' "$ENTRY_WLOG" \
+        && bad "мир запустили ДО проверок — отказ пришёл бы поверх работающей двери" \
+        || good "до запуска мира дело не дошло — проверки идут первыми"
+}
+
+part "30a. штатный подъём: состояние на месте, дверь ответила, имя в поле разрешается"
+entry_case 0 STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+ne_otkaz
+mir_zapuskali
+said "дверь отвечает"
+said "разрешается и ведёт в меня"
+
+part "30b. состояние не пишется → отказ ДО запуска мира"
+rm -rf "$ENTRY_STATE"; mkdir -p "$ENTRY_STATE/field" "$ENTRY_STATE/stand"
+chmod 500 "$ENTRY_STATE/field"
+: > "$ENTRY_WLOG"
+env PATH="$ENTRY_DIR:$PATH" \
+    WORLD_DOOR_FILE="$ENTRY_STATE/field/locations.json" \
+    WORLD_STAND_DIR="$ENTRY_STATE/stand" \
+    WORLD_WAIT=2 STUB_WORLD_LOG="$ENTRY_WLOG" \
+    "$ENTRY_DIR/door-entry.sh" > "$STUB_DIR/out" 2>&1
+[ $? = 1 ] && good "код возврата 1" || bad "отказ на непишущемся состоянии не сработал"
+chmod 700 "$ENTRY_STATE/field"
+otkaz state-not-writable
+mir_ne_zapuskali
+said "выход: "                      # причина без выхода — диагноз, а не отказ
+
+part "30c. каталога состояния нет вовсе → свой код, а не общий"
+rm -rf "$ENTRY_STATE"; mkdir -p "$ENTRY_STATE/stand"
+: > "$ENTRY_WLOG"
+env PATH="$ENTRY_DIR:$PATH" \
+    WORLD_DOOR_FILE="$ENTRY_STATE/field/locations.json" \
+    WORLD_STAND_DIR="$ENTRY_STATE/stand" \
+    WORLD_WAIT=2 STUB_WORLD_LOG="$ENTRY_WLOG" \
+    "$ENTRY_DIR/door-entry.sh" > "$STUB_DIR/out" 2>&1
+[ $? = 1 ] && good "код возврата 1" || bad "пропавший каталог состояния не остановил подъём"
+otkaz state-missing
+mir_ne_zapuskali
+
+# Мир здесь живёт ДОЛЬШЕ, чем длится ожидание, — иначе сценарий проверял бы не то: успей
+# подставной мир выйти к концу ожидания, и точка входа честно назвала бы это `door-dead`.
+# Порядок разбора у неё именно такой: сперва «вышел ли», потом «молчит ли», потому что
+# «умер» — диагноз точнее, чем «не ответил».
+part "30d. дверь молчит, а мир жив → отказ door-silent, и мир не остаётся сиротой"
+entry_case 1 STUB_KNOCK_LOCAL=1 STUB_KNOCK_FIELD=1 STUB_WORLD_LIFE=30
+otkaz door-silent
+mir_zapuskali
+# Ждём отметку, а не смотрим сразу: сигнал доходит мгновенно, но обработчик в оболочке
+# срабатывает МЕЖДУ командами — подставной мир допишет строку, только выйдя из своего
+# `sleep`. Проверять такое без ожидания значит проверять скорость машины.
+for _ in 1 2 3; do grep -q 'мир получил TERM' "$ENTRY_WLOG" && break; sleep 1; done
+grep -q 'мир получил TERM' "$ENTRY_WLOG" \
+    && good "молчащему миру передан TERM — процесс не брошен" \
+    || bad "мир остался работать после отказа" "точка входа вышла, а он живёт — это осиротевший процесс"
+
+part "30e. мир вышел сам → отказ door-dead, а не door-silent"
+entry_case 1 STUB_KNOCK_LOCAL=1 STUB_KNOCK_FIELD=1 STUB_WORLD_LIFE=0 STUB_WORLD_CODE=3
+otkaz door-dead
+said "код 3"                        # чужой код назван, а не спрятан за своим
+
+part "30f. в поле не видно → ПРЕДУПРЕЖДЕНИЕ, а не отказ: дверь на пустой машине законна"
+entry_case 0 STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=1
+ne_otkaz
+said "в общей сети меня по имени не видно"
+said "--network omnifield-gateway --network-alias"
+said "docker network create omnifield-gateway"
+
+part "30g. попросили другую команду → выполняется она, а мир не поднимается"
+: > "$ENTRY_WLOG"
+env PATH="$ENTRY_DIR:$PATH" STUB_WORLD_LOG="$ENTRY_WLOG" \
+    "$ENTRY_DIR/door-entry.sh" printf 'чужая команда\n' > "$STUB_DIR/out" 2>&1
+[ $? = 0 ] && good "код возврата 0" || bad "чужая команда не выполнилась"
+said "чужая команда"
+mir_ne_zapuskali
+
+part "30h. сигнал доходит до мира: docker stop закрывает дверь, а не добивает её"
+rm -rf "$ENTRY_STATE"; mkdir -p "$ENTRY_STATE/field" "$ENTRY_STATE/stand"
+: > "$ENTRY_WLOG"
+env PATH="$ENTRY_DIR:$PATH" \
+    WORLD_DOOR_FILE="$ENTRY_STATE/field/locations.json" \
+    WORLD_STAND_DIR="$ENTRY_STATE/stand" \
+    WORLD_WAIT=2 STUB_WORLD_LOG="$ENTRY_WLOG" STUB_WORLD_LIFE=30 \
+    "$ENTRY_DIR/door-entry.sh" > "$STUB_DIR/out" 2>&1 &
+entry_pid=$!
+sleep 3
+kill -TERM "$entry_pid" 2>/dev/null
+wait "$entry_pid"; entry_rc=$?
+[ "$entry_rc" = 0 ] && good "точка входа вышла кодом 0 — дверь закрылась сама" \
+                    || bad "выход по сигналу дал код $entry_rc" "докер счёл бы это падением двери"
+grep -q 'мир получил TERM' "$ENTRY_WLOG" \
+    && good "TERM передан миру, а не съеден оболочкой" \
+    || bad "мир сигнала не получил" "docker stop ждал бы десять секунд и добивал дверь по таймауту"
+
+part "30i. у двери нет власти над машиной — ни сокета, ни докера в образе"
+sokety=$(grep -n 'docker\.sock\|--privileged' "$HERE/door-entry.sh" || true)
+[ -z "$sokety" ] && good "в точке входа двери нет ни сокета, ни привилегий" \
+                 || { bad "дверь тянется к власти над машиной:"; printf '%s\n' "$sokety" >&2; }
+stavim=$(grep -nE '^[[:space:]]*RUN .*(apk add|docker-cli|docker-compose)' "$HERE/Dockerfile" || true)
+[ -z "$stavim" ] && good "в образ двери не ставится ни докер-клиент, ни compose" \
+                 || { bad "в образ двери ставят инструменты власти:"; printf '%s\n' "$stavim" >&2; }
+
+# ================================================================== 31. КОМАНДА ЮЗЕРА
+# Команда `docker run` напечатана в `deploy/README.md` и должна работать КОПИРОВАНИЕМ, а не
+# пересказом. Проверяем не текст вокруг, а саму команду: имя образа, тома, и — главное —
+# отсутствие докер-сокета. Дверь власти над машиной не имеет никогда (`WORLD2` 3.7); попади
+# сокет в её команду, это была бы поломка модели, а не удобство.
+part "31. команда юзера в README — одна, без сокета и не разъехалась с файлом запуска"
+
+# Команду вырезаем целиком: первая строка `docker run` и все продолжения через `\`. Берём
+# ИМЕННО подъём двери (`--name world-door`), а не любой `docker run` в тексте: примеров с
+# докером в README много, и проверять «какой-нибудь из них» значит не проверять ничего.
+komanda=$(awk '
+    /^docker run/            { blok = $0; v = ($0 ~ /\\$/); if (!v) sdat(); next }
+    v                        { blok = blok "\n" $0; if ($0 !~ /\\$/) { v = 0; sdat() } }
+    function sdat() { if (blok ~ /--name world-door/) print blok; blok = "" }
+' "$HERE/README.md")
+[ -n "$komanda" ] && good "команда подъёма двери в README есть" \
+                  || bad "команды docker run с world-door в README нет — юзеру нечего копировать"
+
+case "$komanda" in
+    *docker.sock*) bad "в команде двери появился докер-сокет:" ; printf '%s\n' "$komanda" >&2 ;;
+    *)             good "сокета в команде двери НЕТ — власти над машиной у неё не появилось" ;;
+esac
+
+for nado in "--name world-door" "-p " "-v world-field:/field" "-v world-stand:/stand" "restart"; do
+    case "$komanda" in
+        *"$nado"*) good "в команде есть «$nado»" ;;
+        *) bad "в команде нет «$nado»" "скопированная команда дала бы не ту дверь, что описана рядом" ;;
+    esac
+done
+
+# Имя образа в команде и в файле запуска — одно и то же. Разъедутся: юзер тянет одно,
+# разработчик поднимает другое, и «почему у меня иначе» становится вопросом без ответа.
+imya_v_faile=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$HERE/compose.yaml" | head -n1)
+case "$komanda" in
+    *"$imya_v_faile"*) good "образ в команде тот же, что в файле запуска: $imya_v_faile" ;;
+    *) bad "образ в команде разъехался с файлом запуска ($imya_v_faile):"; printf '%s\n' "$komanda" >&2 ;;
+esac
+
+# И оно же — полное, с реестром: короткое имя докер достроил бы до Docker Hub, то есть
+# отправил бы юзера не туда, куда мы публикуем (`WORLD2-121`).
+case "$imya_v_faile" in
+    ghcr.io/*|*.*/*|localhost/*) good "имя образа несёт реестр — юзер тянет оттуда, куда мы публикуем" ;;
+    *) bad "имя образа короткое: $imya_v_faile" "докер достроит его до Docker Hub — это чужое пространство имён" ;;
+esac
 
 # ================================================================== итог
 part "── итог"

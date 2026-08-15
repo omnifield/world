@@ -48,7 +48,7 @@ export LC_ALL=C
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE="$HERE/remote.sh"
-IMAGE=omnifield/world:dev
+IMAGE=ghcr.io/omnifield/world:latest
 NET=omnifield-gateway
 DOOR=world-door
 # Имя ресурса для живого прогона. Своё и приметное: контекст `world-probe` не спутать с
@@ -117,7 +117,7 @@ case "$1" in
         exit 0 ;;
     compose)
         case "$*" in
-            *"config --images"*) printf '%s\n' "${STUB_IMAGE:-omnifield/world:dev}"; exit 0 ;;
+            *"config --images"*) printf '%s\n' "${STUB_IMAGE:-ghcr.io/omnifield/world:latest}"; exit 0 ;;
             *version*)           exit "${STUB_LOCAL_COMPOSE:-0}" ;;
             *" up "*|*" up")
                 case "${STUB_UP:-ok}" in
@@ -137,8 +137,13 @@ case "$1" in
             rm) exit 0 ;;
         esac
         exit 0 ;;
+    pull)
+        # Реестр отвечает по сценарию. Отказ выглядит как отказ докера, а не как наш:
+        # инструмент обязан разобрать ЧУЖОЙ ответ, а не свой собственный.
+        [ "${STUB_PULL:-0}" = 0 ] && exit 0
+        printf 'Error response from daemon: denied\n' >&2; exit 1 ;;
     save) printf 'подставной образ\n'; exit 0 ;;
-    load) cat >/dev/null; printf 'Loaded image: omnifield/world:dev\n'; exit "${STUB_LOAD:-0}" ;;
+    load) cat >/dev/null; printf 'Loaded image: ghcr.io/omnifield/world:latest\n'; exit "${STUB_LOAD:-0}" ;;
     network)
         case "$2" in
             inspect) exit $(( ${STUB_NET_EXISTS:-0} == 1 ? 0 : 1 )) ;;
@@ -305,6 +310,39 @@ green() {
     if has "save $IMAGE"; then ok "--resend-image везёт образ заново"
     else bad "--resend-image образ не повёз" "ключ есть, а свойства нет — это хуже отсутствия ключа"; fi
 
+    # ДВА СПОСОБА ДОСТАВКИ ОДНОЙ ВЕЩИ (`WORLD2` 1.5). Реестр стал возможен только с полным
+    # именем образа (`WORLD2-121`): пока имя было коротким, `docker pull` на той стороне
+    # пошёл бы в Docker Hub — не туда, куда мы публикуем.
+    part "ВТОРОЙ ПУТЬ ДОСТАВКИ — реестр (--pull), а не замена копии"
+    run "${DEFAULT[@]}" -- add vps --addr world@10.8.0.5 --pull
+    if [ "$RC" -eq 0 ]; then ok "подъём с --pull прошёл целиком"
+    else bad "подъём с --pull не прошёл (код $RC)" "$OUT"; fi
+    if has "--context world-vps pull $IMAGE"; then ok "образ тянет САМ РЕСУРС, из реестра"
+    else bad "образ из реестра не тянулся" "ключ есть, а свойства нет — это хуже отсутствия ключа"; fi
+    if has "save $IMAGE"; then
+        bad "образ поехал ещё и копией" "два способа доставки не складываются: канал занят зря, а приедет всё равно одно"
+    else
+        ok "копия при этом НЕ везётся — путь один за прогон"
+    fi
+
+    # Реестр снимает требование иметь образ ЗДЕСЬ: тянет его та машина, а не эта.
+    run STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=0 \
+        STUB_LOCAL_IMAGE=0 STUB_NET_EXISTS=0 STUB_UP=ok STUB_HEALTH=healthy \
+        -- add vps --addr world@10.8.0.5 --pull
+    if [ "$RC" -eq 0 ]; then ok "локального образа не нужно вовсе — с --pull его берут в реестре"
+    else bad "с --pull подъём требует образа на этой машине (код $RC)" "$OUT" \
+        "весь смысл реестра в том, что вещь берут не у нас"; fi
+
+    # А умолчание осталось прежним — копия. Это проверяется отдельно, потому что «добавили
+    # ключ и заодно перевернули умолчание» — самая тихая из возможных правок.
+    run "${DEFAULT[@]}" -- add vps --addr world@10.8.0.5
+    if has "save $IMAGE" && ! has "pull $IMAGE"; then
+        ok "без ключа умолчание прежнее: копия, а не реестр"
+    else
+        bad "умолчание съехало на реестр" \
+            "копия возит ровно то, что у тебя на руках; подмена её опубликованным образом видна только по digest'у"
+    fi
+
     part "СНЯТИЕ — на той стороне контейнер, на этой контекст"
     run STUB_CTX_EXISTS=1 STUB_CTX_ENDPOINT=ssh://world@10.8.0.5:22 STUB_REMOTE_DOCKER=1 \
         STUB_NET_EXISTS=1 -- drop vps
@@ -363,6 +401,12 @@ red() {
         STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=0 \
         STUB_LOCAL_IMAGE=0 STUB_LOCAL_DAEMON=0 STUB_NET_EXISTS=1 \
         -- add vps --addr world@10.8.0.5
+    # Реестр отказал — это СВОЯ ступень, а не «образ не доехал»: чинится она не повтором
+    # передачи, а доступом той машины к реестру либо открытием пакета.
+    want_refusal image-pull-failed "ресурсу не дают притянуть образ из реестра" \
+        STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=0 \
+        STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 STUB_PULL=1 \
+        -- add vps --addr world@10.8.0.5 --pull
     want_refusal port-busy "порт на том ресурсе занят" \
         STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=1 \
         STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 STUB_UP=busy \
