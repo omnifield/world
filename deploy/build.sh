@@ -199,7 +199,7 @@ if [ -n "$do_web" ]; then
                     "склад probe-web в сети $NET не отвечает, а без него не собрать пульт" \
                     "если образ мира уже есть на машине — сборка не нужна вовсе: ./deploy/up.sh поднимет из него, и поле не понадобится" \
                     "собрать здесь: подними probe-web в сети $NET (пакеты @omnifield/probe-web-* лежат только там и наружу не торчат, kb:FUND-5)" \
-                    "собрать не здесь: собери образ там, где поле есть, и перенеси — docker save omnifield/world:dev | ssh <машина> docker load" \
+                    "собрать не здесь: собери образ там, где поле есть, и перенеси — docker save ghcr.io/omnifield/world:latest | ssh <машина> docker load" \
                     "проверка руками: docker run --rm --network $NET $PROBE_IMAGE wget -qO- http://probe-web:4873/" ;;
         esac
     fi
