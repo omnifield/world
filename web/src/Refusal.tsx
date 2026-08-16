@@ -10,7 +10,8 @@
 //   • дописанных пультом выходов к чужому отказу — контроллер уже назвал свои, и второй
 //     набор «что делать» рядом с первым означает, что человеку сказали два разных ответа.
 import { For, Show } from "solid-js";
-import { Button } from "@omnifield/probe-web-ui";
+
+import { Button } from "./ui.jsx";
 
 import type { Refusal } from "./control.js";
 
