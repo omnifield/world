@@ -5,9 +5,15 @@
 // тело не того вида, форма ответа разошлась с контрактом. Проверяем при этом не «покраснело»,
 // а что именно сказано человеку: отказ без причины и выходов — провал, а не мелочь
 // (`WORLD2` 2.3).
+//
+// ОБРАЗЦЫ ОТВЕТОВ ЗДЕСЬ НЕ СОЧИНЯЮТСЯ: они вырезаны из контракта соседа (`control/README.md`
+// через `probe-contract.ts`). Написанный рукой образец делает пробу зелёной ровно до тех пор,
+// пока сам себе не соврёт: `door`/`alive` у контроллера не стало (`WORLD2-131`), а здешние
+// пробы об этом молчали — они разбирали нашу же выдумку.
 import { describe, expect, it } from "vitest";
 
-import { type Fetcher, PATH, liveControl } from "./control.js";
+import { type Fetcher, PATH, type Resource, type Session, liveControl } from "./control.js";
+import { изКонтракта } from "./probe-contract.js";
 
 /** Один запрос, как его увидел контроллер: путь, глагол, заголовки, тело. */
 type Записанный = {
@@ -49,22 +55,18 @@ function отвечает(
   return { fetch, записи };
 }
 
-const ВХОД = {
-  name: "егор",
-  brand: "омнифилд",
-  scope: { addr: "/scope/егор", here: true, path: "/scope/егор" },
-  created: false,
-  token: "метка-1",
-};
+/** Ответ входа — образец из контракта («Ответ входа»). `since` у него нет: его нет и у ручки. */
+const ВХОД = изКонтракта<Omit<Session, "since">>("token");
 
-const ЗДЕСЬ = { name: "here", addr: "", here: true, alive: true, door: "здорова" };
-const ВТОРОЙ = {
-  name: "vps",
-  addr: "world@10.8.0.5",
-  here: false,
-  alive: true,
-  door: "здорова",
-};
+/**
+ * Источники ресурса — образец оттуда же. В нём УЖЕ есть оба ответа про вещи: у «здесь» список,
+ * у молчащего `null`. Это не совпадение, а то самое место контракта, ради которого он и написан
+ * так: «не спросили» и «пусто» — разные ответы.
+ */
+const [ЗДЕСЬ, ВТОРОЙ] = изКонтракта<{ resources: Resource[] }>("resources").resources;
+
+/** Отказ контроллера — образец оттуда же («Отказ — код, причина, выход»). */
+const ОТКАЗ = изКонтракта<{ code: string; why: string; ways: string[] }>("code");
 
 describe("вход", () => {
   it("отдаёт личность и скоуп в том виде, в каком их назвал контроллер", async () => {
@@ -114,33 +116,17 @@ describe("вход", () => {
     await control.resources();
 
     expect(записи[0]?.headers.Authorization).toBeUndefined();
-    expect(записи[1]?.headers.Authorization).toBe("Bearer метка-1");
+    expect(записи[1]?.headers.Authorization).toBe(`Bearer ${ВХОД.token}`);
   });
 });
 
 describe("отказ приходит целиком", () => {
   it("код, причина и выходы контроллера доезжают до человека как есть", async () => {
-    const { fetch } = отвечает([
-      {
-        status: 404,
-        body: JSON.stringify({
-          code: "no-scope",
-          why: "по адресу /scope/егор скоупа нет — дотянулись, а личности там не лежит",
-          ways: ["завести его здесь: POST /api/session с create=true", "или назови другой адрес"],
-        }),
-      },
-    ]);
+    const { fetch } = отвечает([{ status: 404, body: JSON.stringify(ОТКАЗ) }]);
     const answer = await liveControl(fetch).enter({ addr: "/scope/егор" });
 
-    expect(answer).toEqual({
-      kind: "refusal",
-      refusal: {
-        code: "no-scope",
-        why: "по адресу /scope/егор скоупа нет — дотянулись, а личности там не лежит",
-        ways: ["завести его здесь: POST /api/session с create=true", "или назови другой адрес"],
-        said: "control",
-      },
-    });
+    // Целиком и слово в слово: причина и ВСЕ выходы контроллера, плюс «сказал это он».
+    expect(answer).toEqual({ kind: "refusal", refusal: { ...ОТКАЗ, said: "control" } });
   });
 
   it("чужой код не переписывается своим и несёт, от кого пришёл", async () => {
@@ -230,11 +216,70 @@ describe("форма ответа проверяется до показа", () 
     expect(answer.kind === "refusal" && answer.refusal.why).toContain("resources");
   });
 
-  it("строка ресурса без измеренной двери не показывается вовсе", async () => {
-    // `door` — это ИЗМЕРЕННОЕ состояние двери. Строка без него врала бы молчанием: человек
-    // прочитал бы «ресурс есть» и не узнал бы, что про дверь ничего не известно.
+  it("строка ресурса без измеренного ответа самого ресурса не показывается вовсе", async () => {
+    // `reach` — это ИЗМЕРЕННЫЙ ответ машины. Строка без него врала бы молчанием: человек
+    // прочитал бы «ресурс есть» и не узнал бы, что дотянулись ли до него — неизвестно.
     const { fetch } = отвечает([
-      { body: JSON.stringify({ resources: [{ name: "vps", addr: "world@10.8.0.5" }] }) },
+      { body: JSON.stringify({ resources: [{ name: "vps", addr: "world@10.8.0.5", things: null }] }) },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
+  it("«не спросили» и «спросили, там пусто» — разные ответы, и пульт их не схлопывает", async () => {
+    // Молчащий ресурс — не пустая машина (`WORLD2` 4.2). Схлопни пульт `null` в `[]`, и человек
+    // прочитал бы «на нём ничего не стоит» там, где на деле до него не дотянулись.
+    const { fetch } = отвечает([
+      {
+        body: JSON.stringify({
+          resources: [
+            { ...ВТОРОЙ, name: "молчит", things: null },
+            { ...ВТОРОЙ, name: "пусто", reach: "отвечает", things: [] },
+          ],
+        }),
+      },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "ok" && answer.value[0]?.things).toBeNull();
+    expect(answer.kind === "ok" && answer.value[1]?.things).toEqual([]);
+    expect(answer.kind === "ok" && answer.value[1]?.things).not.toBeNull();
+  });
+
+  it("поля «things» нет вовсе — отказ, а не догадка «значит, не спросили»", async () => {
+    // «Не спросили» контроллер говорит ВСЛУХ, значением `null`. Молчание контракта его словами
+    // подменять нельзя: это уже пульт отвечает за контроллер.
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resources: [{ name: "vps", addr: "", reach: "отвечает" }] }) },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
+  it("вещь без HEALTHCHECK-а доезжает как есть — «не подтверждено», а не «здорова»", async () => {
+    // У вещи без HEALTHCHECK-а ответа не спросить вовсе, и контроллер говорит это `false` плюс
+    // словами. Пульт слова показывает, а `alive` не поправляет: приблизительная запись хуже
+    // отсутствующей — она выглядит знанием. То же правило и у соседей (`deploy/remote.sh`).
+    const без = { name: "весы", state: "запущена, здоровья не спросить", alive: false };
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resources: [{ ...ЗДЕСЬ, things: [без] }] }) },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "ok" && answer.value[0]?.things).toEqual([без]);
+  });
+
+  it("«отвечает ли вещь» спрашивается булевым — не-булево это отказ, а не «наверное, да»", async () => {
+    // Мягкая проверка (`!== false`) на любом другом значении выдала бы неспрошенное здоровье за
+    // здоровье. Разошлась форма — это вопрос к зоне control, а не догадка в её пользу.
+    const { fetch } = отвечает([
+      {
+        body: JSON.stringify({
+          resources: [{ ...ЗДЕСЬ, things: [{ name: "дверь", state: "здорова", alive: "healthy" }] }],
+        }),
+      },
     ]);
     const answer = await liveControl(fetch).resources();
 

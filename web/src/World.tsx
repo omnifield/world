@@ -153,7 +153,13 @@ export function World(props: WorldProps) {
   );
 }
 
-/** Строка списка источников. Ни памяти, ни ядер — только то, что измерено (`WORLD2` 2.5). */
+/**
+ * Строка списка источников. Ни памяти, ни ядер — только то, что измерено (`WORLD2` 2.5).
+ *
+ * Ресурс — МАШИНА, до которой дотянулись, а не «машина с дверью» (`WORLD2-131`): про сам
+ * ресурс говорит `reach`, про то, что на нём стоит, — список вещей. Два вопроса, два поля, и
+ * второй из первого не выводится.
+ */
 function СтрокаРесурса(props: { res: Resource }) {
   return (
     <li class="pult__item" data-resource={props.res.name}>
@@ -173,13 +179,55 @@ function СтрокаРесурса(props: { res: Resource }) {
             {(addr) => <code>{addr()}</code>}
           </Show>
         </dd>
-        <dt>дверь</dt>
-        <dd data-door={props.res.alive ? "alive" : "dead"}>
-          {props.res.door}
-          {props.res.alive ? " — ресурс в мире" : " — в мир ещё не включён"}
+        <dt>ресурс</dt>
+        {/* Слова контроллера про САМУ машину — «отвечает» либо «молчит». Своей приписки к ним
+            пульт не дописывает: сказанного достаточно, а второе «что это значит» рядом с
+            первым — это уже наш словарь того же самого. */}
+        <dd data-reach>{props.res.reach}</dd>
+        <dt>вещи</dt>
+        <dd>
+          <Вещи things={props.res.things} />
         </dd>
       </dl>
     </li>
+  );
+}
+
+/**
+ * Что стоит на ресурсе — тремя разными ответами, а не двумя.
+ *
+ * «Не спросили» (`null`) и «спросили, там пусто» (`[]`) на экране РАЗНЫЕ: схлопнуть их в одну
+ * строку значит показать человеку знание, которого у нас нет (`WORLD2` 4.2). Молчащий ресурс
+ * — не пустая машина.
+ */
+function Вещи(props: { things: Resource["things"] }) {
+  return (
+    <Switch>
+      <Match when={props.things === null}>
+        <span data-things="unknown">не спросили — ресурс не ответил</span>
+      </Match>
+      <Match when={props.things?.length === 0}>
+        <span data-things="empty">спросили — ничего не поднято</span>
+      </Match>
+      <Match when={props.things}>
+        {(список) => (
+          <ul class="pult__things" data-things="list">
+            <For each={список()}>
+              {(вещь) => (
+                // `data-alive` — ровно то, что сказал контроллер, и ничего сверх: у вещи без
+                // HEALTHCHECK-а здесь «нет», потому что ответа не спросить, — а не «мертва»
+                // и тем более не «здорова». Чем именно это оказалось, сказано словами рядом,
+                // и слова эти контроллера, не наши.
+                <li data-thing={вещь.name} data-alive={вещь.alive ? "yes" : "no"}>
+                  <span class="pult__name">{вещь.name}</span>{" "}
+                  <span class="pult__aside">— {вещь.state}</span>
+                </li>
+              )}
+            </For>
+          </ul>
+        )}
+      </Match>
+    </Switch>
   );
 }
 

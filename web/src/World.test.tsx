@@ -6,7 +6,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { World } from "./World.jsx";
-import type { Answer, Control, Field, Identity, Resource } from "./control.js";
+import type { Answer, Control, Field, Identity, Resource, Session } from "./control.js";
+import { изКонтракта } from "./probe-contract.js";
 import { ввести, дождаться, нажать, осесть, смонтировать } from "./probe-dom.jsx";
 
 let проба: { корень: HTMLElement; снять: () => void } | undefined;
@@ -16,21 +17,21 @@ afterEach(() => {
   проба = undefined;
 });
 
+// Образцы ответов вырезаны из контракта соседа (`probe-contract.ts`), а не написаны рукой:
+// экран, проверенный на выдуманном ответе, зеленеет ровно до того дня, когда выдумка перестаёт
+// совпадать с контроллером (`WORLD2-131`, где так и вышло с полем про дверь).
+// Своего образца у `GET /api/me` в контракте нет — личность там показана ответом входа, её и
+// берём. `since` в том образце нет вовсе (у ответа входа его и не бывает), и дата ниже — это
+// значение, а не форма: экран показывает её как есть.
+const ВОШЁЛ = изКонтракта<Session>("token");
 const Я: Identity = {
-  name: "егор",
-  brand: "омнифилд",
-  scope: { addr: "/scope/егор", here: true, path: "/scope/егор" },
+  name: ВОШЁЛ.name,
+  brand: ВОШЁЛ.brand,
+  scope: ВОШЁЛ.scope,
   since: "2026-08-14T19:00:00Z",
 };
 
-const ЗДЕСЬ: Resource = { name: "here", addr: "", here: true, alive: true, door: "здорова" };
-const ВТОРОЙ: Resource = {
-  name: "vps",
-  addr: "world@10.8.0.5",
-  here: false,
-  alive: true,
-  door: "здорова",
-};
+const [ЗДЕСЬ, ВТОРОЙ] = изКонтракта<{ resources: Resource[] }>("resources").resources;
 
 const ok = <T,>(value: T): Answer<T> => ({ kind: "ok", value });
 
@@ -146,24 +147,63 @@ describe("источники ресурса", () => {
     expect(строка.textContent).not.toContain("localhost");
   });
 
-  it("жив ли — сказано словами про ДВЕРЬ, а не про докер", async () => {
-    const { корень } = await показать({
-      resources: ok([{ ...ВТОРОЙ, alive: false, door: "ресурс молчит" }]),
-    });
-    const строка = корень.querySelector<HTMLElement>("[data-resource='vps']")!;
+  it("про САМ ресурс сказано отдельно от того, что на нём стоит", async () => {
+    // Ресурс — машина, до которой дотянулись, а не «машина с дверью» (`WORLD2-131`). Вопросов
+    // два, и на экране их тоже два: «отвечает ли машина» и «что на ней поднято».
+    const { корень } = await показать({ resources: ok([ЗДЕСЬ]) });
+    const строка = корень.querySelector<HTMLElement>(`[data-resource='${ЗДЕСЬ.name}']`)!;
 
-    expect(строка.querySelector("[data-door]")?.textContent).toContain("ресурс молчит");
-    expect(строка.querySelector("[data-door]")?.getAttribute("data-door")).toBe("dead");
+    expect(строка.querySelector("[data-reach]")?.textContent).toBe(ЗДЕСЬ.reach);
+    expect(строка.querySelector("[data-things]")?.getAttribute("data-things")).toBe("list");
+    expect(строка.querySelector(`[data-thing='${ЗДЕСЬ.things![0]!.name}']`)).not.toBeNull();
   });
 
-  it("ресурса в цифрах на экране нет: только имя, адрес и дверь", async () => {
+  it("«не спросили» и «спросили, там пусто» показаны РАЗНЫМИ ответами", async () => {
+    // Молчащий ресурс — не пустая машина. Одна строка на оба случая сказала бы человеку, что на
+    // недоступной машине ничего не стоит, — а этого мы не знаем (`WORLD2` 4.2).
+    const { корень } = await показать({
+      resources: ok([
+        { ...ВТОРОЙ, name: "молчит", things: null },
+        { ...ВТОРОЙ, name: "пусто", reach: "отвечает", things: [] },
+      ]),
+    });
+    const молчит = корень.querySelector<HTMLElement>("[data-resource='молчит'] [data-things]")!;
+    const пусто = корень.querySelector<HTMLElement>("[data-resource='пусто'] [data-things]")!;
+
+    expect(молчит.getAttribute("data-things")).toBe("unknown");
+    expect(молчит.textContent).toContain("не спросили");
+    expect(пусто.getAttribute("data-things")).toBe("empty");
+    expect(пусто.textContent).toContain("ничего не поднято");
+    expect(молчит.textContent).not.toBe(пусто.textContent);
+  });
+
+  it("вещь без HEALTHCHECK-а не показана здоровой", async () => {
+    // Слова состояния — контроллера (`control/internal/resource`, ступени `verdict`), и пульту
+    // они непрозрачны: он их показывает, а «отвечает ли» берёт полем `alive`. Выдать
+    // неспрошенное здоровье за здоровье — то же самое, что запретили себе соседи
+    // (`deploy/remote.sh`: «приблизительная запись хуже отсутствующей»).
+    const { корень } = await показать({
+      resources: ok([
+        {
+          ...ЗДЕСЬ,
+          things: [{ name: "весы", state: "запущена, здоровья не спросить", alive: false }],
+        },
+      ]),
+    });
+    const вещь = корень.querySelector<HTMLElement>("[data-thing='весы']")!;
+
+    expect(вещь.getAttribute("data-alive")).toBe("no");
+    expect(вещь.textContent).toContain("здоровья не спросить");
+  });
+
+  it("ресурса в цифрах на экране нет: только адрес, сам ресурс и вещи на нём", async () => {
     // `WORLD2` 2.5: память и ядра даёт отдельный инструмент осмотра, и он отложен сознательно.
     // Появится здесь выдуманная цифра — проба покраснеет.
     const { корень } = await показать({ resources: ok([ЗДЕСЬ, ВТОРОЙ]) });
-    const строка = корень.querySelector<HTMLElement>("[data-resource='vps']")!;
+    const строка = корень.querySelector<HTMLElement>(`[data-resource='${ВТОРОЙ.name}']`)!;
     const факты = [...строка.querySelectorAll("dt")].map((dt) => dt.textContent);
 
-    expect(факты).toEqual(["адрес", "дверь"]);
+    expect(факты).toEqual(["адрес", "ресурс", "вещи"]);
   });
 
   it("после добавления источников видно два — это главное, что должно быть видно глазами", async () => {
