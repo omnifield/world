@@ -1473,6 +1473,65 @@ stavim=$(grep -nE '^[[:space:]]*RUN .*(apk add|docker-cli|docker-compose)' "$HER
 [ -z "$stavim" ] && good "в образ двери не ставится ни докер-клиент, ни compose" \
                  || { bad "в образ двери ставят инструменты власти:"; printf '%s\n' "$stavim" >&2; }
 
+# ЗНАЧЕНИЯ, ПРИШЕДШИЕ СНАРУЖИ. Находка ревью `WORLD2-121`: `WORLD_WAIT=abc` ломал сравнение в
+# цикле ожидания — цикл не выполнялся ни разу, стука не было вообще, и следом срабатывал
+# `door-silent`, убивавший ЗДОРОВЫЙ мир. Опечатка в переменной давала уверенный неверный
+# диагноз, а в вывод уезжала сырая ошибка оболочки. Стережём все три свойства сразу.
+bez_syrykh_oshibok() {
+    local syr
+    syr=$(grep -nE 'Illegal number|integer expression|not found|syntax error|unexpected' "$STUB_DIR/out" || true)
+    [ -z "$syr" ] && good "в выводе нет сырых ошибок оболочки — говорим своим языком" \
+                  || { bad "в вывод уехала ошибка оболочки:"; printf '%s\n' "$syr" >&2; }
+}
+
+part "30j. WORLD_WAIT не число → свой отказ ДО подъёма, а не ложное «дверь молчит»"
+entry_case 1 WORLD_WAIT=abc STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+otkaz bad-value
+mir_ne_zapuskali
+said "WORLD_WAIT=abc"                  # названо ЧТО задано, а не «значение неверно»
+said "WORLD_WAIT=60"                   # и что вместо
+bez_syrykh_oshibok
+
+part "30k. WORLD_WAIT=0 → тоже отказ: «ждать нисколько» это ложный door-silent на живой двери"
+entry_case 1 WORLD_WAIT=0 STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+otkaz bad-value
+mir_ne_zapuskali
+
+part "30l. WORLD_DOOR_FILE без каталога → bad-value, а не отказ про несуществующий каталог"
+rm -rf "$ENTRY_STATE"; mkdir -p "$ENTRY_STATE/field" "$ENTRY_STATE/stand"
+: > "$ENTRY_WLOG"
+env PATH="$ENTRY_DIR:$PATH" \
+    WORLD_DOOR_FILE="locations.json" \
+    WORLD_STAND_DIR="$ENTRY_STATE/stand" \
+    WORLD_WAIT=2 STUB_WORLD_LOG="$ENTRY_WLOG" \
+    "$ENTRY_DIR/door-entry.sh" > "$STUB_DIR/out" 2>&1
+[ $? = 1 ] && good "код возврата 1" || bad "имя реестра без каталога не остановило подъём"
+otkaz bad-value
+mir_ne_zapuskali
+
+# А вот это НЕ наше значение: `WORLD_ADDR` принадлежит миру (`core/README.md`). Судить его мы
+# не вправе — но и стучаться по нему не умеем. Значит ожидание пропускается ВСЛУХ, а дверь
+# остаётся жить: убить её из-за того, что мы не умеем постучаться, было бы той же подменой
+# причины, ради которой заведён весь этот блок.
+part "30m. из WORLD_ADDR не выводится порт → ожидание пропущено вслух, дверь НЕ убита"
+entry_case 0 WORLD_ADDR=:http STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+ne_otkaz
+mir_zapuskali
+said "не вывести порт"
+said "здоровье двери НЕ проверено"
+grep -q 'мир получил TERM' "$ENTRY_WLOG" \
+    && bad "живой мир убит из-за значения, которое ему же и принадлежит" \
+    || good "мир не тронут — он сам решит, годен ли ему такой адрес"
+
+part "30n. имя в поле не годится в сетевое → своя причина, а не враньё «в поле не видно»"
+entry_case 0 WORLD_DOOR_ALIAS=door/1 STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+ne_otkaz
+said "не годится в сетевое имя"
+said "адрес для стука не собрать"
+grep -qF "в общей сети меня по имени не видно" "$STUB_DIR/out" \
+    && bad "сказано «в поле не видно» там, где сеть не спрашивали" \
+    || good "про сеть не выдумано ничего — сказано, что адрес не собрать"
+
 # ================================================================== 31. КОМАНДА ЮЗЕРА
 # Команда `docker run` напечатана в `deploy/README.md` и должна работать КОПИРОВАНИЕМ, а не
 # пересказом. Проверяем не текст вокруг, а саму команду: имя образа, тома, и — главное —
