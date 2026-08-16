@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/omnifield/world/control/internal/recipe"
 	"github.com/omnifield/world/control/internal/run"
 )
 
@@ -17,9 +18,46 @@ const remoteRefusalHuman = "\n\x1b[1;31m✗ отказ:\x1b[0m на ресурс
 	"  выход: поставь докер на той машине\n" +
 	"  выход: проверь, что ssh ходит тем же юзером\n"
 
+// Рецепт двери — тот же путь, что складывает подъём контроллера: файл запуска лежит рядом
+// с подъёмом. Существования файла здесь не требуется намеренно — годность рецепта
+// проверяет сосед и отвечает тройкой отказов, а вторая такая же проверка разъехалась бы с
+// его проверкой на первой правке.
+const doorRecipe = "/opt/world/deploy/compose.yaml"
+
 func manager(t *testing.T, fake *run.Fake) *Manager {
 	t.Helper()
-	return &Manager{Runner: fake, RemoteSh: "/opt/world/deploy/remote.sh", Docker: "docker", KeysDir: t.TempDir(), Port: 8080}
+	return &Manager{
+		Runner:   fake,
+		RemoteSh: "/opt/world/deploy/remote.sh",
+		Recipes:  &recipe.Catalog{Dir: t.TempDir(), Door: doorRecipe},
+		Docker:   "docker",
+		KeysDir:  t.TempDir(),
+		Port:     8080,
+	}
+}
+
+// докерОтвечает — подставной докер, у которого на ресурсе стоит одна здоровая вещь.
+// Он НЕ притворяется докером: отвечает ровно теми полями, которые контроллер спросил.
+func докерОтвечает(c run.Command) (run.Result, error) {
+	switch {
+	case has(c.Args, "context"):
+		return run.Result{Out: "default\tunix:///var/run/docker.sock\n" +
+			"world-vps\tssh://world@10.8.0.5\n"}, nil
+	case has(c.Args, "ps"):
+		return run.Result{Out: "aaa111\n"}, nil
+	case has(c.Args, "inspect"):
+		return run.Result{Out: "world\thealthy\trunning\n"}, nil
+	}
+	return run.Result{}, nil
+}
+
+func has(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ── список ───────────────────────────────────────────────────────────────────
@@ -27,12 +65,14 @@ func manager(t *testing.T, fake *run.Fake) *Manager {
 func TestСписокБерётсяИзКонтекстовДокера(t *testing.T) {
 	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
 		switch {
-		case len(c.Args) > 1 && c.Args[0] == "context":
+		case has(c.Args, "context"):
 			return run.Result{Out: "default\tunix:///var/run/docker.sock\n" +
 				"world-vps\tssh://world@10.8.0.5\n" +
 				"чужой-контекст\tssh://кто-то@1.2.3.4\n"}, nil
-		case c.Args[len(c.Args)-1] == DoorContainer:
-			return run.Result{Out: "healthy\n"}, nil
+		case has(c.Args, "ps"):
+			return run.Result{Out: "aaa111\n"}, nil
+		case has(c.Args, "inspect"):
+			return run.Result{Out: "world\thealthy\trunning\n"}, nil
 		}
 		return run.Result{}, nil
 	}}
@@ -47,8 +87,13 @@ func TestСписокБерётсяИзКонтекстовДокера(t *testi
 	if !list[0].Here || list[0].Name != HereName {
 		t.Fatalf("первым обязан идти ресурс, где стоит контроллер: %+v", list[0])
 	}
-	if list[1].Name != "vps" || list[1].Addr != "world@10.8.0.5" || !list[1].Alive {
+	if list[1].Name != "vps" || list[1].Addr != "world@10.8.0.5" || list[1].Reach != "отвечает" {
 		t.Fatalf("ресурс разобрался не так: %+v", list[1])
+	}
+	// Ресурс — машина, а на ней СПИСОК вещей. Одного поля про дверь здесь больше нет:
+	// вторая вещь не должна требовать правки кода (`WORLD2-131`).
+	if len(list[1].Things) != 1 || list[1].Things[0].Name != "world" || !list[1].Things[0].Alive {
+		t.Fatalf("вещи на ресурсе разобрались не так: %+v", list[1].Things)
 	}
 	// Чужие контексты — не наши ресурсы: список мира не должен подбирать всё, что
 	// человек завёл в докере своими руками.
@@ -61,13 +106,9 @@ func TestСписокБерётсяИзКонтекстовДокера(t *testi
 
 func TestСвоегоРеестраЗонаНеЗаводит(t *testing.T) {
 	dir := t.TempDir()
-	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
-		if len(c.Args) > 1 && c.Args[0] == "context" {
-			return run.Result{Out: "world-vps\tssh://world@10.8.0.5\n"}, nil
-		}
-		return run.Result{Out: "healthy"}, nil
-	}}
-	m := &Manager{Runner: fake, RemoteSh: "/opt/world/deploy/remote.sh", Docker: "docker", KeysDir: dir}
+	fake := &run.Fake{Answer: докерОтвечает}
+	m := &Manager{Runner: fake, RemoteSh: "/opt/world/deploy/remote.sh",
+		Recipes: &recipe.Catalog{Door: doorRecipe}, Docker: "docker", KeysDir: dir}
 	if _, ref := m.List(context.Background()); ref != nil {
 		t.Fatalf("список не собрался: %v", ref)
 	}
@@ -80,27 +121,73 @@ func TestСвоегоРеестраЗонаНеЗаводит(t *testing.T) {
 	}
 }
 
-func TestСостояниеДвериИзмеряется(t *testing.T) {
+// Состояние вещи ИЗМЕРЯЕТСЯ, а не выводится: у вещи несколько контейнеров, и целое не
+// бывает здоровее худшей своей части. `none` (у образа нет HEALTHCHECK-а) — это НЕ
+// «здорова»: приблизительная запись хуже отсутствующей (`WORLD2` 4.2).
+func TestСостояниеВещиИзмеряется(t *testing.T) {
 	cases := []struct {
-		out, errText string
-		code         int
-		door         string
-		alive        bool
+		имя     string
+		inspect string
+		state   string
+		alive   bool
 	}{
-		{out: "healthy", door: "здорова", alive: true},
-		{out: "running", door: "здорова", alive: true},
-		{out: "starting", door: "поднимается"},
-		{errText: "Error: No such object: world-door", code: 1, door: "двери нет"},
-		{errText: "cannot connect to the Docker daemon", code: 1, door: "ресурс молчит"},
+		{имя: "одна здоровая", inspect: "world\thealthy\trunning", state: "здорова", alive: true},
+		{имя: "две здоровые", inspect: "world\thealthy\trunning\nworld\thealthy\trunning", state: "здорова", alive: true},
+		{имя: "поднимается", inspect: "world\tstarting\trunning", state: "поднимается"},
+		{имя: "нездорова", inspect: "world\tunhealthy\trunning", state: "нездорова"},
+		{имя: "часть встала", inspect: "world\thealthy\trunning\nworld\tnone\texited", state: "запущена не вся"},
+		{имя: "здоровья нет вовсе", inspect: "world\tnone\trunning", state: "запущена, здоровья не спросить"},
+		// Здоровый рядом с непроверяемым — то же правило, что у соседа: ждём тех, у кого
+		// есть HEALTHCHECK, и не выдаём отсутствие проверки за поломку.
+		{имя: "здоровый и непроверяемый", inspect: "world\thealthy\trunning\nworld\tnone\trunning", state: "здорова", alive: true},
 	}
 	for _, c := range cases {
-		fake := &run.Fake{Answer: func(run.Command) (run.Result, error) {
-			return run.Result{Out: c.out, Err: c.errText, Code: c.code}, nil
+		fake := &run.Fake{Answer: func(cmd run.Command) (run.Result, error) {
+			if has(cmd.Args, "ps") {
+				return run.Result{Out: "aaa111\nbbb222\n"}, nil
+			}
+			return run.Result{Out: c.inspect}, nil
 		}}
-		door, alive := manager(t, fake).door(context.Background(), "world-vps")
-		if door != c.door || alive != c.alive {
-			t.Fatalf("%+v → %q/%v, а ждали %q/%v", c, door, alive, c.door, c.alive)
+		reach, things := manager(t, fake).things(context.Background(), "world-vps")
+		if reach != "отвечает" || len(things) != 1 {
+			t.Fatalf("%s: ресурс ответил %q, вещей %d: %+v", c.имя, reach, len(things), things)
 		}
+		if things[0].State != c.state || things[0].Alive != c.alive {
+			t.Fatalf("%s: %q/%v, а ждали %q/%v", c.имя, things[0].State, things[0].Alive, c.state, c.alive)
+		}
+	}
+}
+
+// Молчащий ресурс и ресурс без вещей — РАЗНЫЕ ответы. Пустой список вместо «не спросили»
+// читался бы как знание, которого у нас нет.
+func TestМолчащийРесурсНеВыдаётсяЗаПустой(t *testing.T) {
+	молчит := &run.Fake{Answer: func(run.Command) (run.Result, error) {
+		return run.Result{Err: "cannot connect to the Docker daemon", Code: 1}, nil
+	}}
+	reach, things := manager(t, молчит).things(context.Background(), "world-vps")
+	if reach != "молчит" || things != nil {
+		t.Fatalf("молчащий ресурс отдал %q/%+v", reach, things)
+	}
+
+	пустой := &run.Fake{Answer: func(run.Command) (run.Result, error) { return run.Result{}, nil }}
+	reach, things = manager(t, пустой).things(context.Background(), "world-vps")
+	if reach != "отвечает" || things == nil || len(things) != 0 {
+		t.Fatalf("ресурс без вещей отдал %q/%+v", reach, things)
+	}
+}
+
+// Контейнер, поднятый не компоузом, вещью мира не является: рецепта у него нет, и назвать
+// его нам нечем. Чужое хозяйство хозяина машины в список мира не попадает.
+func TestЧужиеКонтейнерыВещамиНеСчитаются(t *testing.T) {
+	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
+		if has(c.Args, "ps") {
+			return run.Result{Out: "aaa111\nbbb222\n"}, nil
+		}
+		return run.Result{Out: "\tnone\trunning\nworld\thealthy\trunning\n"}, nil
+	}}
+	_, things := manager(t, fake).things(context.Background(), "world-vps")
+	if len(things) != 1 || things[0].Name != "world" {
+		t.Fatalf("в список вещей попало чужое: %+v", things)
 	}
 }
 
@@ -111,19 +198,24 @@ func TestДобавлениеЗовётГотовыйПодъём(t *testing.T) 
 		if strings.HasSuffix(c.Name, "remote.sh") {
 			return run.Result{}, nil
 		}
-		return run.Result{Out: "healthy"}, nil
+		return докерОтвечает(c)
 	}}
 	m := manager(t, fake)
 
-	got, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "-----ключ-----")
+	got, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "-----ключ-----", "")
 	if ref != nil {
 		t.Fatalf("ресурс не добавился: %v", ref)
 	}
-	if got.Name != "vps" || !got.Alive {
+	if got.Name != "vps" || got.Reach != "отвечает" || len(got.Things) != 1 {
 		t.Fatalf("ответ собрался не так: %+v", got)
 	}
 	if !fake.Called("remote.sh", "add", "vps", "--addr", "world@10.8.0.5") {
 		t.Fatalf("готовый подъём не позван — значит зона написала свой:\n%s", fake.Line(0))
+	}
+	// Рецепт называется ВСЕГДА, даже когда он тот же, что у соседа по умолчанию: умолчание
+	// принадлежит его команде, и молчаливая опора на него однажды подняла бы не ту вещь.
+	if !fake.Called("remote.sh", "--recipe", doorRecipe) {
+		t.Fatalf("подъём позван без рецепта — вещь взялась из умолчания соседа:\n%s", fake.Line(0))
 	}
 
 	// Ключ лёг в связку, и `config` показывает ssh, каким ключом ходить на эту машину:
@@ -145,6 +237,75 @@ func TestДобавлениеЗовётГотовыйПодъём(t *testing.T) 
 	}
 }
 
+// ГЛАВНАЯ проверка захода (`WORLD2-131`): вторая вещь поднимается тем же путём, и для
+// этого не правится ни строки кода. Кладём второй рецепт в каталог — и зовём его по имени.
+func TestВтораяВещьНеТребуетПравкиКода(t *testing.T) {
+	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
+		if strings.HasSuffix(c.Name, "remote.sh") {
+			return run.Result{}, nil
+		}
+		return докерОтвечает(c)
+	}}
+	m := manager(t, fake)
+	весы := filepath.Join(m.Recipes.Dir, "весы.yaml")
+	if err := os.WriteFile(весы, []byte("name: весы\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "", "весы"); ref != nil {
+		t.Fatalf("вторая вещь не поднялась: %v", ref)
+	}
+	if !fake.Called("remote.sh", "add", "vps", "--recipe", весы) {
+		t.Fatalf("подъём позван не тем рецептом:\n%s", fake.Line(0))
+	}
+
+	// И снимается она тем же рецептом: своего реестра вещей зона не заводит.
+	if _, ref := m.Drop(context.Background(), "vps", false, false, "весы"); ref != nil {
+		t.Fatalf("вторая вещь не снялась: %v", ref)
+	}
+	if !fake.Called("remote.sh", "drop", "vps", "--recipe", весы) {
+		t.Fatalf("снятие пошло не тем рецептом:\n%s", fake.Line(len(fake.Calls())-1))
+	}
+}
+
+// Рецепт, которого нет, обязан отказать НАШИМ кодом и до того, как тронут ресурс: имя
+// рецепта — наше знание, и отвечать за него соседу не за что.
+func TestНеизвестныйРецептОтказываетДоПодъёма(t *testing.T) {
+	fake := &run.Fake{}
+	m := manager(t, fake)
+
+	_, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", "весы")
+	if ref == nil || ref.Code != "no-such-recipe" {
+		t.Fatalf("ждали no-such-recipe, получили %v", ref)
+	}
+	if len(fake.Calls()) != 0 {
+		t.Fatalf("до подъёма дело дошло на неизвестном рецепте: %s", fake.Line(0))
+	}
+	if _, err := os.Stat(filepath.Join(m.KeysDir, "world-vps")); !os.IsNotExist(err) {
+		t.Fatal("отказ оставил за собой ключ — а отказ не вправе оставлять следов")
+	}
+}
+
+// Путь, названный юзером, уезжает подъёму КАК ЕСТЬ: годность файла проверяет сосед и
+// отвечает своей тройкой (`no-recipe` · `bad-recipe` · `recipe-no-image`), а вторая такая
+// же проверка здесь разъехалась бы с ней на первой правке.
+func TestПутьРецептаУезжаетПодъёмуКакЕсть(t *testing.T) {
+	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
+		if strings.HasSuffix(c.Name, "remote.sh") {
+			return run.Result{}, nil
+		}
+		return докерОтвечает(c)
+	}}
+	m := manager(t, fake)
+
+	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "", "/чужой/путь/весы.yaml"); ref != nil {
+		t.Fatalf("названный путь не доехал: %v", ref)
+	}
+	if !fake.Called("remote.sh", "--recipe", "/чужой/путь/весы.yaml") {
+		t.Fatalf("путь рецепта до подъёма не доехал:\n%s", fake.Line(0))
+	}
+}
+
 func TestКлючДокладываетсяДоПодъёма(t *testing.T) {
 	var order []string
 	m := manager(t, nil)
@@ -159,7 +320,7 @@ func TestКлючДокладываетсяДоПодъёма(t *testing.T) {
 	}}
 	m.Runner = fake
 
-	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ"); ref != nil {
+	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", ""); ref != nil {
 		t.Fatalf("ресурс не добавился: %v", ref)
 	}
 	if len(order) != 1 {
@@ -176,7 +337,7 @@ func TestОтказПодъёмаДоезжаетСвоимКодом(t *testing
 	}}
 	m := manager(t, fake)
 
-	_, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ")
+	_, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", "")
 	if ref == nil {
 		t.Fatal("подъём отказал, а контроллер промолчал")
 	}
@@ -208,7 +369,7 @@ func TestНеудачныйПодъёмУбираетКлючЗаСобой(t *t
 	}}
 	m := manager(t, fake)
 
-	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ"); ref == nil {
+	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", ""); ref == nil {
 		t.Fatal("ждали отказ")
 	}
 	if _, err := os.Stat(filepath.Join(m.KeysDir, "world-vps")); !os.IsNotExist(err) {
@@ -233,7 +394,7 @@ func TestИменаИАдресаПроверяютсяДоВызова(t *testi
 		{"vps", "world@10.8.0.5:порт", "bad-address"},
 	}
 	for _, c := range cases {
-		_, ref := m.Add(context.Background(), c.name, c.addr, "")
+		_, ref := m.Add(context.Background(), c.name, c.addr, "", "")
 		if ref == nil || ref.Code != c.code {
 			t.Fatalf("%q/%q → %v, а ждали %s", c.name, c.addr, ref, c.code)
 		}
@@ -248,11 +409,11 @@ func TestИменаИАдресаПроверяютсяДоВызова(t *testi
 func TestСнятиеНазываетЧтоОсталось(t *testing.T) {
 	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) { return run.Result{}, nil }}
 	m := manager(t, fake)
-	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ"); ref != nil {
+	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", ""); ref != nil {
 		t.Fatalf("ресурс не добавился: %v", ref)
 	}
 
-	got, ref := m.Drop(context.Background(), "vps", false, false)
+	got, ref := m.Drop(context.Background(), "vps", false, false, "")
 	if ref != nil {
 		t.Fatalf("ресурс не снялся: %v", ref)
 	}
@@ -274,7 +435,7 @@ func TestСнятиеНазываетЧтоОсталось(t *testing.T) {
 func TestСнятиеСоСостояниемГоворитОбЭтомСоседу(t *testing.T) {
 	fake := &run.Fake{}
 	m := manager(t, fake)
-	got, ref := m.Drop(context.Background(), "vps", true, true)
+	got, ref := m.Drop(context.Background(), "vps", true, true, "")
 	if ref != nil {
 		t.Fatalf("ресурс не снялся: %v", ref)
 	}
@@ -288,7 +449,7 @@ func TestСнятиеСоСостояниемГоворитОбЭтомСосе�
 
 func TestРесурсКонтроллераСнятьНельзя(t *testing.T) {
 	fake := &run.Fake{}
-	_, ref := manager(t, fake).Drop(context.Background(), HereName, false, false)
+	_, ref := manager(t, fake).Drop(context.Background(), HereName, false, false, "")
 	if ref == nil || ref.Code != "drop-here" {
 		t.Fatalf("ждали drop-here, получили %v", ref)
 	}
@@ -309,10 +470,10 @@ func TestЧужиеСтрокиВСвязкеНеТрогаем(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ"); ref != nil {
+	if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", ""); ref != nil {
 		t.Fatalf("ресурс не добавился: %v", ref)
 	}
-	if _, ref := m.Drop(context.Background(), "vps", false, false); ref != nil {
+	if _, ref := m.Drop(context.Background(), "vps", false, false, ""); ref != nil {
 		t.Fatalf("ресурс не снялся: %v", ref)
 	}
 
@@ -329,7 +490,7 @@ func TestПовторноеДобавлениеНеПлодитБлоки(t *tes
 	fake := &run.Fake{}
 	m := manager(t, fake)
 	for range 3 {
-		if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ"); ref != nil {
+		if _, ref := m.Add(context.Background(), "vps", "world@10.8.0.5", "ключ", ""); ref != nil {
 			t.Fatalf("ресурс не добавился: %v", ref)
 		}
 	}

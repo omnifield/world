@@ -7,9 +7,10 @@
 //
 //	POST   /api/session            вход: адрес скоупа и креды (или create — завести здесь)
 //	GET    /api/me                 кто я сейчас
-//	GET    /api/resources          источники ресурса: имя, адрес, жив ли
-//	POST   /api/resources          добавить ресурс — на нём встаёт дверь
+//	GET    /api/resources          источники ресурса: имя, адрес, отвечает ли, что на нём стоит
+//	POST   /api/resources          добавить ресурс — на нём встаёт вещь, названная рецептом
 //	DELETE /api/resources/{имя}    снять ресурс; в ответе — что осталось на той машине
+//	GET    /api/recipes            чем контроллер умеет поднимать: каталог рецептов
 //	GET    /api/fields             поля юзера
 //	POST   /api/fields             завести поле
 //
@@ -38,6 +39,7 @@ import (
 	"time"
 
 	"github.com/omnifield/world/control/internal/pult"
+	"github.com/omnifield/world/control/internal/recipe"
 	"github.com/omnifield/world/control/internal/refusal"
 	"github.com/omnifield/world/control/internal/resource"
 	"github.com/omnifield/world/control/internal/run"
@@ -53,8 +55,13 @@ const cookieName = "control-session"
 // сами: подменяемость — то, чем проба проверяет поведение там, где нет ни докера, ни
 // второго ресурса.
 type Options struct {
-	Runner     run.Runner
-	RemoteSh   string
+	Runner   run.Runner
+	RemoteSh string
+	// RecipesDir — каталог рецептов: ландшафт машины, куда хозяин кладёт свои вещи.
+	// Пустой каталог — законное состояние: остаётся дверь.
+	RecipesDir string
+	// DoorRecipe — файл запуска двери, приехавший в образе рядом с подъёмом.
+	DoorRecipe string
 	Docker     string
 	KeysDir    string
 	DoorPort   int
@@ -71,10 +78,11 @@ type Options struct {
 
 // Handler — ручки контроллера.
 type Handler struct {
-	opt  Options
-	res  *resource.Manager
-	pult *pult.Handler
-	mux  *http.ServeMux
+	opt     Options
+	res     *resource.Manager
+	recipes *recipe.Catalog
+	pult    *pult.Handler
+	mux     *http.ServeMux
 
 	mu   sync.Mutex
 	sess *session
@@ -103,17 +111,20 @@ func New(opt Options) *Handler {
 		opt.Docker = "docker"
 	}
 
+	recipes := &recipe.Catalog{Dir: opt.RecipesDir, Door: opt.DoorRecipe}
 	h := &Handler{
 		opt: opt,
 		res: &resource.Manager{
 			Runner:   opt.Runner,
 			RemoteSh: opt.RemoteSh,
+			Recipes:  recipes,
 			Docker:   opt.Docker,
 			KeysDir:  opt.KeysDir,
 			Port:     opt.DoorPort,
 		},
-		pult: pult.New(opt.PultDir),
-		mux:  http.NewServeMux(),
+		recipes: recipes,
+		pult:    pult.New(opt.PultDir),
+		mux:     http.NewServeMux(),
 	}
 
 	h.mux.HandleFunc("POST /api/session", h.wrap("session", h.postSession))
@@ -121,12 +132,13 @@ func New(opt Options) *Handler {
 	h.mux.HandleFunc("GET /api/resources", h.wrap("resources", h.getResources))
 	h.mux.HandleFunc("POST /api/resources", h.wrap("resource-add", h.postResource))
 	h.mux.HandleFunc("DELETE /api/resources/{name}", h.wrap("resource-drop", h.deleteResource))
+	h.mux.HandleFunc("GET /api/recipes", h.wrap("recipes", h.getRecipes))
 	h.mux.HandleFunc("GET /api/fields", h.wrap("fields", h.getFields))
 	h.mux.HandleFunc("POST /api/fields", h.wrap("field-add", h.postField))
 
 	// Тот же путь другим методом — это не «нет такой ручки», а «не тем глаголом», и
 	// сказать об этом надо разными словами: иначе человек ищет опечатку в пути.
-	for _, p := range []string{"/api/session", "/api/me", "/api/resources", "/api/resources/{name}", "/api/fields"} {
+	for _, p := range []string{"/api/session", "/api/me", "/api/resources", "/api/resources/{name}", "/api/recipes", "/api/fields"} {
 		h.mux.HandleFunc(p, h.wrap("wrong-method", wrongMethod))
 	}
 
@@ -315,6 +327,10 @@ type resourceBody struct {
 	Name  string `json:"name"`
 	Addr  string `json:"addr"`
 	Creds string `json:"creds"`
+	// Recipe — ЧТО поднять на этом ресурсе: имя рецепта из каталога либо путь (в названии
+	// с косой чертой контроллер видит путь). Не назван — дверь: прежний запрос работает
+	// как работал, без единого лишнего поля.
+	Recipe string `json:"recipe"`
 }
 
 func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
@@ -326,7 +342,7 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 		return ref
 	}
 
-	added, ref := h.res.Add(r.Context(), body.Name, body.Addr, body.Creds)
+	added, ref := h.res.Add(r.Context(), body.Name, body.Addr, body.Creds, body.Recipe)
 	if ref != nil {
 		return ref
 	}
@@ -345,8 +361,10 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 		return ref
 	}
 	q := r.URL.Query()
+	// Рецепт называется и при снятии: снимаем ТО ЖЕ, что ставили, а своего реестра вещей
+	// зона не заводит — второй список того же самого разъехался бы с контекстами докера.
 	dropped, ref := h.res.Drop(r.Context(), r.PathValue("name"),
-		flag(q.Get("with-state")), flag(q.Get("with-image")))
+		flag(q.Get("with-state")), flag(q.Get("with-image")), q.Get("recipe"))
 	if ref != nil {
 		return ref
 	}
@@ -355,6 +373,26 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 		return ref
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"dropped": dropped, "resources": list})
+	return nil
+}
+
+// ── рецепты ──────────────────────────────────────────────────────────────────
+
+// getRecipes — что контроллер умеет поднимать прямо сейчас. Список ЧИТАЕТСЯ из каталога,
+// а не перечисляется в коде: список вещей мира механикой не является (`WORLD2` 3.7).
+// Положили файл в каталог — вещь появилась здесь, без правки кода и без пересборки образа.
+func (h *Handler) getRecipes(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	if _, ref := h.current(r); ref != nil {
+		return ref
+	}
+	list, ref := h.recipes.List()
+	if ref != nil {
+		return ref
+	}
+	if list == nil {
+		list = []recipe.Recipe{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recipes": list})
 	return nil
 }
 
@@ -510,7 +548,7 @@ func unknownEndpoint(_ http.ResponseWriter, r *http.Request) *refusal.Refusal {
 	return refusal.New(http.StatusNotFound, "unknown-endpoint",
 		"такой ручки у контроллера нет: "+r.URL.Path,
 		"список ручек — в control/README.md",
-		"их семь: /api/session, /api/me, /api/resources, /api/fields")
+		"их восемь: /api/session, /api/me, /api/resources, /api/recipes, /api/fields")
 }
 
 // writeRefusal печатает отказ ОДИН И ТОТ ЖЕ, но подаёт его двумя способами: машине —
