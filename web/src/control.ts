@@ -313,14 +313,32 @@ async function call<T>(
 //
 // Форму проверяем целиком и до показа: показать половину ответа честнее нельзя, а
 // додумывать недостающее поле — это заводить в пульте вторую истину о мире.
+//
+// ПОЛЕ ЕСТЬ И ПУСТО — ЭТО НЕ «ПОЛЯ НЕТ» (`WORLD2` 3.4, задача `WORLD2-135`). Пустое законно
+// везде в мире, и мерка у каждого поля своя:
+//
+//	`typeof … === "string"` — пустая строка ЗАКОННОЕ ЗНАЧЕНИЕ (бренд, адрес «здесь»);
+//	`isFilled`              — пустой строки у поля не бывает, и пустая значит поломку.
+//
+// Мерка выбирается не на вкус: она берётся оттуда, где поле рождается. Требование непустоты,
+// поставленное на поле, которому пустым быть можно, — это отказ на ПРАВИЛЬНОМ ответе мира;
+// именно им пульт не пускал в мир всякого, кто входит впервые.
 
 function readSession(parsed: unknown, path: string): Answer<Session> {
   const rec = asRecord(parsed);
   if (!rec) return notExpected(path, "это не объект");
 
-  for (const field of ["name", "brand", "token"] as const) {
+  // `name` и `token` пустыми не бывают: личность без имени контроллер не заводит вовсе
+  // (отказ `no-name`), а пустая метка сессии означала бы «вошёл», когда входа нет.
+  for (const field of ["name", "token"] as const) {
     if (!isFilled(rec[field])) return notExpected(path, `нет строки «${field}»`);
   }
+  // `brand` — ЛЮБАЯ строка, в том числе пустая. Бренд это то, под чем юзер отдаёт своё; пока
+  // он ничего не отдавал, бренда у него нет, и свежесозданный скоуп так и отвечает: `""`.
+  // Это законное состояние мира, а не отсутствие данных, и выдумывать за юзера бренд (имя,
+  // прочерк) пульт не станет — пустое показывается пустым и называется словами.
+  if (typeof rec.brand !== "string") return notExpected(path, "нет строки «brand»");
+
   const scope = readScope(rec.scope);
   if (!scope) return notExpected(path, "нет объекта «scope» с полями addr, here, path");
 
@@ -341,9 +359,10 @@ function readIdentity(parsed: unknown, path: string): Answer<Identity> {
   const rec = asRecord(parsed);
   if (!rec) return notExpected(path, "это не объект");
 
-  for (const field of ["name", "brand"] as const) {
-    if (!isFilled(rec[field])) return notExpected(path, `нет строки «${field}»`);
-  }
+  // Мерка та же, что и у входа: имя непустое, бренд — любая строка (см. `readSession`).
+  if (!isFilled(rec.name)) return notExpected(path, "нет строки «name»");
+  if (typeof rec.brand !== "string") return notExpected(path, "нет строки «brand»");
+
   const scope = readScope(rec.scope);
   if (!scope) return notExpected(path, "нет объекта «scope» с полями addr, here, path");
 
@@ -359,6 +378,7 @@ function readIdentity(parsed: unknown, path: string): Answer<Identity> {
   };
 }
 
+/** Адрес и путь скоупа — ЛЮБЫЕ строки: непустоту здесь никто не обещал, и требовать её нечем. */
 function readScope(raw: unknown): ScopeView | null {
   const rec = asRecord(raw);
   if (!rec) return null;
@@ -402,6 +422,8 @@ function readResourceList(raw: unknown, path: string): Answer<Resource[]> {
 function readOneResource(raw: unknown): Resource | null {
   const rec = asRecord(raw);
   if (!rec) return null;
+  // Имя ресурса называет человек, и пустым оно не бывает: сосед отсекает его правилом имени
+  // (`bad-name`), а имя «здесь» занято контроллером.
   if (!isFilled(rec.name)) return null;
   // `addr` у ресурса контроллера пуст ЗАКОННО, а `reach` — это измеренный ответ самого
   // ресурса, и без него строка списка врала бы молчанием. Поэтому проверки у них разные.
@@ -448,8 +470,9 @@ function readThings(raw: unknown): Thing[] | null | typeof НЕ_ТА_ФОРМА 
 function readOneThing(raw: unknown): Thing | null {
   const rec = asRecord(raw);
   if (!rec) return null;
-  // `state` — измеренное состояние вещи словами; строка о вещи без него говорила бы «вещь
-  // есть» и молчала о том, что про неё ничего не известно.
+  // Имя вещи — имя проекта компоуза, и пустым оно не приезжает: контейнеры без этой метки
+  // контроллер в список не берёт вовсе. `state` — измеренное состояние вещи словами; строка о
+  // вещи без него говорила бы «вещь есть» и молчала о том, что про неё ничего не известно.
   if (!isFilled(rec.name) || !isFilled(rec.state)) return null;
   // `alive` спрашиваем БУЛЕВЫМ, а не «похоже на правду»: `false` у контроллера значит в том
   // числе «HEALTHCHECK-а нет, ответа не спросить», и мягкая проверка (`!== false`) выдала бы
@@ -499,6 +522,8 @@ function readFieldList(raw: unknown, path: string): Answer<Field[]> {
 function readOneField(raw: unknown): Field | null {
   const rec = asRecord(raw);
   if (!rec) return null;
+  // Поле заводится ПО ИМЕНИ, безымянного контроллер не заводит (отказ `no-name`). А `created`
+  // — дата, и её отсутствие законно: без даты поле показать можно, соврать датой нельзя.
   if (!isFilled(rec.name)) return null;
   return { name: rec.name as string, created: typeof rec.created === "string" ? rec.created : "" };
 }

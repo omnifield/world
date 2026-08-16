@@ -13,7 +13,7 @@
 import { describe, expect, it } from "vitest";
 
 import { type Fetcher, PATH, type Resource, type Session, liveControl } from "./control.js";
-import { изКонтракта } from "./probe-contract.js";
+import { СВЕЖИЙ_СКОУП, изКонтракта } from "./probe-contract.js";
 
 /** Один запрос, как его увидел контроллер: путь, глагол, заголовки, тело. */
 type Записанный = {
@@ -117,6 +117,68 @@ describe("вход", () => {
 
     expect(записи[0]?.headers.Authorization).toBeUndefined();
     expect(записи[1]?.headers.Authorization).toBe(`Bearer ${ВХОД.token}`);
+  });
+});
+
+describe("свежесозданный скоуп — первое, что видит новый юзер", () => {
+  // `WORLD2-135`: пульт требовал непустой бренд и не пускал в мир НИКОГО, кто входит впервые.
+  // Ни одна из проб зоны этого не поймала, и сверка с образцом контракта не поймала бы тоже:
+  // пример в доке показывает форму, а не законный край значений — бренд там назван.
+  it("вход с ПУСТЫМ брендом проходит: пустое законно, а не поломка ответа", async () => {
+    const { fetch } = отвечает([{ body: JSON.stringify(СВЕЖИЙ_СКОУП), status: 201 }]);
+    const answer = await liveControl(fetch).enter({
+      addr: СВЕЖИЙ_СКОУП.scope.addr,
+      create: true,
+      name: СВЕЖИЙ_СКОУП.name,
+    });
+
+    expect(answer.kind).toBe("ok");
+    expect(answer.kind === "ok" && answer.value.brand).toBe("");
+    expect(answer.kind === "ok" && answer.value.created).toBe(true);
+  });
+
+  it("пустой бренд ничем не подменяется — ни именем, ни прочерком", async () => {
+    // Мир не выдумывает за юзера (`WORLD2` 3.7, 0.1): пустое доезжает пустым, а называется
+    // словами уже на экране.
+    const { fetch } = отвечает([{ body: JSON.stringify(СВЕЖИЙ_СКОУП) }]);
+    const answer = await liveControl(fetch).me();
+
+    expect(answer.kind === "ok" && answer.value.brand).toBe("");
+  });
+
+  it("а вот бренда НЕ СТРОКОЙ — это уже форма, и она отказ", async () => {
+    // «Поле пустое» и «поля нет» — разные вещи. Первое законно, второе значит, что контракт
+    // разъехался, и разбирать такой ответ дальше нельзя.
+    const { brand: _, ...без } = СВЕЖИЙ_СКОУП;
+    const { fetch } = отвечает([{ body: JSON.stringify(без) }]);
+    const answer = await liveControl(fetch).me();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+    expect(answer.kind === "refusal" && answer.refusal.why).toContain("brand");
+  });
+
+  it("а вот пустое ИМЯ и пустая МЕТКА — поломка: их пустыми не бывает", async () => {
+    // Личность без имени контроллер не заводит вовсе (`no-name`), а пустая метка сессии
+    // означала бы «вошёл», когда входа нет. Одна мерка на все поля разом была бы такой же
+    // ошибкой, как и требование непустоты у бренда, — просто в другую сторону.
+    for (const порча of [{ name: "" }, { token: "" }]) {
+      const { fetch } = отвечает([{ body: JSON.stringify({ ...СВЕЖИЙ_СКОУП, ...порча }) }]);
+      const answer = await liveControl(fetch).enter({ addr: СВЕЖИЙ_СКОУП.scope.addr });
+
+      expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+    }
+  });
+
+  it("у свежего скоупа пусто ВСЁ, что пульт спрашивает, — и это не отказ", async () => {
+    // Свежесозданный скоуп — это личность и пустые списки (`WORLD2` 3.4). Ключей и территорий
+    // пульт не спрашивает вовсе, а поля и источники ресурса спрашивает — и пустые их принимает.
+    const { fetch } = отвечает([{ body: JSON.stringify({ fields: [] }) }]);
+    const поля = await liveControl(fetch).fields();
+    const { fetch: fetch2 } = отвечает([{ body: JSON.stringify({ resources: [] }) }]);
+    const ресурсы = await liveControl(fetch2).resources();
+
+    expect(поля).toEqual({ kind: "ok", value: [] });
+    expect(ресурсы).toEqual({ kind: "ok", value: [] });
   });
 });
 
