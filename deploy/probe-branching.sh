@@ -224,13 +224,6 @@ case "$1" in
                 # фоновый контейнер (заглушка-локация, держатель порта, сломанные двери
                 # красного прогона) — считаем, что запустился
                 exit 0 ;;
-            *probe-web:4873*)
-                # проверка склада
-                case "${STUB_WAREHOUSE:-ok}" in
-                    ok)      exit 0 ;;
-                    nostart) exit 125 ;;
-                    *)       exit 1 ;;
-                esac ;;
             *probe-loc*)
                 # стук в заглушку-локацию: отвечает она или нет
                 [ -n "${STUB_LOC_READY:-}" ] && exit 0 || exit 1 ;;
@@ -323,46 +316,61 @@ else detail "подставную дверь поднять нечем (нет p
 # ================================================================== 1. подъём без поля
 part "1. образ есть · склада нет · пробником не проверить → подъём не требует поля"
 if [ -n "$DOOR_PID" ]; then want=0; else want=1; fi
-STUB_HAVE_IMAGE=1 STUB_HAVE_PROBE= STUB_PULL_OK= STUB_WAREHOUSE=silent \
+STUB_HAVE_IMAGE=1 STUB_HAVE_PROBE= STUB_PULL_OK= \
     run_case "$want" "$HERE/up.sh"
 [ -n "$DOOR_PID" ] || detail "код 1 здесь — это отказ стука в подставную дверь, а не ветвление"
 said "собирать не нужно"
 not_called "run --rm --network"          # склад не спрашивали вовсе
 not_called "compose -f $HERE/compose.yaml build"
 
-# ================================================================== 2. сборке двери склад не нужен
+# ================================================================== 2. сборке двери пульт не нужен
 # Раньше здесь стоял обратный случай: молчащий склад ОСТАНАВЛИВАЛ сборку мира, потому что
 # образ вёз в себе пульт. Дверь показывать перестала (`WORLD2-107`), пульт уехал в образ
-# контроллера — и требование поля ушло вместе с причиной. Стережём именно это: молчащий
-# склад больше не мешает собрать дверь, а сборщик пульта не зовётся вовсе.
-part "2. образ есть · --build · склад молчит → образ мира ВСЁ РАВНО складывается"
+# контроллера — и требование поля ушло вместе с причиной. Стережём именно это: сборка
+# двери идёт сама по себе, а сборщик пульта не зовётся вовсе.
+part "2. образ есть · --build → образ мира складывается, пульт при этом не собирается"
 if [ -n "$DOOR_PID" ]; then want=0; else want=1; fi
-STUB_HAVE_IMAGE=1 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=silent \
+STUB_HAVE_IMAGE=1 STUB_HAVE_PROBE=1 \
     run_case "$want" "$HERE/up.sh" --build
 [ -n "$DOOR_PID" ] || detail "код 1 здесь — это отказ стука в подставную дверь, а не ветвление"
 called "compose -f $HERE/compose.yaml build"
 not_called "$NODE_IMAGE"                 # сборщик пульта не запускался
-not_called "probe-web:4873"              # склад не спрашивали вовсе: образу двери он не нужен
 
-# ================================================================== 3–4. «не смог проверить»
-part "3. образа нет · пробник не скачался → «не знаю» ≠ «склада нет», сборка идёт"
-STUB_HAVE_IMAGE= STUB_HAVE_PROBE= STUB_PULL_OK= STUB_WAREHOUSE=silent STUB_BUILDER=fail \
-    run_case 1 "$HERE/build.sh" --only-web
-said "проверить склад НЕЧЕМ"
-said "это НЕ значит, что склада нет"
-called "$NODE_IMAGE"                     # пошёл собирать, а не остановился
-
-part "4. пробник не запустился (код 125) → тот же исход «не знаю»"
-STUB_HAVE_IMAGE= STUB_HAVE_PROBE=1 STUB_WAREHOUSE=nostart STUB_BUILDER=fail \
-    run_case 1 "$HERE/build.sh" --only-web
-said "контейнер-пробник не запустился (код 125)"
-called "$NODE_IMAGE"
+# ================================================================== 3. сборке поля не нужно вовсе
+# ЗДЕСЬ СТЕРЕЖЁТСЯ СНЯТОЕ ТРЕБОВАНИЕ, и это единственное место, где оно стережётся.
+#
+# Было так: шаг 1 создавал сеть `omnifield-gateway`, стучался в склад локации `probe-web` и
+# отказывался собирать, если тот не отвечал. Причина — пакеты пульта лежали на складе и
+# наружу не торчали. Панель отвязана от продуктов мира (`WORLD2-127`), причина исчезла — и
+# требование снято вместе с ней (`WORLD2-128`).
+#
+# ВМЕСТЕ С НИМ СНЯТЫ ДВА СЦЕНАРИЯ, стерёгшие честность отказа «склад не отвечает» против
+# «проверить нечем» (`kb:WORLD-31`): бывшие 3 и 4. Они стерегли РАЗБОР ИСХОДОВ ПРОВЕРКИ, а
+# проверки больше нет — оставленные, они зеленели бы на пустоте и читались бы как
+# проверенное свойство (`WORLD2` 4.2). Правило само по себе живо и стережётся там, где у
+# него есть предмет (подъём, точка входа, выпуск).
+part "3. шаг 1 не спрашивает поля: ни сети, ни склада, ни --network в вызове"
+STUB_BUILDER=ok run_case 0 "$HERE/build.sh" --only-web
+called "$NODE_IMAGE"                     # сборщик всё-таки звался
+not_called "probe-web:4873"              # склада не спрашивает
+not_called "--network"                   # и в контейнер поля не подаёт
+# Сети докера сборка не трогает ВООБЩЕ — ни `create`, ни `inspect`. Проверять только
+# `network create` мало, и это не придирка: прежний код спрашивал `network inspect` и
+# создавал сеть лишь при её отсутствии, а подставной докер на `inspect` отвечает «есть».
+# То есть верни кто-нибудь весь блок целиком — `network create` не позвался бы, и сторож
+# на нём остался бы ЗЕЛЁНЫМ. Найдено порчей 2026-08-16 (`WORLD2-128`).
+grep -q '^network' "$STUB_LOG" \
+    && { bad "сборка трогает сети докера"; grep '^network' "$STUB_LOG" >&2; } \
+    || good "сетей докера сборка не трогает вовсе"
+grep -qF 'omnifield-gateway' "$STUB_DIR/out" \
+    && { bad "сборка всё ещё поминает поле в выводе"; grep -F 'omnifield-gateway' "$STUB_DIR/out" >&2; } \
+    || good "про omnifield-gateway сборка не заикается"
 
 # ================================================================== 4b. виноват сборщик
 # Упавший сборщик закрывает поток, и хостовый `tar` умирает от SIGPIPE. Отказ обязан назвать
 # СБОРЩИК: иначе виноватой выглядит зона `web`, и чинить пойдут не то (`kb:WORLD-31`).
 part "4b. сборщик упал, не дочитав поток → отказ называет сборщик, а не подачу"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=deaf \
+STUB_HAVE_PROBE=1 STUB_BUILDER=deaf \
     run_case 1 "$HERE/build.sh" --only-web
 said "пульт не собрался"
 grep -qF 'исходник пульта не прочитался' "$STUB_DIR/out" \
@@ -378,13 +386,12 @@ rm -rf "$OUT"
 run_case 0 "$HERE/build.sh"
 called "compose -f $HERE/compose.yaml build"
 not_called "$NODE_IMAGE"                 # сборщик пульта не звался
-not_called "probe-web:4873"              # склад не спрашивали
 grep -qF 'собранного пульта' "$STUB_DIR/out" \
     && bad "сборка мира всё ещё требует пульт" || good "про пульт сборка мира не заикается"
 
 # ================================================================== 6. только пульт
 part "6. --only-web: склад отвечает · сборщик отдал собранное → пульт собран, образ мира не тронут"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh" --only-web
 called "$NODE_IMAGE"
 not_called "compose -f $HERE/compose.yaml build"
@@ -409,14 +416,14 @@ grep '^run ' "$STUB_LOG" | grep -qF -- "$ROOT" \
 # зону без пульта.
 part "8. сборщик вышел с нулём, а поток пуст → отказ, прежняя сборка цела"
 printf 'прежняя сборка\n' > "$OUT/index.html"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=empty \
+STUB_HAVE_PROBE=1 STUB_BUILDER=empty \
     run_case 1 "$HERE/build.sh" --only-web
 said "поток пуст"
 grep -q 'прежняя сборка' "$OUT/index.html" 2>/dev/null \
     && good "прежняя сборка на месте" || bad "прежнюю сборку снесли ради неудачной"
 
 part "9. в потоке нет index.html → отказ, прежняя сборка цела"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=nowebpage \
+STUB_HAVE_PROBE=1 STUB_BUILDER=nowebpage \
     run_case 1 "$HERE/build.sh" --only-web
 said "нет index.html"
 grep -q 'прежняя сборка' "$OUT/index.html" 2>/dev/null \
@@ -429,7 +436,7 @@ grep -q 'прежняя сборка' "$OUT/index.html" 2>/dev/null \
 # вызовов видно, снесли контейнер или оставили.
 part "10. заглушка не поднялась → контейнер ОСТАВЛЕН, выход исполним"
 detail "сценарий ждёт 15 попыток стука — это ~15 секунд"
-STUB_HAVE_IMAGE=1 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=silent \
+STUB_HAVE_IMAGE=1 STUB_HAVE_PROBE=1 \
     run_case 1 "$HERE/probe.sh" --green
 said "заглушка-локация не поднялась"
 said "контейнер ОСТАВЛЕН нарочно"
@@ -614,7 +621,6 @@ STUB_HAVE_LOC_IMAGE= STUB_GUARD_READY=1 STUB_JOIN_OK=1 \
     run_case 0 "$HERE/location-up.sh" --config "$LOC_CFG"
 called "location-compose.yaml build"
 called "location-compose.yaml up -d"
-not_called "probe-web:4873"                    # склад пульта локации не нужен вовсе
 
 # Порядок «сначала сторож, потом вход» — единственное место, где эти два шага связаны, и
 # переставить их значит получить `self-unreachable` на ровном месте: дверь проверяет адрес.
@@ -966,16 +972,15 @@ not_called "control/compose.yaml build"
 
 part "26b. --only-control с готовым пультом → складывает образ и НЕ собирает пульт заново"
 mkdir -p "$OUT"; printf 'собранный пульт\n' > "$OUT/index.html"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh" --only-control
 called "control/compose.yaml build"
 not_called "$NODE_IMAGE"                             # сборщик пульта не звался
-not_called "probe-web:4873"                          # склад не спрашивался: поля тут не надо
 not_called "compose -f $HERE/compose.yaml build"     # образ мира не трогали
 
 part "26c. --control → шаг 1, потом шаг 3; образ МИРА при этом не складывается"
 rm -rf "$OUT"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh" --control
 called "$NODE_IMAGE"
 called "control/compose.yaml build"
@@ -988,13 +993,12 @@ built=$(grep -c "^run .*$NODE_IMAGE" "$STUB_LOG")
 [ "$built" = 1 ] && good "пульт собран ровно один раз (сборщик звался $built раз)" \
                  || bad "сборщик пульта звался $built раз — второй сборки в зоне быть не должно"
 
-part "26d. умолчание: ./deploy/build.sh собирает мир — без пульта, без склада, без контроллера"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+part "26d. умолчание: ./deploy/build.sh собирает мир — без пульта и без контроллера"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh"
 called "compose -f $HERE/compose.yaml build"
 not_called "control/compose.yaml build"
 not_called "$NODE_IMAGE"        # пульт умолчанию не нужен: в образ двери он не едет
-not_called "probe-web:4873"     # и поля умолчанию не нужно вовсе
 
 # Раскладку контроллера (контекст, Dockerfile, имя образа) держит ЕГО зона. Заведись её
 # копия здесь — сборка из этой зоны однажды сложила бы не тот образ, который потом
@@ -1079,7 +1083,7 @@ ranshe() {   # ranshe ОПИСАНИЕ N M — строка N в журнале 
 }
 
 part "29. выпуск: --dry-run не трогает ничего"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh" --dry-run
 said "ghcr.io/omnifield/world:sha-abc1234"
 said "ghcr.io/omnifield/world:latest"
@@ -1093,7 +1097,7 @@ not_called "control/compose.yaml build"              # и не собирали
 not_called "compose -f $HERE/compose.yaml build"     # ни того, ни другого образа
 
 part "29b. дерево не чисто → отказ: тег назвал бы не тот коммит"
-STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh"
 said "дерево не чисто"
 said "git -C"                                        # выход исполним: показано, где смотреть
@@ -1109,7 +1113,7 @@ not_called "push"
 
 # Штатный ход. Здесь же — ПОРЯДОК четырёх push'ей и один `sha` на оба образа.
 part "29d. штатный выпуск: собрал ОБА, пометил каждый двумя тегами, отдал четыре"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "compose -f $HERE/compose.yaml build"         # дверь собрана своей же сборкой
 called "control/compose.yaml build"                  # и контроллер — ею же
@@ -1151,7 +1155,7 @@ called "image inspect --format .* ghcr.io/omnifield/world:sha-abc1234"
 called "image inspect --format .* ghcr.io/omnifield/world-control:sha-abc1234"
 
 part "29e. реестр не принял → отказ называет вход; дальше первого тега не уехало НИЧЕГО"
-STUB_PUSH=denied STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_PUSH=denied STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh"
 said "docker login"
 said "write:packages"
@@ -1166,7 +1170,7 @@ not_called "push ghcr.io/omnifield/world-control"     # до пульта дел
 part "29f. реестр — значение: имена его не несут, сказали другой → поехали туда ОБА"
 WORLD_REGISTRY=example.test \
 STUB_WORLD_IMAGE=omnifield/world:dev STUB_CONTROL_IMAGE=omnifield/world-control:dev \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "push example.test/omnifield/world:sha-abc1234"
 called "push example.test/omnifield/world-control:sha-abc1234"
@@ -1175,7 +1179,7 @@ not_called "push ghcr.io"
 # Главная граница всей затеи: обычная сборка публиковать не умеет. Проверяем её же
 # командой — не «нет ключа», а «ни одного вызова в реестр».
 part "29g. обычная сборка НЕ публикует — ни метки, ни push"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh" --control
 called "control/compose.yaml build"
 not_called "push"
@@ -1210,7 +1214,7 @@ grep -qF '✗ не выпущено' "$STUB_DIR/out" \
 
 part "29i. имя от control УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
 STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "push ghcr.io/omnifield/world-control:sha-abc1234"
 not_called "ghcr.io/ghcr.io"               # двойного реестра нет ни в метке, ни в push
@@ -1218,7 +1222,7 @@ said "реестр взят из имени зоны control"   # и сказа�
 
 part "29j. в имени ПОРТ реестра → тег отрезан, имя цело; реестры у образов РАЗНЫЕ"
 STUB_CONTROL_IMAGE=registry.local:5000/omnifield/world-control:dev \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "push registry.local:5000/omnifield/world-control:sha-abc1234"
 called "push registry.local:5000/omnifield/world-control:latest"
@@ -1234,7 +1238,7 @@ said "ghcr.io и registry.local:5000"
 # Молча выбрать нельзя — выпуск отдал бы вещь не туда, откуда её потом тянут.
 part "29k. реестр назван дважды и по-разному → отказ, а не догадка"
 WORLD_REGISTRY=example.test STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh"
 said "два разных реестра"
 not_called "push"
@@ -1249,7 +1253,7 @@ not_called "control/compose.yaml build"    # отказ ДО сборки: со�
 # код разъезжается не сразу, а когда его чинят с одной стороны.
 part "29l. имя двери УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
 STUB_WORLD_IMAGE=ghcr.io/omnifield/world:latest \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/release.sh"
 called "push ghcr.io/omnifield/world:sha-abc1234"
 not_called "ghcr.io/ghcr.io"
@@ -1257,7 +1261,7 @@ said "реестр взят из имени зоны deploy"
 
 part "29m. реестр двери назван дважды и по-разному → отказ, а не догадка"
 WORLD_REGISTRY=example.test STUB_WORLD_IMAGE=ghcr.io/omnifield/world:latest \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh"
 said "два разных реестра"
 not_called "push"
@@ -1268,7 +1272,7 @@ not_called "compose -f $HERE/compose.yaml build"
 # половина выпуска. Проверяем, что дверь при этом собралась (значит порядок настоящий, а не
 # случайно спасший нас отказ раньше времени), а в реестр не ушло ни одного вызова.
 part "29n. сборка контроллера упала → не отдано НИЧЕГО, хотя дверь собралась"
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=fail \
+STUB_HAVE_PROBE=1 STUB_BUILDER=fail \
     run_case 1 "$HERE/release.sh"
 called "compose -f $HERE/compose.yaml build"   # дверь собралась — до пульта дошли
 said "не отдано ничего"
@@ -1277,7 +1281,7 @@ not_called "tag "
 
 part "29o. оба образа названы одинаково → отказ: второй лёг бы поверх первого"
 STUB_WORLD_IMAGE=omnifield/world-control:dev \
-STUB_HAVE_PROBE=1 STUB_WAREHOUSE=ok STUB_BUILDER=ok \
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh"
 said "названы одинаково"
 not_called "push"
