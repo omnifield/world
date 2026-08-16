@@ -10,17 +10,14 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@omnifield/probe-web-runtime": "^0.1.0",
-    "@omnifield/probe-web-style": "^0.1.0",
-    "@omnifield/probe-web-ui": "^0.1.0",
     "solid-js": "^1.9.14"
   },
   "devDependencies": {
-    "@omnifield/probe-web-build": "^0.1.0",
     "@types/node": "^26.2.0",
     "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
+    "vite-plugin-solid": "^2.11.14",
     "vitest": "^4.1.10"
   }
 }

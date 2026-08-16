@@ -1,0 +1,73 @@
+/* Тема пульта: сброс и токены. Раньше это приезжало двумя файлами `@omnifield/probe-web-style`
+   — пакетом со склада ВНУТРИ мира, то есть входом, который зависит от инструмента мира
+   (`WORLD2` 3.7). Теперь значения живут здесь, и панель поднимается на любой машине.
+
+   Разделение слоёв сохранено, потому что оно рабочее, а не декоративное:
+
+     • ЗДЕСЬ — литеральные значения: цвета, шкалы, шрифты. Единственное место, где они есть;
+     • в `panel.css` — только `var(…)`. Литеральный цвет, вписанный туда, не переключится
+       вместе с темой и всплывёт светлым пятном в тёмном режиме.
+
+   Токенов ровно столько, сколько зовёт `panel.css`. Палитру про запас не заводим: неиспользуемый
+   токен — это обещание, которое некому держать.
+
+   Тёмный режим — по СИСТЕМНОЙ настройке (`prefers-color-scheme`), а не по классу `.dark`:
+   переключателя тем у пульта нет и в задаче не стоит, а класс, который некому поставить, был
+   бы мёртвым кодом. Появится переключатель — он и добавит сюда своё правило. */
+
+:root {
+  /* Режим объявляется браузеру, а не только нам: от него зависят системные элементы —
+     скроллбары, поля автозаполнения. Без него тёмная страница получает светлые виджеты. */
+  color-scheme: light;
+
+  --background: #ffffff;
+  --foreground: #17171a;
+  --card: #ffffff;
+  --card-foreground: #17171a;
+  --primary: #17171a;
+  --primary-foreground: #fafafa;
+  --muted-foreground: #6b6b74;
+  --border: #e3e3e6;
+  --ring: #8f8f99;
+  /* Отказ — кайма и код, а не заливка; цвет нужен различимый, но не кричащий. */
+  --destructive: #b3261e;
+
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --motion-fast: 200ms;
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --background: #0b0b0d;
+    --foreground: #f4f4f5;
+    --card: #121215;
+    --card-foreground: #f4f4f5;
+    --primary: #f4f4f5;
+    --primary-foreground: #0b0b0d;
+    --muted-foreground: #a1a1aa;
+    --border: #2a2a30;
+    --ring: #8f8f99;
+    --destructive: #f2705f;
+  }
+}
+
+*,
+::before,
+::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}

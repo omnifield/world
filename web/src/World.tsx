@@ -11,10 +11,10 @@
 //   • СНЯТИЯ РЕСУРСА — у контроллера ручка есть, `WORLD2-102` её на экран не просит, а
 //     необратимое действие на чужой машине тихой кнопкой рядом со списком не заводят.
 import { For, Show, Switch, Match, createResource, createSignal } from "solid-js";
-import { Button, Field, Input, Label, Textarea } from "@omnifield/probe-web-ui";
 
 import type { Answer, Control, Field as WorldField, Refusal, Resource } from "./control.js";
 import { RefusalView } from "./Refusal.jsx";
+import { Button, Field, Input, Label, Textarea } from "./ui.jsx";
 
 export type WorldProps = {
   control: Control;

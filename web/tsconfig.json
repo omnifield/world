@@ -1,7 +1,27 @@
 {
-  "extends": "@omnifield/probe-web-build/tsconfig",
+  // Типы. Раньше файл наследовался от `@omnifield/probe-web-build/tsconfig` — пакета со
+  // склада внутри мира; теперь настройки стоят здесь целиком.
+  //
+  // `jsxImportSource: solid-js` — то, ради чего база вообще существовала: Solid берёт JSX из
+  // своего рантайма, а не из React. Со сменой мажора Solid эту строку правим у себя, и это
+  // честнее, чем ждать выпуска чужого пакета.
   "include": ["src", "vite.config.ts", "vitest.config.ts"],
   "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
     // vite.config.ts читает process.env — это узел, а не браузер. Больше типы Node нигде
     // не нужны, и в src их нет.
     "types": ["vite/client", "node"]

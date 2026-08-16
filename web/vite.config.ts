@@ -1,8 +1,9 @@
-// Ни версии Vite, ни solid-плагина, ни настроек сборки здесь нет намеренно: всё это живёт за
-// точкой `@omnifield/probe-web-build/vite` и двигается её выпуском (kb:PROBEWEB-7). Файл наш,
-// обвес в него больше не заглядывает, — но содержательного в нём быть не должно, иначе версия
-// сборки замёрзнет у нас навсегда.
-import { defineConfig } from "@omnifield/probe-web-build/vite";
+// Сборка пульта. Раньше здесь было три строки, а весь конфиг приезжал за точкой
+// `@omnifield/probe-web-build/vite` — пакетом со склада ВНУТРИ мира. Так вход в мир зависел
+// от инструмента мира, чего канон не допускает (`WORLD2` 3.7). Теперь конфиг наш и целиком
+// виден: одна страница, один плагин.
+import solid from "vite-plugin-solid";
+import { defineConfig } from "vite";
 
 // Адрес КОНТРОЛЛЕРА для дев-сервера. Пульт говорит с ним, а не с дверью (`WORLD2` 3.7):
 // дверь — вход и выход, она ничего не показывает. Умолчание — `:8090` в петле, ровно туда
@@ -14,12 +15,13 @@ import { defineConfig } from "@omnifield/probe-web-build/vite";
 // он туда попадёт — забота того, кто его раздаёт.
 const controlTarget = process.env.WORLD_CONTROL ?? "http://127.0.0.1:8090";
 
-export default {
-  ...defineConfig(),
+export default defineConfig({
+  // JSX Solid преобразует плагин — без него браузер получит вызовы, которых не понимает.
+  plugins: [solid()],
   server: {
     proxy: {
       // Только ручки. Статику в деве отдаёт vite — иначе он проксировал бы сам себя.
       "/api": { target: controlTarget, changeOrigin: true },
     },
   },
-};
+});

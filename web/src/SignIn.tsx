@@ -13,10 +13,10 @@
 // которого скоупа ещё нет, не должен для начала получить «нет» — но если отказ `no-scope`
 // всё же пришёл, форма заведения открывается с тем же адресом, чтобы не набирать его дважды.
 import { Show, createSignal } from "solid-js";
-import { Button, Field, Input, Label, Textarea } from "@omnifield/probe-web-ui";
 
 import type { Control, Refusal, Session } from "./control.js";
 import { RefusalView } from "./Refusal.jsx";
+import { Button, Field, Input, Label, Textarea } from "./ui.jsx";
 
 export type SignInProps = {
   control: Control;
