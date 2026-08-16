@@ -38,6 +38,18 @@ COPY --from=build /out/control /usr/local/bin/control
 COPY deploy/remote.sh /opt/world/deploy/remote.sh
 COPY deploy/compose.yaml /opt/world/deploy/compose.yaml
 
+# ── каталог рецептов ─────────────────────────────────────────────────────────
+# ЧТО ПОДНИМАЕТСЯ НА РЕСУРСЕ — ГОВОРИТ РЕЦЕПТ, А НЕ КОНТРОЛЛЕР (`WORLD2` 3.7, `WORLD2-131`).
+# Каталог едет ПУСТЫМ, и это не забывчивость: перечня вещей у мира нет, а дверь лежит рядом
+# с подъёмом и второй копией здесь не появляется — две копии одного файла разъехались бы
+# молча. Свои вещи хозяин машины кладёт сюда монтированием:
+#
+#   docker run … -v ~/мои-рецепты:/opt/world/recipes:ro …
+#
+# Ради этого каталог и заведён отдельным путём: положить вещь можно БЕЗ пересборки образа и
+# без единой правки кода — иначе вещь снова была бы зашита, а не описана.
+RUN mkdir -p /opt/world/recipes
+
 # ── лицо для человека ────────────────────────────────────────────────────────
 # Собранный пульт — КАК ЕСТЬ, из результата первого шага сборки. Исходников зоны `web`
 # здесь нет по построению: копируется каталог сборки, а не зона.
@@ -60,6 +72,7 @@ RUN test -s /opt/world/pult/index.html || { \
 
 ENV CONTROL_ADDR=":8090" \
     CONTROL_REMOTE_SH="/opt/world/deploy/remote.sh" \
+    CONTROL_RECIPES="/opt/world/recipes" \
     CONTROL_KEYS="/root/.ssh" \
     CONTROL_PULT="/opt/world/pult" \
     CONTROL_DOCKER="docker"

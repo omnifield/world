@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,7 @@ func TestПодсказкаНазываетВсеРучки(t *testing.T) {
 	for _, path := range []string{
 		"POST   /api/session", "GET    /api/me",
 		"GET    /api/resources", "POST   /api/resources", "DELETE /api/resources/{имя}",
+		"GET    /api/recipes",
 		"GET    /api/fields", "POST   /api/fields",
 		"GET    /                     пульт",
 	} {
@@ -31,7 +33,7 @@ func TestПодсказкаНазываетВсеЗначения(t *testing.T) 
 	for _, name := range []string{
 		"CONTROL_ADDR", "CONTROL_KEYS", "CONTROL_REMOTE_SH",
 		"CONTROL_DOCKER", "CONTROL_DOOR_PORT", "CONTROL_TOOL_TIMEOUT", "CONTROL_SSH_TIMEOUT",
-		"CONTROL_PULT",
+		"CONTROL_PULT", "CONTROL_RECIPES", "CONTROL_DOOR_RECIPE",
 	} {
 		if !strings.Contains(sb.String(), name) {
 			t.Fatalf("в подсказке нет значения %s — неназванная настройка равна отсутствующей", name)
@@ -72,5 +74,24 @@ func TestУмолчанияСовпадаютСФайломЗапуска(t *tes
 	}
 	if !strings.Contains(string(data), "CONTROL_PULT: /opt/world/pult") {
 		t.Fatal("путь к пульту в файле запуска разъехался с тем, куда его кладёт образ")
+	}
+	// Каталог рецептов — то место, куда хозяин машины кладёт свои вещи. Разъедься путь с
+	// образом, положенный рецепт просто не нашёлся бы, и отказ был бы про имя, а не про
+	// раскладку.
+	if !strings.Contains(string(data), "CONTROL_RECIPES: /opt/world/recipes") {
+		t.Fatal("каталог рецептов в файле запуска разъехался с тем, что заводит образ")
+	}
+}
+
+// Рецепт двери и каталог рецептов ВЫВОДЯТСЯ из пути к подъёму: файл запуска двери едет в
+// образ рядом с ним. Второе независимое умолчание того же самого разъехалось бы молча —
+// ровно так же, как разъезжалось имя образа двери (`WORLD2-121`).
+func TestРецептыВыводятсяИзПутиКПодъёму(t *testing.T) {
+	dir := filepath.Dir(defaultRemoteSh)
+	if got := filepath.Join(dir, "compose.yaml"); got != "../deploy/compose.yaml" {
+		t.Fatalf("рецепт двери выводится не туда: %q", got)
+	}
+	if got := filepath.Join(dir, "recipes"); got != "../deploy/recipes" {
+		t.Fatalf("каталог рецептов выводится не туда: %q", got)
 	}
 }

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { SignIn } from "./SignIn.jsx";
 import type { Answer, Control, Session } from "./control.js";
+import { изКонтракта } from "./probe-contract.js";
 import { ввести, дождаться, нажать, осесть, смонтировать } from "./probe-dom.jsx";
 
 let проба: { корень: HTMLElement; снять: () => void } | undefined;
@@ -16,14 +17,10 @@ afterEach(() => {
   проба = undefined;
 });
 
-const ВОШЁЛ: Session = {
-  name: "егор",
-  brand: "омнифилд",
-  scope: { addr: "/scope/егор", here: true, path: "/scope/егор" },
-  since: "",
-  created: false,
-  token: "метка-1",
-};
+// Образцы ответов вырезаны из контракта соседа (`probe-contract.ts`), а не написаны рукой:
+// проба, разбирающая нашу же выдумку, зеленеет и тогда, когда контроллер отвечает иначе.
+// `since` у ответа входа нет — его и не бывает; пульт ставит там пустую строку.
+const ВОШЁЛ: Session = { ...изКонтракта<Omit<Session, "since">>("token"), since: "" };
 
 /** Контроллер для пробы: помнит, чем его позвали, и отвечает тем, что велели. */
 function контроллер(ответ: Answer<Session> | Array<Answer<Session>>) {
@@ -38,14 +35,11 @@ function контроллер(ответ: Answer<Session> | Array<Answer<Session
   return { control, звонки };
 }
 
+/** Отказ «скоупа нет» — образец из контракта; `said` дописывает пульт, разобрав чужой отказ. */
+const ОБРАЗЕЦ_ОТКАЗА = изКонтракта<{ code: string; why: string; ways: string[] }>("code");
 const ОТКАЗ_НЕТ_СКОУПА: Answer<Session> = {
   kind: "refusal",
-  refusal: {
-    code: "no-scope",
-    why: "по адресу /scope/егор скоупа нет — дотянулись, а личности там не лежит",
-    ways: ["завести его здесь", "или назови адрес, где скоуп уже лежит"],
-    said: "control",
-  },
+  refusal: { ...ОБРАЗЕЦ_ОТКАЗА, said: "control" },
 };
 
 describe("до входа не существует ничего", () => {
@@ -89,10 +83,11 @@ describe("отказ", () => {
       "блок отказа",
     );
 
-    expect(блок.dataset.refusal).toBe("no-scope");
-    expect(блок.textContent).toContain("скоупа нет");
+    expect(блок.dataset.refusal).toBe(ОБРАЗЕЦ_ОТКАЗА.code);
+    expect(блок.textContent).toContain(ОБРАЗЕЦ_ОТКАЗА.why);
+    // ВСЕ выходы, и в том же порядке: показанная половина — это отказ, у которого выхода нет.
     const выходы = [...блок.querySelectorAll(".pult__ways li")].map((li) => li.textContent);
-    expect(выходы).toEqual(["завести его здесь", "или назови адрес, где скоуп уже лежит"]);
+    expect(выходы).toEqual(ОБРАЗЕЦ_ОТКАЗА.ways);
     expect(блок.textContent).not.toContain("что-то пошло не так");
   });
 

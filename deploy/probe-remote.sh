@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Проба ДВЕРИ НА ЧУЖОМ РЕСУРСЕ — что `remote.sh` делает, чего НЕ делает и как отказывает.
+# Проба ВЕЩИ НА ЧУЖОМ РЕСУРСЕ — что `remote.sh` делает, чего НЕ делает и как отказывает.
 #
 #   ./deploy/probe-remote.sh            (умолчание) зелёный прогон, затем красный
 #   ./deploy/probe-remote.sh --green    только зелёный: что инструмент обязан делать
-#   ./deploy/probe-remote.sh --red      только красный: девять нарочных поломок
+#   ./deploy/probe-remote.sh --red      только красный: нарочные поломки
 #   ./deploy/probe-remote.sh --live     ЖИВОЙ прогон на настоящем втором ресурсе
 #
 # ┌─────────────────────────────────────────────────────────────────────────────────────┐
 # │ ЧТО ЭТА ПРОБА СТЕРЕЖЁТ                                                               │
 # │                                                                                      │
+# │  · ВЕЩЬ ОПИСАНА РЕЦЕПТОМ, А НЕ ЗАШИТА: проба кладёт ВТОРОЙ рецепт — чужой образ,     │
+# │    чужое имя контейнера, чужой порт — и поднимает его тем же путём. Потребовалась    │
+# │    бы правка кода — вещь была зашита, и это дефект (`WORLD2` 3.7);                   │
 # │  · ГЛАВНОЕ СВОЙСТВО: на ту машину не кладётся НИЧЕГО. Ни `scp`, ни команд по ssh     │
 # │    сверх проверки доступа, ни файлов — только разговор с чужим демоном докера        │
 # │    (`TECH` 2). Это проверяется по журналу вызовов, то есть по тому, чего не было;    │
@@ -48,6 +51,10 @@ export LC_ALL=C
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE="$HERE/remote.sh"
+# ЭТО ОЖИДАНИЯ ПРОБЫ ПРО РЕЦЕПТ ДВЕРИ, А НЕ ЗНАНИЕ МЕХАНИКИ. Проба вправе знать, что лежит в
+# `deploy/compose.yaml`, — она его и стережёт: имя образа и имя контейнера обязаны приезжать
+# ОТТУДА. Инструменту знать их неоткуда, и отдельная проверка следит, чтобы они не вернулись
+# в `remote.sh` константами.
 IMAGE=ghcr.io/omnifield/world:latest
 NET=omnifield-gateway
 DOOR=world-door
@@ -89,7 +96,33 @@ cat > "$STUB_DIR/docker" <<'STUB'
 #!/usr/bin/env bash
 # ПОДСТАВНОЙ докер: пишет журнал вызовов и отвечает по сценарию. Контейнеров не запускает,
 # на чужие машины не ходит. Сценарий задаётся переменными STUB_* — их выставляет проба.
+#
+# РЕЦЕПТ ОН ЧИТАЕТ ПО-НАСТОЯЩЕМУ — тот файл, который ему назвали ключом `-f`. Иначе проба
+# зеленела бы на подставе: подмени рецепт, а ответы те же — и «вещь берётся из рецепта»
+# осталось бы словами (`WORLD2` 4.2).
 printf 'docker %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+RECIPE=""; prev=""; LAST=""; PROJ_FILTER=""
+for a in "$@"; do
+    [ "$prev" = "-f" ] && RECIPE="$a"
+    case "$a" in label=com.docker.compose.project=*) PROJ_FILTER="${a##*=}" ;; esac
+    prev="$a"; LAST="$a"
+done
+
+# proj — имя проекта, как его вывел бы компоуз: `name:` из рецепта, иначе имя файла.
+proj() {
+    local n=""
+    [ -n "$RECIPE" ] && [ -f "$RECIPE" ] && n="$(sed -n 's/^name: *//p' "$RECIPE" | head -n1)"
+    [ -n "$n" ] || { n="$(basename -- "${RECIPE%.*}")"; }
+    printf '%s' "$n"
+}
+# ids — по контейнеру на каждую службу с образом. Столько же, сколько назвал рецепт.
+ids() {
+    local n i
+    n="$(grep -c '^ *image:' "$RECIPE" 2>/dev/null || printf 0)"
+    [ "$n" -gt 0 ] || return 0
+    for i in $(seq 1 "$n"); do printf '%s-cid%s\n' "$(proj)" "$i"; done
+}
 
 CTX=""
 if [ "${1:-}" = "--context" ]; then CTX="${2:-}"; shift 2; fi
@@ -117,7 +150,19 @@ case "$1" in
         exit 0 ;;
     compose)
         case "$*" in
-            *"config --images"*) printf '%s\n' "${STUB_IMAGE:-ghcr.io/omnifield/world:latest}"; exit 0 ;;
+            *"config --images"*)
+                # Имя образа ЧИТАЕТСЯ из рецепта. Нет его там — печатать нечего, и это ровно
+                # тот случай, в котором инструмент обязан отказать, а не подставить своё.
+                sed -n 's/^ *image: *//p' "$RECIPE" 2>/dev/null | head -n1; exit 0 ;;
+            *config*)
+                # Рецепт, который компоуз не разбирает: слово-метка в файле. Настоящий
+                # компоуз спорит с отступами, подстановками и полями — заглушке хватит
+                # одного признака, потому что проверяем мы ВЕТВЛЕНИЕ, а не разбор YAML.
+                if grep -q 'СЛОМАНО' "$RECIPE" 2>/dev/null; then
+                    printf 'validating %s: services must be a mapping\n' "$RECIPE" >&2; exit 1
+                fi
+                printf 'name: %s\n' "$(proj)"; exit 0 ;;
+            *" ps -aq"*|*" ps -q"*) ids; exit 0 ;;
             *version*)           exit "${STUB_LOCAL_COMPOSE:-0}" ;;
             *" up "*|*" up")
                 case "${STUB_UP:-ok}" in
@@ -151,10 +196,31 @@ case "$1" in
             rm)      exit "${STUB_NET_RM:-0}" ;;
         esac
         exit 0 ;;
-    inspect)  printf '%s\n' "${STUB_HEALTH:-healthy}"; exit 0 ;;
-    ps)       printf 'Up 3 minutes (healthy)\n'; exit 0 ;;
-    port)     printf '8080/tcp -> 0.0.0.0:8080\n'; exit 0 ;;
-    volume)   printf 'world-field\nworld-stand\n'; exit 0 ;;
+    inspect)
+        # Один вызов, два вопроса: здоровье и имя контейнера. Имя выводим из проекта — то
+        # есть из рецепта, а не из константы: спросили про чужую вещь — получили её имя.
+        case "$*" in
+            *".State.Health"*) printf '%s\n' "${STUB_HEALTH:-healthy}" ;;
+            *".Name"*)         printf '/%s\n' "$LAST" ;;
+        esac
+        exit 0 ;;
+    ps)
+        case "$*" in
+            # `ps -a --format '{{.Label "com.docker.compose.project"}}'` — какие ВЕЩИ вообще
+            # стоят на ресурсе. Ответ идёт от демона, а не от нашего рецепта.
+            *Label*) printf '%s\n' "${STUB_THINGS:-world}" ;;
+            *)       printf 'Up 3 minutes (healthy)\n' ;;
+        esac
+        exit 0 ;;
+    port)     printf '8080/tcp -> 0.0.0.0:%s\n' "${STUB_HOST_PORT:-8080}"; exit 0 ;;
+    volume)
+        # Тома ищутся по метке проекта — значит и отвечать надо от имени проекта.
+        if [ -n "$PROJ_FILTER" ]; then
+            printf '%s-field\n%s-stand\n' "$PROJ_FILTER" "$PROJ_FILTER"
+        else
+            printf 'world-field\nworld-stand\n'
+        fi
+        exit 0 ;;
 esac
 exit 0
 STUB
@@ -179,6 +245,32 @@ done
 
 chmod +x "$STUB_DIR"/*
 PATH="$STUB_DIR:$PATH"; export PATH
+
+# ------------------------------------------------------------------ ВТОРОЙ РЕЦЕПТ
+# Ради него вся ступень и делалась: чужая вещь, ни одним словом не совпадающая с дверью.
+# Своё имя проекта, свой образ, своё имя контейнера, свой порт. Если она поднимается тем же
+# путём и без единой правки кода — вещь описана рецептом, а не зашита (`WORLD2` 3.7).
+#
+# Файл временный: класть второй рецепт в зону значило бы завести вещь, которой никто не
+# заказывал. Проверяем МЕХАНИКУ, а не пополняем каталог.
+OTHER="$STUB_DIR/scales.yaml"
+cat > "$OTHER" <<'RECIPE'
+name: scales
+services:
+  scales:
+    image: ghcr.io/example/scales:v1
+    container_name: scales-box
+    ports:
+      - "9099:9099"
+RECIPE
+
+OTHER_IMAGE=ghcr.io/example/scales:v1
+
+# Рецепт, который компоуз не разберёт, и рецепт без имени образа — две РАЗНЫЕ поломки.
+BROKEN="$STUB_DIR/сломанный.yaml"
+printf 'name: СЛОМАНО\nservices: [это не отображение]\n' > "$BROKEN"
+NOIMAGE="$STUB_DIR/безобраза.yaml"
+printf 'name: безобраза\nservices:\n  что-то:\n    ports:\n      - "1:1"\n' > "$NOIMAGE"
 
 # ------------------------------------------------------------------ прогон инструмента
 # run <сценарий…> -- <аргументы remote.sh> — прогнать `remote.sh` с чистым журналом.
@@ -228,6 +320,12 @@ green() {
     run "${DEFAULT[@]}" -- add vps --addr world@10.8.0.5
     if [ "$RC" -eq 0 ]; then ok "подъём на чистом ресурсе прошёл целиком"
     else bad "подъём на чистом ресурсе не прошёл (код $RC)" "$OUT"; fi
+
+    # Прежний путь не сломан: команда без ключей ставит дверь — рецепт двери остался
+    # умолчанием КОМАНДЫ. Съедь это умолчание, и человек, поднимавший дверь одной строкой,
+    # поднял бы неизвестно что.
+    if has "compose -f $HERE/compose.yaml"; then ok "без --recipe берётся рецепт двери — прежний путь цел"
+    else bad "умолчание команды съехало с рецепта двери" "$JOURNAL"; fi
 
     # Имя контекста ПРОИЗВОДНО от имени ресурса. Стереги мы «какое-то имя», инструмент мог
     # бы выдумывать его заново каждый раз, и `drop` перестал бы находить свой же ресурс.
@@ -292,6 +390,72 @@ green() {
     done
     ok "ни apt, ни git clone, ни установки чего-либо на той стороне"
 
+    part "ВТОРАЯ ВЕЩЬ ПОДНИМАЕТСЯ ТЕМ ЖЕ ПУТЁМ — без единой правки кода (WORLD2 3.7)"
+    # Это главная проверка ступени. Она отвечает на один вопрос: описана вещь рецептом или
+    # всё-таки зашита. Второй рецепт не совпадает с дверью ничем — ни именем проекта, ни
+    # образом, ни именем контейнера, ни портом.
+    run "${DEFAULT[@]}" -- add vps --addr world@10.8.0.5 --recipe "$OTHER"
+    if [ "$RC" -eq 0 ]; then ok "чужая вещь встала тем же add — правок в коде не потребовалось"
+    else bad "чужая вещь по своему рецепту не встала (код $RC)" "$OUT" \
+        "потребовала правки — значит вещь была зашита, а не описана, и это дефект (WORLD2 3.7)"; fi
+
+    if has "compose -f $OTHER"; then ok "подъём идёт по НАЗВАННОМУ рецепту"
+    else bad "подъём пошёл не по названному рецепту" "$JOURNAL"; fi
+
+    if has "save $OTHER_IMAGE"; then ok "везётся образ из рецепта: $OTHER_IMAGE"
+    else bad "образ второй вещи не поехал" "имя образа обязано читаться из рецепта, а не из константы"; fi
+
+    if has "$IMAGE"; then
+        bad "в подъёме чужой вещи всплыл образ двери ($IMAGE)" \
+            "механика подставляет своё умолчание вместо того, что назвал рецепт"
+    else
+        ok "образа двери в подъёме чужой вещи нет ни разу"
+    fi
+
+    # Здоровье спрашивается у контейнеров ЭТОГО проекта, а не у имени, известного заранее.
+    if has "scales-cid1"; then ok "здоровье спрашивается у контейнера этой вещи (его назвал компоуз)"
+    else bad "здоровье спрашивалось не у контейнеров рецепта" "$JOURNAL" \
+        "имя контейнера — свойство рецепта; знать его механике неоткуда"; fi
+
+    if in_out "scales"; then ok "имя вещи в отчёте взято из рецепта"
+    else bad "в отчёте нет имени вещи из рецепта" "$OUT"; fi
+    if in_out "world-door" || in_out "дверь стоит"; then
+        bad "отчёт про чужую вещь говорит про дверь" "$OUT"
+    else
+        ok "в отчёте про чужую вещь двери не поминают вовсе"
+    fi
+
+    part "СНЯТЬ И СПРОСИТЬ — ТОЖЕ ПО РЕЦЕПТУ, А НЕ ПО ЗАШИТОМУ ИМЕНИ"
+    run STUB_CTX_EXISTS=1 STUB_CTX_ENDPOINT=ssh://world@10.8.0.5:22 STUB_REMOTE_DOCKER=1 \
+        STUB_NET_EXISTS=1 -- drop vps --recipe "$OTHER" --with-image
+    if [ "$RC" -eq 0 ] && has "compose -f $OTHER" && has " down"; then
+        ok "снимается вещь названного рецепта"
+    else
+        bad "снятие пошло не по рецепту (код $RC)" "$JOURNAL"
+    fi
+    if has "image rm $OTHER_IMAGE"; then ok "--with-image снимает образ ИЗ РЕЦЕПТА"
+    else bad "снят не тот образ" "$JOURNAL" "имя образа при снятии обязано быть тем же, что при подъёме"; fi
+
+    run STUB_CTX_EXISTS=1 STUB_CTX_ENDPOINT=ssh://world@10.8.0.5:22 STUB_REMOTE_DOCKER=1 \
+        STUB_REMOTE_IMAGE=1 STUB_NET_EXISTS=1 STUB_THINGS=scales -- status vps --recipe "$OTHER"
+    if [ "$RC" -eq 0 ] && in_out "scales"; then ok "status говорит про вещь названного рецепта"
+    else bad "status не назвал вещь рецепта (код $RC)" "$OUT"; fi
+    if in_out "вещи там"; then ok "status называет и то, ЧТО ВООБЩЕ стоит на ресурсе — отдельным вопросом"
+    else bad "status не говорит, какие вещи стоят на ресурсе" "$OUT" \
+        "ресурс — машина, до которой дотянулись; что на ней стоит, выводить из нашего рецепта нельзя"; fi
+
+    part "В МЕХАНИКЕ НЕ ОСТАЛОСЬ ЗАШИТОЙ ВЕЩИ"
+    # Сторож на будущее: вернуть в путь подъёма имя контейнера двери или её образ — и проба
+    # покраснеет здесь. Зелёная проба, которой больше нечего проверять, хуже отсутствующей
+    # (`WORLD2` 4.2), поэтому старую сверку констант заменили на обратную: их быть НЕ ДОЛЖНО.
+    hard="$(grep -n 'world-door\|ghcr\.io/omnifield/world' "$REMOTE" || true)"
+    if [ -z "$hard" ]; then
+        ok "в remote.sh нет ни имени контейнера двери, ни её образа"
+    else
+        bad "в remote.sh вернулась зашитая вещь" "$hard" \
+            "имя контейнера и образ принадлежат рецепту: вторая вещь потребовала бы правки кода"
+    fi
+
     part "ОБРАЗ НЕ ВЕЗЁТСЯ ДВАЖДЫ"
     run STUB_CTX_EXISTS=1 STUB_CTX_ENDPOINT=ssh://world@10.8.0.5:22 STUB_SSH_OK=1 \
         STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=1 STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 \
@@ -343,6 +507,18 @@ green() {
             "копия возит ровно то, что у тебя на руках; подмена её опубликованным образом видна только по digest'у"
     fi
 
+    # Образ без HEALTHCHECK — это НЕ отказ и НЕ «здорова»: третье состояние, и оно называется
+    # вслух. Вещь, у которой проверки нет вовсе, обязана вставать (`WORLD2` 4.2).
+    run STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=1 \
+        STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 STUB_UP=ok STUB_HEALTH=none \
+        -- add vps --addr world@10.8.0.5 --recipe "$OTHER"
+    if [ "$RC" -eq 0 ] && in_out "HEALTHCHECK"; then
+        ok "вещь без HEALTHCHECK встаёт, и непроверенное названо непроверенным"
+    else
+        bad "вещь без HEALTHCHECK не встала либо промолчала об этом (код $RC)" "$OUT" \
+            "чужая вещь не обязана иметь нашу проверку здоровья; выдать «встало» за «отвечает» тоже нельзя"
+    fi
+
     part "СНЯТИЕ — на той стороне контейнер, на этой контекст"
     run STUB_CTX_EXISTS=1 STUB_CTX_ENDPOINT=ssh://world@10.8.0.5:22 STUB_REMOTE_DOCKER=1 \
         STUB_NET_EXISTS=1 -- drop vps
@@ -376,21 +552,42 @@ green() {
         STUB_REMOTE_IMAGE=1 STUB_NET_EXISTS=1 -- status vps
     # Состояние спрашивается у ЧУЖОГО демона по каждой вещи отдельно: выведенное состояние
     # врёт ровно тогда, когда на него смотрят (`WORLD2` 4.2).
-    if [ "$RC" -eq 0 ] && in_out "дверь" && in_out "образ"; then
+    if [ "$RC" -eq 0 ] && in_out "контейнер" && in_out "образ" && in_out "здоровье"; then
         ok "status говорит, что на ресурсе сейчас"
     else
         bad "status не назвал состояние ресурса (код $RC)" "$OUT"
     fi
+    # Состояние вещи — её тома, и имена их читаются по метке проекта, а не по нашему списку.
+    if in_out "world-field"; then ok "тома вещи названы по факту, а не по зашитому списку"
+    else bad "тома вещи не названы" "$OUT" "своего списка томов у механики нет — он принадлежит рецепту"; fi
 }
 
 # ------------------------------------------------------------------ красный прогон
 red() {
-    part "КРАСНЫЙ ПРОГОН — девять нарочных поломок, у каждой СВОЙ код"
+    part "КРАСНЫЙ ПРОГОН — нарочные поломки, у каждой СВОЙ код"
 
     want_refusal no-name "имя ресурса не названо" "${DEFAULT[@]}" -- add
     want_refusal bad-name "имя ресурса не годится" "${DEFAULT[@]}" -- add "ВПС"
     want_refusal no-address "ресурс не заведён и адрес не назван" "${DEFAULT[@]}" -- add vps
     want_refusal bad-address "адрес похож на IPv6" "${DEFAULT[@]}" -- add vps --addr "world@fe80::1:22"
+    # ТРИ ОТКАЗА ПРО РЕЦЕПТ, а не один «плохой рецепт»: файла нет · файл не разбирается · в
+    # разобранном не названо имя образа. Чинятся они разными действиями, и общий код отправлял
+    # бы человека чинить не то (`WORLD2` 2.3).
+    want_refusal no-recipe "рецепта, которого нет" "${DEFAULT[@]}" \
+        -- add vps --addr world@10.8.0.5 --recipe "$STUB_DIR/такого-рецепта-нет.yaml"
+    want_refusal bad-recipe "рецепт, который компоуз не разбирает" "${DEFAULT[@]}" \
+        -- add vps --addr world@10.8.0.5 --recipe "$BROKEN"
+    want_refusal recipe-no-image "рецепт без имени образа" "${DEFAULT[@]}" \
+        -- add vps --addr world@10.8.0.5 --recipe "$NOIMAGE"
+    # Отказ про рецепт обязан случиться ДО того, как мы тронули ресурс: непригодный рецепт не
+    # вправе оставить за собой ни контекста, ни соединения.
+    if has "context create" || has "ssh "; then
+        bad "отказ по рецепту случился, когда ресурс уже трогали" "$JOURNAL" \
+            "рецепт читается до первого шага наружу: чинить его — работа на этой машине"
+    else
+        ok "отказ по рецепту — до первого касания ресурса"
+    fi
+
     want_refusal access-denied "ключ не принят" \
         STUB_CTX_EXISTS=0 STUB_SSH_OK=0 STUB_REMOTE_DOCKER=1 STUB_LOCAL_IMAGE=1 \
         -- add vps --addr world@10.8.0.5
@@ -413,6 +610,13 @@ red() {
         -- add vps --addr world@10.8.0.5
     want_refusal no-such-resource "снимают ресурс, которого не заводили" \
         STUB_CTX_EXISTS=0 -- drop vps
+    # «Запущено» и «отвечает» — разные вещи, и вторую мы обязаны дождаться либо отказать.
+    # Ждём ВСЕ контейнеры рецепта, поэтому нездоровый обязан покраснеть, а не потеряться
+    # среди здоровых соседей.
+    want_refusal thing-silent "вещь запущена, а здоровой за отведённое время не стала" \
+        WORLD_REMOTE_WAIT=0 STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 \
+        STUB_REMOTE_IMAGE=1 STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 STUB_UP=ok \
+        STUB_HEALTH=unhealthy -- add vps --addr world@10.8.0.5
 
     part "ОТКАЗ ОБЯЗАН НАЗЫВАТЬ ВЫХОД, А НЕ ТОЛЬКО ПРИЧИНУ (WORLD2 2.3)"
     run STUB_CTX_EXISTS=0 STUB_SSH_OK=0 STUB_REMOTE_DOCKER=1 STUB_LOCAL_IMAGE=1 \

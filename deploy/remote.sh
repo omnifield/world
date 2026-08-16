@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
-# Дверь на НАЗВАННОМ ресурсе: назвал адрес — дверь появилась там сама.
+# Вещь на НАЗВАННОМ ресурсе: назвал адрес и рецепт — вещь появилась там сама.
 #
-#   ./deploy/remote.sh add <имя> --addr user@host[:порт]   поставить дверь на ресурсе
-#   ./deploy/remote.sh drop <имя>                          снять её оттуда
+#   ./deploy/remote.sh add <имя> --addr user@host[:порт] [--recipe <путь>]   поставить
+#   ./deploy/remote.sh drop <имя> [--recipe <путь>]        снять её оттуда
 #   ./deploy/remote.sh list                                какие ресурсы заведены
-#   ./deploy/remote.sh status <имя>                         что сейчас на том ресурсе
+#   ./deploy/remote.sh status <имя> [--recipe <путь>]      что сейчас на том ресурсе
+#
+# ┌─────────────────────────────────────────────────────────────────────────────────────┐
+# │ ЧТО ИМЕННО ПОДНИМАЕТСЯ — ЗНАЕТ РЕЦЕПТ, А НЕ ЭТОТ СКРИПТ (`WORLD2` 3.7).              │
+# │                                                                                      │
+# │ Рецепт — файл запуска (compose). Из него берётся ВСЁ про вещь: имя, образ, имена     │
+# │ контейнеров, порты, тома, имя в сети. Своих констант про конкретную вещь у механики  │
+# │ нет: положил второй рецепт — поднимается вторая вещь, и ни строки здесь править не   │
+# │ надо. Потребовала бы правки — значит вещь была зашита, а не описана, и это дефект.   │
+# │                                                                                      │
+# │ Дверь — ОДИН ИЗ РЕЦЕПТОВ (`deploy/compose.yaml`), а не встроенная вещь. Она осталась │
+# │ умолчанием КОМАНДЫ (не назвал рецепт — ставится дверь), и это единственное место,    │
+# │ где механика вообще про неё слышит.                                                  │
+# └─────────────────────────────────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────────────────────────────────┐
 # │ ЧЕЛОВЕК НА ТОТ РЕСУРС НЕ ЗАХОДИТ. Ни консоли, ни `git clone`, ни `apt install`, ни    │
@@ -20,10 +33,14 @@
 #
 # ЧТО ПОЯВЛЯЕТСЯ НА ТОЙ СТОРОНЕ — и ничего сверх этого:
 #
-#   контейнер `world-door`      снимается `drop`
+#   контейнеры рецепта          снимаются `drop`
 #   сеть `omnifield-gateway`    снимается `drop`, если в ней больше никого нет
-#   тома `world-field`/`world-stand`   состояние поля — остаётся, снимается `drop --with-state`
-#   образ `ghcr.io/omnifield/world:latest` остаётся, снимается `drop --with-image`
+#   тома рецепта                состояние — остаётся, снимается `drop --with-state`
+#   образ, названный рецептом   остаётся, снимается `drop --with-image`
+#
+# Имён контейнеров, томов и образа тут не перечислено намеренно: они принадлежат рецепту, и
+# у механики их знать неоткуда. Что появилось на самом деле — говорит `status`, спрашивая
+# чужой демон, а не наш список.
 #
 # На ЭТОЙ машине появляется ровно одна вещь — контекст докера `world-<имя>`. Он же и есть
 # всё наше состояние: адрес ресурса хранится в нём, своего файла реестра зона не заводит.
@@ -45,22 +62,20 @@ set -euo pipefail
 export LC_ALL=C
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_FILE="$HERE/compose.yaml"
 
-# Общая сеть — та же, что и на своей машине: имя контрактное и живёт в файле запуска
-# (`compose.yaml`, `external: true`). Компоуз её не создаёт, поэтому создаём мы — так же,
-# как это делает `up.sh` у себя, и по той же причине: войти в несуществующую сеть докер
-# не даёт, и первый подъём на чистой машине без этого не встаёт.
+# РЕЦЕПТ — единственный источник знания о поднимаемой вещи. Умолчание — рецепт двери, и это
+# умолчание КОМАНДЫ, а не знание механики: прежний путь («поставь дверь на ресурс») остаётся
+# одной командой без ключей, а всё, что механика делает дальше, читается из названного файла.
+RECIPE="$HERE/compose.yaml"
+
+# Общая сеть — ЛАНДШАФТ машины, а не свойство вещи: в ней стоят соседи по полю, и она старше
+# любого рецепта. Компоуз её не создаёт (`external: true`), поэтому создаём мы — так же, как
+# это делает `up.sh` у себя, и по той же причине: войти в несуществующую сеть докер не даёт,
+# и первый подъём на чистой машине без этого не встаёт.
 NET=omnifield-gateway
-# Имя контейнера двери задано в `compose.yaml` (`container_name`). Здесь оно нужно, чтобы
-# спросить у ЧУЖОГО демона про здоровье двери; вторая копия имени сторожится пробой.
-DOOR=world-door
-# Хост-порт двери НА ТОМ РЕСУРСЕ. То же значение, что у `up.sh`, и подставляется в тот же
-# `compose.yaml` — раскладка на чужой машине не отличается от своей ничем.
-PORT="${WORLD_PORT:-8080}"
 # Сколько ждём ответа ssh. Меньше — быстрее краснеет, больше — терпимее к медленной связи.
 TIMEOUT="${WORLD_REMOTE_TIMEOUT:-10}"
-# Сколько ждём, пока дверь на той стороне станет здоровой. Дольше, чем у `up.sh`: там образ
+# Сколько ждём, пока вещь на той стороне станет здоровой. Дольше, чем у `up.sh`: там образ
 # уже лежит и запуск местный, здесь между нами сеть.
 WAIT="${WORLD_REMOTE_WAIT:-60}"
 
@@ -72,9 +87,9 @@ PREFIX=world-
 
 usage() {
     cat <<'USAGE'
-Дверь на названном ресурсе: ./deploy/remote.sh <команда>
+Вещь на названном ресурсе: ./deploy/remote.sh <команда>
 
-  add <имя> --addr user@host[:порт]   поставить дверь на том ресурсе одной командой
+  add <имя> --addr user@host[:порт]   поставить вещь на том ресурсе одной командой
   drop <имя> [--with-state] [--with-image]   снять её оттуда
   list                                какие ресурсы заведены с этой машины
   status <имя>                        что сейчас на том ресурсе
@@ -83,37 +98,46 @@ usage() {
 Имя ресурса — своё, короткое: буквы, цифры и дефис. Имя контекста докера производно от
 него (`world-<имя>`) и отдельно не называется.
 
-  ./deploy/remote.sh add vps --addr world@10.8.0.5
+ЧТО ПОДНИМАЕТСЯ — говорит РЕЦЕПТ (файл запуска), а не эта команда. Не назвал рецепт —
+берётся рецепт двери (deploy/compose.yaml); назвал — поднимается названная им вещь, и
+механике для этого нечего знать заранее.
+
+  ./deploy/remote.sh add vps --addr world@10.8.0.5                    дверь (умолчание)
+  ./deploy/remote.sh add vps --recipe deploy/весы.yaml                 другая вещь
   ./deploy/remote.sh add vps --addr world@10.8.0.5:2222   порт ssh, если он не 22
-  WORLD_PORT=8090 ./deploy/remote.sh add vps --addr …     хост-порт двери НА ТОМ ресурсе
+  WORLD_PORT=8090 ./deploy/remote.sh add vps --addr …     значение, которое читает рецепт
 
 Ключи `add`:
   --addr АДРЕС      адрес ресурса. Обязателен, пока ресурс не заведён; заведённому не
                     нужен — адрес лежит в контексте. Названный заново — адрес меняется
+  --recipe ПУТЬ     файл запуска поднимаемой вещи. Умолчание — deploy/compose.yaml,
+                    рецепт двери. Тот же ключ нужен `drop` и `status`: своего реестра
+                    вещей зона не заводит, и «что мы там поднимали» она не помнит
   --resend-image    везти образ, даже если на той стороне он уже есть
   --pull            образ на ресурсе берётся ИЗ РЕЕСТРА (docker pull там), а не копией
                     отсюда. Быстрее и не занимает наш канал, но приезжает ОПУБЛИКОВАННЫЙ
                     образ, а не тот, что лежит здесь. Умолчание — копия: она возит ровно
                     то, что у тебя на руках, и не требует реестра на той стороне
 
-Ключи `drop` — по умолчанию снимаются контейнер, сеть и контекст:
-  --with-state      снять и ТОМА: реестр поля и журнал стенда. Состояние стирается
-  --with-image      снять и образ мира с того ресурса
+Ключи `drop` — по умолчанию снимаются контейнеры, сеть и контекст:
+  --with-state      снять и ТОМА рецепта: состояние стирается
+  --with-image      снять и образ, названный рецептом, с того ресурса
 
 Переменные:
-  WORLD_PORT=8080              хост-порт двери на том ресурсе
+  WORLD_PORT=8080              значение для рецепта двери — её хост-порт на том ресурсе.
+                               Рецепт, который его не читает, о нём и не узнает
   WORLD_REMOTE_TIMEOUT=10      сколько секунд ждём ответа ssh
-  WORLD_REMOTE_WAIT=60         сколько секунд ждём, пока дверь станет здоровой
+  WORLD_REMOTE_WAIT=60         сколько секунд ждём, пока вещь станет здоровой
 
 ЧТО НУЖНО НА ТОМ РЕСУРСЕ: докер и ssh с ключом. Больше ничего — ни пакетов, ни клона
 репозитория, ни наших скриптов. Ключ берётся оттуда же, откуда его берёт ssh: агент
 (`ssh-add`) либо `~/.ssh/config`; своего хранилища ключей мир не заводит (WORLD2 3.0).
 
 Отказ печатается двумя строками: причина и выход — человеку, `REMOTE-REFUSAL: <код>` —
-машине. Коды: no-name · bad-name · no-address · bad-address · no-docker · no-daemon ·
-no-compose · no-ssh · access-denied · no-remote-docker · no-image · image-send-failed ·
-image-pull-failed · no-network · port-busy · up-failed · door-silent · no-such-resource ·
-down-failed · context-failed.
+машине. Коды: no-name · bad-name · no-address · bad-address · no-recipe · bad-recipe ·
+recipe-no-image · no-docker · no-daemon · no-compose · no-ssh · access-denied ·
+no-remote-docker · no-image · image-send-failed · image-pull-failed · no-network ·
+port-busy · up-failed · thing-silent · no-such-resource · down-failed · context-failed.
 USAGE
 }
 
@@ -288,19 +312,95 @@ check_remote_docker() {
         "проверить руками: ssh -p $SSH_PORT $(ssh_target) docker version"
 }
 
-# image_name — имя образа берём из файла запуска, а не держим вторую копию здесь: разъедутся
-# — повезём на ресурс не тот образ, который там потом поднимется.
-image_name() {
-    local img
-    img="$(docker compose -f "$COMPOSE_FILE" config --images 2>/dev/null | head -n1 || true)"
-    [ -n "$img" ] || img=ghcr.io/omnifield/world:latest
-    printf '%s' "$img"
+# ------------------------------------------------------------------ рецепт
+# THING — имя вещи, IMAGE — её образ. Оба ЧИТАЮТСЯ из рецепта, а не задаются здесь: список
+# вещей мира не является механикой (`WORLD2` 3.7), и всё, что механика о вещи знает, она
+# узнаёт в этой одной функции.
+THING=""; IMAGE=""
+
+# read_recipe — прочитать рецепт и отказать ВНЯТНО, если читать нечего. Три разных отказа, а
+# не один «плохой рецепт»: файла нет · файл не разбирается · в разобранном нет образа — чинят
+# их разными действиями, и общий код отправлял бы чинить не туда (`WORLD2` 2.3).
+#
+# Спрашиваем сам компоуз (`config`), а не читаем YAML своими глазами: рецепт может тянуть
+# подстановки, `extends` и второй файл, и наш разбор разошёлся бы с тем, что реально
+# поднимется. Разъехавшийся разбор хуже отсутствующего — он выглядит знанием (`WORLD2` 4.2).
+read_recipe() {
+    [ -n "$RECIPE" ] || refuse no-recipe \
+        "рецепт не назван" \
+        "назови файл запуска: --recipe deploy/compose.yaml" \
+        "без ключа берётся рецепт двери — deploy/compose.yaml"
+
+    [ -f "$RECIPE" ] || refuse no-recipe \
+        "рецепта «$RECIPE» нет — поднимать нечего" \
+        "проверь путь: ls -l $RECIPE" \
+        "путь считается от того места, где ты стоишь, а не от deploy/" \
+        "какие рецепты лежат рядом: ls $HERE/*.yaml"
+
+    local conf rc=0
+    set +e
+    conf=$(docker compose -f "$RECIPE" config 2>&1); rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        detail "${conf:-(компоуз промолчал)}"
+        refuse bad-recipe \
+            "рецепт «$RECIPE» компоуз не разбирает — ответ его напечатан выше" \
+            "проверь руками: docker compose -f $RECIPE config" \
+            "чаще всего это отступы, неизвестное поле либо подстановка, которой нечем стать"
+    fi
+
+    # Имя вещи — имя проекта компоуза: он же и есть то, чем на той стороне помечены её
+    # контейнеры, тома и сети. Берём его у компоуза, а не из имени файла: рецепт вправе
+    # назвать проект сам (`name:`), и тогда наше имя разошлось бы с настоящим.
+    THING="$(printf '%s\n' "$conf" | sed -n 's/^name: *//p' | head -n1)"
+    [ -n "$THING" ] || THING="$(basename -- "${RECIPE%.*}")"
+
+    IMAGE="$(docker compose -f "$RECIPE" config --images 2>/dev/null | head -n1 || true)"
+    [ -n "$IMAGE" ] || refuse recipe-no-image \
+        "в рецепте «$RECIPE» не названо имя образа — везти на ресурс нечего" \
+        "назови его у службы: image: ghcr.io/<кто>/<что>:<тег>" \
+        "имя нужно ПОЛНОЕ, с реестром: короткое докер достроит своим умолчанием (Docker Hub), а это чужое пространство имён" \
+        "посмотреть, что компоуз видит в рецепте: docker compose -f $RECIPE config --images"
 }
+
+# ------------------------------------------------------------------ что стоит на той стороне
+# thing_ids — контейнеры ЭТОГО рецепта на том ресурсе. Спрашиваем компоуз, а не сверяем имена
+# со своей константой: имя контейнера принадлежит рецепту, и знать его механике неоткуда.
+thing_ids() {
+    docker --context "$CTX" compose -f "$RECIPE" ps -aq 2>/dev/null || true
+}
+
+# health_of — здоровье одного контейнера словами. `none` значит «у образа нет HEALTHCHECK», и
+# это НЕ то же самое, что «здоров»: приблизительная запись хуже отсутствующей (`WORLD2` 4.2).
+health_of() {
+    docker --context "$CTX" inspect --format \
+        '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$1" 2>/dev/null || true
+}
+
+# thing_volumes — тома ЭТОЙ вещи на том ресурсе. Ищем по метке проекта, которую компоуз
+# ставит на всё, что заводит сам: имена томов принадлежат рецепту, и держать их копию здесь
+# значило бы завести второй список того же самого.
+thing_volumes() {
+    docker --context "$CTX" volume ls \
+        --filter "label=com.docker.compose.project=$THING" --format '{{.Name}}' 2>/dev/null \
+        | tr '\n' ' ' | sed 's/ *$//' || true
+}
+
+# published_of — куда опубликованы порты контейнера. Читается ФАКТОМ у чужого демона: какие
+# порты у вещи есть, знает её рецепт, а какие из них легли наружу — только сам докер.
+published_of() { docker --context "$CTX" port "$1" 2>/dev/null || true; }
+
+# host_port — первый хост-порт из публикации, чтобы было куда стучаться снаружи.
+host_port() { printf '%s\n' "$1" | sed -n 's/.*-> *[^:]*:\([0-9]\+\).*/\1/p' | head -n1; }
 
 # ------------------------------------------------------------------ add
 cmd_add() {
     need_name add
     have_local_tools
+    # Рецепт читается ДО того, как мы тронули ресурс: непригодный рецепт обязан отказать, не
+    # заводя ни контекста, ни соединения. Отказ не вправе ничего оставлять за собой
+    # (`WORLD2` 2.3, пункт 4).
+    read_recipe
 
     # Адрес обязателен, пока ресурс не заведён. Заведённому он не нужен: адрес лежит в
     # контексте, и повторный `add` — это законный способ поднять дверь заново, не повторяя
@@ -317,6 +417,7 @@ cmd_add() {
     parse_addr
 
     step "ресурс $NAME → $ADDR (контекст $CTX)"
+    ok "вещь «$THING» по рецепту $RECIPE"
 
     # ---------------------------------------------------------- 1. доступ
     step "проверяю доступ: ssh на $(ssh_target):$SSH_PORT"
@@ -339,7 +440,7 @@ cmd_add() {
         fi
     else
         docker context create "$CTX" \
-            --description "мир: дверь на ресурсе $NAME" \
+            --description "мир: ресурс $NAME" \
             --docker "host=$endpoint" >/dev/null 2>&1 || refuse context-failed \
             "контекст $CTX не создать" \
             "посмотри, что мешает: docker context create $CTX --docker host=$endpoint" \
@@ -367,7 +468,7 @@ cmd_add() {
     # Тянуть стало ВОЗМОЖНО только теперь: имя образа полное, с реестром (`WORLD2-121`).
     # Пока оно было коротким, `docker pull` на той стороне пошёл бы в Docker Hub — то есть
     # не туда, куда мы публикуем.
-    local image; image="$(image_name)"
+    local image="$IMAGE"
     step "образ $image на ресурсе"
     local have_remote=
     docker --context "$CTX" image inspect "$image" >/dev/null 2>&1 && have_remote=1
@@ -389,9 +490,9 @@ cmd_add() {
         docker image inspect "$image" >/dev/null 2>&1 || refuse no-image \
             "образа $image нет ни на ресурсе $NAME, ни на этой машине — везти нечего" \
             "пусть ресурс возьмёт его из реестра сам: ./deploy/remote.sh add $NAME --pull" \
-            "либо собери здесь: ./deploy/build.sh — и повтори эту команду" \
+            "либо собери его здесь тем, чем эта вещь собирается, — и повтори команду" \
             "образ есть под другим именем — переименуй: docker tag <твой> $image" \
-            "поля для этой сборки не нужно: пульт в образ двери не едет — подробности в deploy/README.md"
+            "имя образа взято из рецепта $RECIPE и здесь не выдумывается: назови в рецепте то имя, которое у тебя есть"
 
         [ -n "$have_remote" ] && warn "образ там есть, но велено перевезти заново (--resend-image)"
         # Поток идёт через ssh целиком: ни временного файла на той стороне, ни `scp`. На
@@ -424,10 +525,10 @@ cmd_add() {
     # ---------------------------------------------------------- 6. контейнер
     # Файл запуска ЛЕЖИТ ЗДЕСЬ и остаётся здесь: компоуз читает его на этой машине и говорит
     # с чужим демоном. На тот ресурс не уезжает ни файла — в этом весь смысл контекста.
-    step "поднимаю дверь на $NAME: хост-порт $PORT"
+    step "поднимаю «$THING» на $NAME по рецепту $RECIPE"
     local out rc=0
     set +e
-    out=$(WORLD_PORT="$PORT" docker --context "$CTX" compose -f "$COMPOSE_FILE" \
+    out=$(docker --context "$CTX" compose -f "$RECIPE" \
               up -d --no-build --remove-orphans 2>&1); rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -435,92 +536,119 @@ cmd_add() {
         # Занятый порт — отдельная ступень, а не «не встало»: чинит его хозяин того ресурса,
         # и чинится он другим действием. Схлопнуть его в общий отказ значит отправить
         # человека читать журнал там, где ответ уже известен.
+        #
+        # Номер порта берём ИЗ ОТВЕТА ДОКЕРА, а не из своего значения: какой порт вещь просит
+        # наружу, знает её рецепт, и наш пересказ назвал бы не тот (`WORLD2` 2.3).
         case "$out" in
             *"port is already allocated"*|*"address already in use"*|*"Ports are not available"*|*"bind: address already in use"*)
+                local busy; busy="$(printf '%s\n' "$out" | sed -n 's/.*[Bb]ind for [^:]*:\([0-9]\+\).*/\1/p' | head -n1)"
                 refuse port-busy \
-                    "порт $PORT на ресурсе $NAME занят кем-то ещё" \
-                    "возьми другой: WORLD_PORT=8090 ./deploy/remote.sh add $NAME" \
-                    "кто держит порт: ssh -p $SSH_PORT $(ssh_target) ss -lntp | grep :$PORT" \
-                    "наружу торчит ровно одна дверь на ресурс — второй мир на той же машине поднимают на другом хост-порту" ;;
+                    "порт ${busy:-из рецепта} на ресурсе $NAME занят кем-то ещё" \
+                    "порт вещь просит рецептом — назови другой в $RECIPE либо значением, которое этот рецепт читает" \
+                    "кто держит порт: ssh -p $SSH_PORT $(ssh_target) ss -lntp${busy:+ | grep :$busy}" \
+                    "наружу торчит ровно одна дверь на ресурс (kb:FUND-5) — второй мир на той же машине поднимают на другом хост-порту" ;;
         esac
         refuse up-failed \
-            "дверь на ресурсе $NAME не встала" \
+            "вещь «$THING» на ресурсе $NAME не встала" \
             "ответ докера напечатан выше — он же первая причина" \
-            "журнал двери: docker --context $CTX compose -f deploy/compose.yaml logs --tail=40" \
-            "снять недоделанное и начать заново: ./deploy/remote.sh drop $NAME"
+            "журнал: docker --context $CTX compose -f $RECIPE logs --tail=40" \
+            "снять недоделанное и начать заново: ./deploy/remote.sh drop $NAME --recipe $RECIPE"
     fi
-    ok "контейнер запущен"
+    ok "контейнеры запущены"
 
     # ---------------------------------------------------------- 7. дверь отвечает
     # «Запущен» и «отвечает» — разные вещи, и подтверждать надо второе. Спрашиваем ЗДОРОВЬЕ у
     # чужого демона, а не стучимся сюда curl-ом: опубликованный порт того ресурса может быть
     # закрыт для нас фаерволом, и живая дверь выглядела бы мёртвой. HEALTHCHECK стучится
     # изнутри контейнера — это ровно тот вопрос, на который тут надо ответить.
-    step "жду, пока дверь на $NAME станет здоровой (до ${WAIT}с)"
-    local health="" waited=0
-    while [ "$waited" -lt "$WAIT" ]; do
-        health="$(docker --context "$CTX" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$DOOR" 2>/dev/null || true)"
-        case "$health" in
-            healthy) break ;;
-            none)
-                # Образ без HEALTHCHECK — сказать это вслух, а не выдать «встал» за
-                # «отвечает». Приблизительная запись хуже отсутствующей: она выглядит
-                # знанием (`WORLD2` 4.2).
-                warn "у образа нет HEALTHCHECK — «отвечает ли дверь» этой командой не проверить"
-                break ;;
-        esac
+    step "жду, пока «$THING» на $NAME станет здоровой (до ${WAIT}с)"
+    local ids; ids="$(thing_ids)"
+    [ -n "$ids" ] || refuse up-failed \
+        "компоуз отчитался о подъёме, а контейнеров рецепта $RECIPE на ресурсе $NAME не видно" \
+        "спроси сам: docker --context $CTX compose -f $RECIPE ps -a" \
+        "рецепт мог не объявить ни одной службы — проверь: docker compose -f $RECIPE config --services"
+
+    # Ждём ВСЕ контейнеры рецепта, а не один: сколько их и какие — знает рецепт. Считать
+    # здоровой вещь по первому попавшемуся контейнеру значило бы выдать часть за целое.
+    local verdict="" waited=0 id h pending checked
+    while :; do
+        pending=0; checked=0
+        for id in $ids; do
+            h="$(health_of "$id")"
+            case "$h" in
+                healthy)     checked=$((checked + 1)) ;;
+                # `none` — у образа нет HEALTHCHECK: этот контейнер не ждём вовсе, потому что
+                # ждать нечего. Пустой ответ — контейнера уже нет; это тоже не ожидание.
+                none|"")     ;;
+                *)           pending=$((pending + 1)) ;;
+            esac
+        done
+        if [ "$pending" -eq 0 ]; then
+            [ "$checked" -gt 0 ] && verdict=healthy || verdict=none
+            break
+        fi
+        if [ "$waited" -ge "$WAIT" ]; then verdict=timeout; break; fi
         sleep 2; waited=$((waited + 2))
     done
 
-    if [ "$health" = healthy ]; then
-        ok "дверь отвечает: $DOOR здоров на ресурсе $NAME"
-    elif [ "$health" != none ]; then
-        printf '\n--- последние строки журнала двери ---\n' >&2
-        docker --context "$CTX" compose -f "$COMPOSE_FILE" logs --tail=40 >&2 || true
-        refuse door-silent \
-            "дверь на $NAME запущена, но за ${WAIT}с здоровой не стала (состояние: ${health:-неизвестно})" \
-            "журнал выше — если дверь падает, мир называет причину сам, первой же строкой" \
-            "тома с прошлого мира могли остаться от другой редакции: ./deploy/remote.sh drop $NAME --with-state, затем add" \
-            "медленный ресурс — дай больше времени: WORLD_REMOTE_WAIT=180 ./deploy/remote.sh add $NAME"
-    fi
+    case "$verdict" in
+        healthy) ok "вещь отвечает: все проверяемые контейнеры «$THING» здоровы на $NAME" ;;
+        # Ни одного HEALTHCHECK — сказать это вслух, а не выдать «встало» за «отвечает».
+        # Приблизительная запись хуже отсутствующей: она выглядит знанием (`WORLD2` 4.2).
+        none)    warn "ни у одного образа рецепта нет HEALTHCHECK — «отвечает ли вещь» этой командой не проверить" ;;
+        *)
+            printf '\n--- последние строки журнала ---\n' >&2
+            docker --context "$CTX" compose -f "$RECIPE" logs --tail=40 >&2 || true
+            refuse thing-silent \
+                "вещь «$THING» на $NAME запущена, но за ${WAIT}с здоровой не стала" \
+                "журнал выше — если вещь падает, она называет причину сама, первой же строкой" \
+                "состояние с прошлого раза могло остаться от другой редакции: ./deploy/remote.sh drop $NAME --recipe $RECIPE --with-state, затем add" \
+                "медленный ресурс — дай больше времени: WORLD_REMOTE_WAIT=180 ./deploy/remote.sh add $NAME --recipe $RECIPE" ;;
+    esac
 
     # ---------------------------------------------------------- 8. виден ли порт отсюда
     # Стук с ЭТОЙ машины — не проверка двери, а проверка ДОСТУПА снаружи, и это разные
     # вещи. Не дошло — не отказ: дверь здорова у себя, а порт может быть закрыт фаерволом
     # или NAT-ом, и чинит это хозяин ресурса.
-    if [ "$health" = healthy ]; then
+    # Какой порт спрашивать — говорит ФАКТ публикации, а не наше значение: что вещь кладёт
+    # наружу, знает её рецепт. И спрашиваем мы ВИДИМОСТЬ порта, а не здоровье: здоровье уже
+    # спрошено у демона, а какой путь у этой вещи «живой», механике знать неоткуда — потому
+    # годится ЛЮБОЙ ответ HTTP, хоть 404, хоть 410.
+    local ports=""; ports="$(published_of "$(printf '%s\n' "$ids" | head -n1)")"
+    local hport; hport="$(host_port "$ports")"
+    if [ "$verdict" = healthy ] && [ -n "$hport" ]; then
         local knocked=
         if command -v curl >/dev/null 2>&1; then
-            curl -fsS -m 3 -o /dev/null "http://$HOST:$PORT/healthz" && knocked=1 || true
+            local code
+            code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "http://$HOST:$hport/" 2>/dev/null || true)"
+            case "$code" in ""|000) ;; *) knocked=1 ;; esac
         elif command -v wget >/dev/null 2>&1; then
-            wget -q -T 3 -O /dev/null "http://$HOST:$PORT/healthz" && knocked=1 || true
+            wget -q -S --spider -T 3 -O /dev/null "http://$HOST:$hport/" 2>&1 | grep -q 'HTTP/' && knocked=1 || true
         else
-            warn "ни curl, ни wget здесь нет — снаружи дверь не проверить (изнутри она здорова)"
+            warn "ни curl, ни wget здесь нет — снаружи порт не проверить (изнутри вещь здорова)"
             knocked=skip
         fi
         if [ "$knocked" = 1 ]; then
-            ok "порт виден и с этой машины: http://$HOST:$PORT/healthz отвечает"
+            ok "порт виден и с этой машины: http://$HOST:$hport/ отвечает"
         elif [ -z "$knocked" ]; then
-            warn "с этой машины http://$HOST:$PORT/healthz не отвечает, хотя дверь здорова"
-            detail "это не поломка двери: снаружи порт может быть закрыт фаерволом или NAT-ом"
-            detail "открыть его — дело хозяина ресурса; изнутри ресурса дверь работает"
+            warn "с этой машины http://$HOST:$hport/ не отвечает, хотя вещь здорова"
+            detail "это не поломка вещи: снаружи порт может быть закрыт фаерволом или NAT-ом"
+            detail "открыть его — дело хозяина ресурса; изнутри ресурса вещь работает"
         fi
     fi
 
     cat >&2 <<GOTOVO
 
-$(printf '\033[1;32m✓ дверь стоит на ресурсе %s\033[0m' "$NAME")
+$(printf '\033[1;32m✓ вещь «%s» стоит на ресурсе %s\033[0m' "$THING" "$NAME")
 
-  проба жизни       http://$HOST:$PORT/healthz     (если порт открыт хозяином ресурса)
-  кто в поле        http://$HOST:$PORT/api/locations
-  лица тут нет      корень отвечает 410 face-elsewhere: дверь не показывает, пульт при
-                    контроллере
-  что там сейчас    ./deploy/remote.sh status $NAME
-  журнал            docker --context $CTX compose -f deploy/compose.yaml logs -f
-  снять             ./deploy/remote.sh drop $NAME
+  рецепт            $RECIPE
+  публикация        ${ports:-наружу ничего не опубликовано}
+  что там сейчас    ./deploy/remote.sh status $NAME --recipe $RECIPE
+  журнал            docker --context $CTX compose -f $RECIPE logs -f
+  снять             ./deploy/remote.sh drop $NAME --recipe $RECIPE
 
-  на ресурсе появились: контейнер $DOOR · сеть $NET · тома world-field и world-stand ·
-  образ $image. Ничего сверх этого туда не клали — ни файлов, ни пакетов.
+  на ресурсе появилось то, что назвал рецепт: контейнеры «$THING», её тома, сеть $NET и
+  образ $image. Ничего сверх этого туда не клали — ни файлов, ни пакетов, ни самого рецепта.
 GOTOVO
 }
 
@@ -528,6 +656,10 @@ GOTOVO
 cmd_drop() {
     need_name drop
     have_local_tools
+    # Снимаем ТО ЖЕ, что ставили, — а чем ставили, помнит человек и называет рецептом. Своего
+    # реестра вещей зона не заводит намеренно: второй список того же самого разъехался бы с
+    # первым, и `drop` начал бы снимать не то, о чём думает человек.
+    read_recipe
 
     ctx_exists || refuse no-such-resource \
         "ресурса «$NAME» с этой машины не заводили — контекста $CTX нет" \
@@ -537,32 +669,36 @@ cmd_drop() {
     ADDR="$(ctx_endpoint)"; ADDR="${ADDR#ssh://}"
     parse_addr
 
-    step "снимаю дверь с ресурса $NAME ($ADDR)"
+    step "снимаю «$THING» с ресурса $NAME ($ADDR) — рецепт $RECIPE"
 
     # Ресурс мог умереть, уехать или сменить ключ — а контекст на этой машине остался. Снять
     # его мы обязаны в любом случае: иначе `list` будет врать про ресурсы, которых нет.
     # Поэтому сначала пробуем снять на той стороне, а свой контекст убираем всегда.
-    local reachable=1
+    local reachable=1 vols=""
     docker --context "$CTX" version >/dev/null 2>&1 || reachable=
 
     if [ -n "$reachable" ]; then
+        # Тома спрашиваем ДО снятия и у самого докера: какие они у этой вещи, знает её
+        # рецепт, и назвать их мы вправе только по факту — своего списка у нас нет.
+        vols="$(thing_volumes)"
+
         local out rc=0
-        local -a args=(compose -f "$COMPOSE_FILE" down --remove-orphans)
+        local -a args=(compose -f "$RECIPE" down --remove-orphans)
         [ -n "$WITH_STATE" ] && args+=(-v)
         set +e
-        out=$(WORLD_PORT="$PORT" docker --context "$CTX" "${args[@]}" 2>&1); rc=$?
+        out=$(docker --context "$CTX" "${args[@]}" 2>&1); rc=$?
         set -e
         if [ "$rc" -ne 0 ]; then
             printf '%s\n' "$out" >&2
             refuse down-failed \
-                "контейнер на ресурсе $NAME не снялся" \
+                "вещь «$THING» на ресурсе $NAME не снялась" \
                 "ответ докера напечатан выше" \
-                "снять руками: docker --context $CTX compose -f deploy/compose.yaml down" \
+                "снять руками: docker --context $CTX compose -f $RECIPE down" \
                 "контекст на этой машине НЕ снят — повтори команду, когда ресурс ответит" \
                 "ресурса больше нет вовсе — снеси только контекст: docker context rm $CTX"
         fi
-        ok "контейнер снят"
-        [ -n "$WITH_STATE" ] && ok "тома сняты: реестр поля и журнал стенда стёрты"
+        ok "контейнеры сняты"
+        [ -n "$WITH_STATE" ] && ok "тома сняты: состояние «$THING» стёрто${vols:+ ($vols)}"
 
         # Сеть снимаем, если в ней больше никого нет. Занята — оставляем и говорим об этом:
         # снести общую сеть, в которой стоят соседи, значило бы сломать чужое ради своей
@@ -578,7 +714,7 @@ cmd_drop() {
         fi
 
         if [ -n "$WITH_IMAGE" ]; then
-            local image; image="$(image_name)"
+            local image="$IMAGE"
             if docker --context "$CTX" image rm "$image" >/dev/null 2>&1; then
                 ok "образ $image снят с ресурса"
             else
@@ -599,26 +735,27 @@ cmd_drop() {
 
     say ""
     if [ -n "$reachable" ]; then
-        printf '\033[1;32m✓ дверь снята с ресурса %s\033[0m\n' "$NAME" >&2
+        printf '\033[1;32m✓ вещь «%s» снята с ресурса %s\033[0m\n' "$THING" "$NAME" >&2
         say ""
         say "  что осталось на той машине:"
         if [ -n "$WITH_STATE" ]; then
-            say "    состояние поля — стёрто (--with-state)"
+            say "    состояние вещи — стёрто (--with-state)"
         else
-            say "    тома world-field и world-stand — состояние поля, оно переживает снятие"
-            say "      стереть: ./deploy/remote.sh add $NAME --addr $ADDR, затем drop $NAME --with-state"
-            say "      состояние переживает снятие НАРОЧНО: поднятая заново дверь находит своё поле,"
-            say "      а не пустой реестр. Молча стирать его снятие не вправе"
+            say "    тома вещи — её состояние, оно переживает снятие${vols:+: $vols}"
+            say "      стереть: ./deploy/remote.sh add $NAME --addr $ADDR --recipe $RECIPE,"
+            say "               затем drop $NAME --recipe $RECIPE --with-state"
+            say "      состояние переживает снятие НАРОЧНО: поднятая заново вещь находит своё,"
+            say "      а не пустоту. Молча стирать его снятие не вправе"
         fi
         if [ -n "$WITH_IMAGE" ]; then
-            say "    образ мира — снят (--with-image)"
+            say "    образ $IMAGE — снят (--with-image)"
         else
-            say "    образ мира — остался: он тяжёлый, и второй подъём с ним мгновенный"
+            say "    образ $IMAGE — остался: он тяжёлый, и второй подъём с ним мгновенный"
         fi
         say "    больше НИЧЕГО: ни файлов, ни пакетов, ни клона репозитория — их туда и не клали"
     else
         printf '\033[1;33m! ресурс %s убран только с этой машины\033[0m\n' "$NAME" >&2
-        say "  на самой машине контейнер, тома и образ могли остаться — снять их можно, когда она ответит"
+        say "  на самой машине контейнеры, тома и образ могли остаться — снять их можно, когда она ответит"
     fi
 }
 
@@ -657,15 +794,18 @@ cmd_status() {
 
     ADDR="$(ctx_endpoint)"; ADDR="${ADDR#ssh://}"
     parse_addr
-    local image; image="$(image_name)"
+    read_recipe
+    local image="$IMAGE"
 
     say ""
     say "ресурс     : $NAME"
     say "адрес      : $ADDR"
     say "контекст   : $CTX"
 
+    say "рецепт     : $RECIPE (вещь «$THING»)"
+
     # Каждая строка ниже — ОТДЕЛЬНЫЙ вопрос отдельному демону, и ни одна не выводится из
-    # другой. «Докер отвечает» не значит «дверь стоит», «контейнер есть» не значит «дверь
+    # другой. «Докер отвечает» не значит «вещь стоит», «контейнер есть» не значит «вещь
     # отвечает»: состояние, выведенное вместо измеренного, врёт ровно тогда, когда на него
     # смотрят (`WORLD2` 4.2).
     if ! docker --context "$CTX" version >/dev/null 2>&1; then
@@ -677,20 +817,39 @@ cmd_status() {
     fi
     say "докер там  : отвечает"
 
+    # ЧТО ВООБЩЕ СТОИТ НА РЕСУРСЕ — вопрос к ресурсу, а не к нашему рецепту. Ресурс это
+    # машина, до которой дотянулись; какие вещи на ней подняты — отдельное знание, и оно
+    # читается у чужого демона по метке проекта, которую компоуз ставит сам. Своего реестра
+    # вещей зона по-прежнему не заводит.
+    local things
+    things="$(docker --context "$CTX" ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+              | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)"
+    say "вещи там   : ${things:-ни одной}"
+
     if docker --context "$CTX" image inspect "$image" >/dev/null 2>&1; then
         say "образ      : $image есть"
     else
-        say "образ      : $image НЕТ — дверь поднять нечем"
+        say "образ      : $image НЕТ — «$THING» поднять нечем"
     fi
 
-    local state health published
-    state="$(docker --context "$CTX" ps -a --filter "name=^$DOOR$" --format '{{.Status}}' 2>/dev/null | head -n1 || true)"
-    say "контейнер  : ${state:-нет}"
-    if [ -n "$state" ]; then
-        health="$(docker --context "$CTX" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}HEALTHCHECK-а нет{{end}}' "$DOOR" 2>/dev/null || true)"
-        say "дверь      : ${health:-неизвестно}"
-        published="$(docker --context "$CTX" port "$DOOR" 2>/dev/null | tr '\n' ' ' || true)"
-        say "порт       : ${published:-публикации не видно}"
+    # Дальше — про ВЕЩЬ ЭТОГО РЕЦЕПТА, и контейнеры её называет компоуз, а не мы.
+    local ids id name state health published
+    ids="$(thing_ids)"
+    if [ -z "$ids" ]; then
+        say "контейнеры : нет"
+    else
+        for id in $ids; do
+            name="$(docker --context "$CTX" inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||' || true)"
+            state="$(docker --context "$CTX" ps -a --filter "id=$id" --format '{{.Status}}' 2>/dev/null | head -n1 || true)"
+            health="$(health_of "$id")"
+            published="$(published_of "$id" | tr '\n' ' ' | sed 's/ *$//')"
+            say "контейнер  : ${name:-$id} — ${state:-состояние неизвестно}"
+            case "$health" in
+                none|"") say "  здоровье : HEALTHCHECK-а нет — «отвечает ли» этим не проверить" ;;
+                *)       say "  здоровье : $health" ;;
+            esac
+            say "  порт     : ${published:-публикации не видно}"
+        done
     fi
 
     if docker --context "$CTX" network inspect "$NET" >/dev/null 2>&1; then
@@ -699,13 +858,12 @@ cmd_status() {
         say "сеть       : $NET нет"
     fi
 
-    local vols
-    vols="$(docker --context "$CTX" volume ls --format '{{.Name}}' 2>/dev/null | grep -E '^world-(field|stand)$' | tr '\n' ' ' || true)"
+    local vols; vols="$(thing_volumes)"
     say "состояние  : ${vols:-томов нет}"
 
     say ""
-    say "  поднять заново : ./deploy/remote.sh add $NAME"
-    say "  снять          : ./deploy/remote.sh drop $NAME"
+    say "  поднять заново : ./deploy/remote.sh add $NAME --recipe $RECIPE"
+    say "  снять          : ./deploy/remote.sh drop $NAME --recipe $RECIPE"
 }
 
 # ------------------------------------------------------------------ разбор ключей
@@ -727,6 +885,11 @@ while [ $# -gt 0 ]; do
         --addr)  shift; [ $# -gt 0 ] || { printf 'у --addr нет значения: --addr user@10.8.0.5\n' >&2; exit 2; }
                  ADDR="$1" ;;
         --addr=*)       ADDR="${1#--addr=}" ;;
+        # Рецепт — не украшение команды, а то, ЧТО она поднимает: без значения ключ
+        # молчаливо вернул бы дверь, и человек поднял бы не ту вещь.
+        --recipe) shift; [ $# -gt 0 ] || { printf 'у --recipe нет значения: --recipe deploy/compose.yaml\n' >&2; exit 2; }
+                 RECIPE="$1" ;;
+        --recipe=*)     RECIPE="${1#--recipe=}" ;;
         --resend-image) RESEND=1 ;;
         --pull)         PULL=1 ;;
         --with-state)   WITH_STATE=1 ;;

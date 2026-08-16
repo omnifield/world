@@ -1,23 +1,35 @@
-// Пакет resource — источники ресурса: где у юзера стоят двери мира.
+// Пакет resource — источники ресурса: машины, до которых юзер дотянулся.
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-// │ ЭТОТ ПАКЕТ НЕ ПОДНИМАЕТ ДВЕРЬ. Подъём двери на названном ресурсе уже написан и лежит │
+// │ ЭТОТ ПАКЕТ НЕ ПОДНИМАЕТ ВЕЩЬ. Подъём вещи на названном ресурсе уже написан и лежит   │
 // │ в `deploy/remote.sh` (контекст докера по ssh, `WORLD2-99`). Контроллер его ЗОВЁТ.    │
 // │ Второй подъём того же самого разъехался бы с первым на первой правке соседа — и      │
 // │ человек получил бы две двери, которые ставятся по-разному.                            │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ РЕСУРС — ЭТО МАШИНА, А НЕ «МАШИНА С ДВЕРЬЮ» (`WORLD2` 3.7, `WORLD2-131`).            │
+// │                                                                                      │
+// │ Что на ней стоит — отдельный вопрос и отдельный ответ: СПИСОК поднятых вещей, а не    │
+// │ одно поле про дверь. Пока здесь жило `Door string`, зона знала ровно одну вещь мира,  │
+// │ и вторая потребовала бы правки кода — значит вещь была зашита, а не описана.          │
+// │                                                                                      │
+// │ Имён контейнеров, образов и портов у зоны поэтому нет вовсе: они принадлежат рецепту, │
+// │ и знать их контроллеру неоткуда. Чем поднимать — говорит рецепт (`internal/recipe`).  │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
 // Своего реестра ресурсов зона тоже НЕ заводит. Список — это контексты докера, ровно те
 // же, что читает `deploy/remote.sh list`: один источник истины, а не два списка одного и
 // того же (довод целиком — в шапке `deploy/remote.sh`). Мы читаем ту же истину, а не
-// копируем её к себе.
+// копируем её к себе. Список ВЕЩЕЙ на ресурсе читается там же, где его читает сосед, — по
+// метке проекта, которую компоуз ставит на всё, что заводит сам.
 //
 // Что здесь ЕСТЬ своего и чего нет у соседа:
 //
 //   - креды. `docker context` поля для ключа не имеет вовсе, а юзер называет ключ, когда
 //     добавляет ресурс. Контроллер кладёт ключ в свою связку и приписывает его к машине в
 //     `~/.ssh/config` — то самое место, откуда ssh (а значит и докер) его берёт;
-//   - «жив ли» одной строкой на весь список: пульту нужен список с состоянием, а не
+//   - состояние одной строкой на весь список: пульту нужен список с состоянием, а не
 //     четырнадцать строк вывода `status` на каждый ресурс;
 //   - ресурс «здесь» — тот, на котором стоит сам контроллер. У соседа его нет и быть не
 //     может: он ведёт список ЧУЖИХ ресурсов, а свой контроллер знает про себя сам.
@@ -34,22 +46,29 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/omnifield/world/control/internal/recipe"
 	"github.com/omnifield/world/control/internal/refusal"
 	"github.com/omnifield/world/control/internal/run"
 )
 
-// Значения, которые ПРИНАДЛЕЖАТ зоне `deploy` и здесь только повторены. Повтор — это шов,
-// и он стережётся пробой (`probe-control.sh` читает `deploy/remote.sh` и краснеет, если
-// там стало другое). Молчаливый повтор чужой константы — то, что разъезжается тише всего.
 const (
 	// ContextPrefix — приставка имени контекста докера (`PREFIX` в deploy/remote.sh).
+	// Значение ПРИНАДЛЕЖИТ зоне `deploy` и здесь повторено: по нему мы узнаём свои
+	// контексты среди чужих. Повтор — это шов, и он стережётся пробой (`probe-control.sh`
+	// читает `deploy/remote.sh` и краснеет, если там стало другое). Молчаливый повтор
+	// чужой константы — то, что разъезжается тише всего.
+	//
+	// Больше повторов у зоны нет: имя контейнера, образ и порт принадлежат РЕЦЕПТУ, а не
+	// соседу и не нам (`WORLD2-131`).
 	ContextPrefix = "world-"
-	// DoorContainer — имя контейнера двери (`DOOR` в deploy/remote.sh, оно же
-	// `container_name` в deploy/compose.yaml).
-	DoorContainer = "world-door"
 	// HereName — имя ресурса, на котором стоит сам контроллер. Занятое имя: завести
 	// второй «здесь» нельзя, иначе список начнёт врать про то, где мы стоим.
 	HereName = "here"
+	// projectLabel — метка компоуза, по которой видно, ЧЬЁ это хозяйство. Ставит её сам
+	// компоуз на всё, что заводит (контейнеры, тома, сети), и читает её же сосед
+	// (`deploy/remote.sh`, `thing_volumes` и `status`). Это правило докера, а не наше
+	// знание о вещах: имя вещи здесь читается, а не перечисляется.
+	projectLabel = "com.docker.compose.project"
 )
 
 // nameRe — имя ресурса. Правило то же, что у соседа (`bad-name` в deploy/remote.sh), и
@@ -57,36 +76,56 @@ const (
 // ключа в нашей связке: имя с косой чертой увело бы запись из связки в чужой каталог.
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
 
-// Resource — источник ресурса глазами юзера. Ни памяти, ни ядер здесь нет: ресурс в
-// цифрах даёт отдельный инструмент осмотра, и он сознательно отложен (`WORLD2` 2.5).
+// Thing — вещь, поднятая на ресурсе. Имя — имя проекта компоуза: им помечено всё, что
+// вещь на той машине завела, и его же называет рецепт. Своего перечня вещей у зоны нет.
+type Thing struct {
+	Name string `json:"name"`
+	// State — что видно про вещь словами: «здорова», «поднимается», «нездорова»,
+	// «запущена не вся», «запущена, здоровья не спросить». Измеренное, а не выведенное:
+	// состояние, выведенное вместо измеренного, врёт ровно тогда, когда на него смотрят
+	// (`WORLD2` 4.2).
+	State string `json:"state"`
+	// Alive — вещь ОТВЕЧАЕТ, а не «запущена». Разные вещи: запуск подтверждает докер,
+	// ответ — HEALTHCHECK изнутри контейнера. У вещи без HEALTHCHECK-а ответ не спросить
+	// вовсе, и тогда здесь `false` — не «мертва», а «не подтверждено», и это сказано
+	// словами в `State`.
+	Alive bool `json:"alive"`
+}
+
+// Resource — источник ресурса глазами юзера: машина, до которой дотянулись. Ни памяти, ни
+// ядер здесь нет: ресурс в цифрах даёт отдельный инструмент осмотра, и он сознательно
+// отложен (`WORLD2` 2.5).
 type Resource struct {
 	Name string `json:"name"`
 	Addr string `json:"addr"`
 	// Here — на этом ресурсе стоит контроллер.
 	Here bool `json:"here"`
-	// Alive — отвечает ли ДВЕРЬ. Источник считается по двери: вход и есть то, чем ресурс
-	// включается в мир (`WORLD2` 3.5). «Докер отвечает» — это не «ресурс в мире».
-	Alive bool `json:"alive"`
-	// Door — что именно видно про дверь, словами: «здорова», «поднимается», «нет»,
-	// «ресурс молчит». Выведенное состояние врёт ровно тогда, когда на него смотрят,
-	// поэтому здесь то, что измерено, а не то, что следует из другого поля.
-	Door string `json:"door"`
+	// Reach — отвечает ли САМ ресурс: «отвечает» либо «молчит». Вопрос про машину, а не
+	// про вещь на ней, и ответ на него не выводится из другого поля.
+	Reach string `json:"reach"`
+	// Things — что на ресурсе поднято. `null` означает «не спросили» (ресурс молчит), а
+	// пустой список — «спросили, и там ничего нет». Разные ответы: пустой список вместо
+	// «не спросили» читался бы как знание, которого у нас нет (`WORLD2` 4.2).
+	Things []Thing `json:"things"`
 }
 
 // Manager — работа с источниками ресурса.
 type Manager struct {
 	Runner run.Runner
-	// RemoteSh — путь к готовому подъёму двери. Значение, а не константа: в образе
+	// RemoteSh — путь к готовому подъёму вещи. Значение, а не константа: в образе
 	// контроллера он лежит по своему пути, в девбоксе — по своему, а проба подменяет его
 	// заглушкой, чтобы проверить ПОВЕДЕНИЕ там, где докера нет.
 	RemoteSh string
+	// Recipes — где контроллер берёт рецепты. Чем поднимать вещь, знает рецепт, а какие
+	// рецепты есть — каталог; в коде их перечня нет (`internal/recipe`).
+	Recipes *recipe.Catalog
 	// Docker — имя докер-клиента. Подменяется пробой по той же причине.
 	Docker string
 	// KeysDir — связка контроллера (`~/.ssh` внутри его образа): ключи ресурсов и
 	// `config`, из которого их берёт ssh.
 	KeysDir string
 	// Port — хост-порт двери на том ресурсе; едет в `deploy/remote.sh` тем же именем,
-	// каким тот его ждёт.
+	// каким тот его ждёт. Рецепт, который его не читает, о нём и не узнает.
 	Port int
 }
 
@@ -115,7 +154,7 @@ func (m *Manager) List(ctx context.Context) ([]Resource, *refusal.Refusal) {
 		}
 		short := strings.TrimPrefix(name, ContextPrefix)
 		r := Resource{Name: short, Addr: strings.TrimPrefix(endpoint, "ssh://")}
-		r.Door, r.Alive = m.door(ctx, name)
+		r.Reach, r.Things = m.things(ctx, name)
 		out = append(out, r)
 	}
 	return out, nil
@@ -126,49 +165,135 @@ func (m *Manager) List(ctx context.Context) ([]Resource, *refusal.Refusal) {
 // пульт и станет ложью для того, кто смотрит снаружи.
 func (m *Manager) here(ctx context.Context) Resource {
 	r := Resource{Name: HereName, Here: true}
-	r.Door, r.Alive = m.door(ctx, "")
+	r.Reach, r.Things = m.things(ctx, "")
 	return r
 }
 
-// door — измеряем дверь на ресурсе. Пустой контекст означает «здесь».
-func (m *Manager) door(ctx context.Context, dockerContext string) (string, bool) {
-	args := []string{}
+// things — что стоит на ресурсе. Пустой контекст означает «здесь».
+//
+// Спрашиваем ДЕМОН той машины, а не свой список: какие вещи там подняты — знание той
+// стороны, и у нас его взять неоткуда. Вопросов два, и они разные: «отвечает ли ресурс» и
+// «что на нём стоит». Вывести второй из первого нельзя — молчащий ресурс это не пустая
+// машина (`WORLD2` 4.2).
+func (m *Manager) things(ctx context.Context, dockerContext string) (string, []Thing) {
+	res, err := m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: m.args(dockerContext, "ps", "-a", "--format", "{{.ID}}")})
+	if err != nil || res.Code != 0 {
+		return "молчит", nil
+	}
+	ids := strings.Fields(res.Out)
+	if len(ids) == 0 {
+		return "отвечает", []Thing{}
+	}
+
+	// Один вопрос на все контейнеры сразу: `inspect` принимает их списком. Спрашиваем
+	// ПОЛЯ, а не разбираем строку статуса («Up 2 minutes (healthy)»): разбор чужой
+	// формулировки разъехался бы с ней на первой правке докера.
+	args := m.args(dockerContext, "inspect", "--format",
+		"{{index .Config.Labels \""+projectLabel+"\"}}\t"+
+			"{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t{{.State.Status}}")
+	res, err = m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: append(args, ids...)})
+	if err != nil || res.Code != 0 {
+		// Контейнеры есть, а спросить их не вышло. Врать «ничего не стоит» нельзя, и
+		// назвать вещи нечем — значит ресурс для нас молчит.
+		return "молчит", nil
+	}
+
+	order := []string{}
+	seen := map[string]*tally{}
+	for _, line := range strings.Split(res.Out, "\n") {
+		// Обрезаем СПРАВА, а не с обеих сторон: у контейнера без метки поле проекта пусто,
+		// и снятая слева табуляция превратила бы его состояние в имя вещи.
+		project, rest, ok := strings.Cut(strings.TrimRight(line, " \t\r"), "\t")
+		if !ok || project == "" {
+			// Контейнер, поднятый не компоузом, вещью мира не является: у него нет
+			// рецепта, и назвать его нам нечем. Чужое хозяйство хозяина машины мы не
+			// перечисляем — оно не наше и не про нас.
+			continue
+		}
+		health, state, _ := strings.Cut(rest, "\t")
+		t, known := seen[project]
+		if !known {
+			t = &tally{}
+			seen[project] = t
+			order = append(order, project)
+		}
+		t.add(health, state)
+	}
+
+	out := make([]Thing, 0, len(order))
+	for _, name := range order {
+		state, alive := seen[name].verdict()
+		out = append(out, Thing{Name: name, State: state, Alive: alive})
+	}
+	return "отвечает", out
+}
+
+// args — общее начало команды докера. Пустой контекст означает «здесь»: у своей машины
+// контекст не спрашивается вовсе.
+func (m *Manager) args(dockerContext string, rest ...string) []string {
+	var args []string
 	if dockerContext != "" {
 		args = append(args, "--context", dockerContext)
 	}
-	args = append(args, "inspect", "--format",
-		"{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", DoorContainer)
+	return append(args, rest...)
+}
 
-	res, err := m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: args})
-	if err != nil {
-		return "ресурс молчит", false
+// tally — контейнеры одной вещи, посчитанные по состояниям. Вещь не бывает целой по
+// одному контейнеру: сколько их у неё и какие — знает рецепт, и судить о ней по первому
+// попавшемуся значило бы выдать часть за целое.
+type tally struct{ stopped, sick, rising, healthy, unchecked int }
+
+func (t *tally) add(health, state string) {
+	if strings.TrimSpace(state) != "running" {
+		t.stopped++
+		return
 	}
-	if res.Code != 0 {
-		// Демон мог не ответить вовсе, а мог ответить «такого контейнера нет». Разные
-		// вещи: первое чинит хозяин ресурса, второе — подъём двери.
-		if strings.Contains(res.Err, "No such object") || strings.Contains(res.Err, "no such container") {
-			return "двери нет", false
-		}
-		return "ресурс молчит", false
-	}
-	switch state := strings.TrimSpace(res.Out); state {
-	case "healthy", "running":
-		return "здорова", true
+	switch strings.TrimSpace(health) {
+	case "healthy":
+		t.healthy++
 	case "starting":
-		return "поднимается", false
-	case "":
-		return "неизвестно", false
+		t.rising++
+	case "none", "":
+		// У образа нет HEALTHCHECK-а. Это НЕ «здоров»: ждать нечего и спрашивать нечего —
+		// приблизительная запись хуже отсутствующей. То же правило и та же развилка, что
+		// у соседа в `deploy/remote.sh`.
+		t.unchecked++
 	default:
-		return state, false
+		t.sick++
 	}
 }
 
-// Add — добавить ресурс: креды в связку, дальше готовый подъём двери.
-func (m *Manager) Add(ctx context.Context, name, addr, creds string) (Resource, *refusal.Refusal) {
+// verdict — вещь целиком: словами и «отвечает ли». Порядок ступеней — от того, что чинят
+// первым: не запущено · нездорово · поднимается · отвечает · отвечать нечему.
+func (t *tally) verdict() (string, bool) {
+	switch {
+	case t.stopped > 0:
+		return "запущена не вся", false
+	case t.sick > 0:
+		return "нездорова", false
+	case t.rising > 0:
+		return "поднимается", false
+	case t.healthy > 0:
+		return "здорова", true
+	default:
+		return "запущена, здоровья не спросить", false
+	}
+}
+
+// Add — добавить ресурс: креды в связку, дальше готовый подъём НАЗВАННОЙ РЕЦЕПТОМ вещи.
+// Рецепт не назван — берётся дверь: прежний путь («поставь дверь на ресурс») остаётся
+// запросом без единого лишнего поля.
+func (m *Manager) Add(ctx context.Context, name, addr, creds, recipeName string) (Resource, *refusal.Refusal) {
 	if ref := validName(name); ref != nil {
 		return Resource{}, ref
 	}
 	host, ref := checkAddr(addr)
+	if ref != nil {
+		return Resource{}, ref
+	}
+	// Рецепт находим ДО того, как тронули связку и ресурс: неизвестное имя обязано
+	// отказать, не оставив за собой ни ключа, ни контекста (`WORLD2` 2.3).
+	recipePath, ref := m.recipe(recipeName)
 	if ref != nil {
 		return Resource{}, ref
 	}
@@ -183,7 +308,10 @@ func (m *Manager) Add(ctx context.Context, name, addr, creds string) (Resource, 
 		installed = true
 	}
 
-	args := []string{"add", name, "--addr", addr}
+	// Рецепт называется ВСЕГДА, даже когда он тот же самый, что у соседа по умолчанию.
+	// Умолчание принадлежит ЕГО команде, а не нашему вызову: положись мы на него, смена
+	// умолчания у соседа молча сменила бы вещь, которую поднимает контроллер.
+	args := []string{"add", name, "--addr", addr, "--recipe", recipePath}
 	res, err := m.Runner.Run(ctx, run.Command{
 		Name: m.RemoteSh,
 		Args: args,
@@ -196,12 +324,23 @@ func (m *Manager) Add(ctx context.Context, name, addr, creds string) (Resource, 
 		if installed {
 			_ = m.removeKey(name)
 		}
-		return Resource{}, m.toolFailure(err, res, "поставить дверь на "+addr+" не вышло")
+		return Resource{}, m.toolFailure(err, res, "поставить вещь по рецепту "+recipePath+" на "+addr+" не вышло")
 	}
 
 	out := Resource{Name: name, Addr: addr}
-	out.Door, out.Alive = m.door(ctx, ContextPrefix+name)
+	out.Reach, out.Things = m.things(ctx, ContextPrefix+name)
 	return out, nil
+}
+
+// recipe — путь рецепта по имени, названному человеком. Каталога рецептов может не быть
+// вовсе (зона его не заводит — это ландшафт машины), и тогда остаётся дверь.
+func (m *Manager) recipe(name string) (string, *refusal.Refusal) {
+	if m.Recipes == nil {
+		return "", refusal.New(http.StatusInternalServerError, "no-recipes",
+			"контроллеру не назвали, где брать рецепты, — поднимать нечем",
+			"это дефект подъёма контроллера: см. control/README.md, CONTROL_RECIPES")
+	}
+	return m.Recipes.Find(name)
 }
 
 // Dropped — что осталось на той машине после снятия. Ответ обязан это называть: «снял» без
@@ -215,18 +354,25 @@ type Dropped struct {
 
 // Drop — снять ресурс. Состояние поля и образ по умолчанию остаются: стереть их молча
 // значило бы потерять то, что юзер клал не сюда и не сейчас.
-func (m *Manager) Drop(ctx context.Context, name string, withState, withImage bool) (Dropped, *refusal.Refusal) {
+//
+// Рецепт называется и здесь: снимаем ТО ЖЕ, что ставили, а своего реестра вещей зона не
+// заводит — «что мы там поднимали», помнит человек (тот же довод, что у соседа).
+func (m *Manager) Drop(ctx context.Context, name string, withState, withImage bool, recipeName string) (Dropped, *refusal.Refusal) {
 	if ref := validName(name); ref != nil {
 		return Dropped{}, ref
 	}
 	if name == HereName {
 		return Dropped{}, refusal.New(http.StatusConflict, "drop-here",
 			"«здесь» — это ресурс, на котором стоит сам контроллер; снять его контроллером нельзя",
-			"дверь на этом ресурсе снимается своим подъёмом: ./deploy/up.sh down",
+			"вещи на этом ресурсе снимаются своим подъёмом: ./deploy/up.sh down",
 			"сам контроллер снимается руками того, кто его ставил: ./control/up.sh down")
 	}
+	recipePath, ref := m.recipe(recipeName)
+	if ref != nil {
+		return Dropped{}, ref
+	}
 
-	args := []string{"drop", name}
+	args := []string{"drop", name, "--recipe", recipePath}
 	if withState {
 		args = append(args, "--with-state")
 	}
@@ -244,26 +390,43 @@ func (m *Manager) Drop(ctx context.Context, name string, withState, withImage bo
 		return Dropped{}, ref
 	}
 
+	// Перечисляем то, что снято, БЕЗ имён: имена контейнеров, томов и образа принадлежат
+	// рецепту, и знать их контроллеру неоткуда. Названное наугад имя выглядело бы знанием
+	// и разъехалось бы с рецептом молча (`WORLD2` 4.2).
 	out := Dropped{
 		Name:    name,
-		Removed: []string{"дверь (контейнер)", "сеть мира, если в ней больше никого", "контекст докера", "ключ ресурса из связки контроллера"},
+		Removed: []string{"контейнеры рецепта", "сеть мира, если в ней больше никого", "контекст докера", "ключ ресурса из связки контроллера"},
+	}
+	query := "?recipe=" + recipeName
+	if recipeName == "" {
+		query = ""
 	}
 	if withState {
-		out.Removed = append(out.Removed, "состояние поля (тома)")
+		out.Removed = append(out.Removed, "тома рецепта — состояние вещи стёрто")
 	} else {
-		out.Left = append(out.Left, "состояние поля (тома world-field, world-stand)")
-		out.Ways = append(out.Ways, "снять и его: DELETE /api/resources/"+name+"?with-state=1")
+		out.Left = append(out.Left, "тома рецепта — состояние вещи, оно переживает снятие")
+		out.Ways = append(out.Ways, "снять и его: DELETE /api/resources/"+name+with(query, "with-state=1"))
 	}
 	if withImage {
-		out.Removed = append(out.Removed, "образ мира")
+		out.Removed = append(out.Removed, "образ, названный рецептом")
 	} else {
-		out.Left = append(out.Left, "образ мира")
-		out.Ways = append(out.Ways, "снять и его: DELETE /api/resources/"+name+"?with-image=1")
+		out.Left = append(out.Left, "образ, названный рецептом")
+		out.Ways = append(out.Ways, "снять и его: DELETE /api/resources/"+name+with(query, "with-image=1"))
 	}
 	if len(out.Left) == 0 {
 		out.Ways = append(out.Ways, "на той машине нашего не осталось ничего, кроме докера и ssh — их ставил не мир")
 	}
 	return out, nil
+}
+
+// with — приписать значение к пути ручки, не потеряв уже названный рецепт. Выход обязан
+// быть КОМАНДОЙ, которую можно повторить как есть: потеряй он рецепт, вторая попытка
+// сняла бы не ту вещь.
+func with(query, param string) string {
+	if query == "" {
+		return "?" + param
+	}
+	return query + "&" + param
 }
 
 func (m *Manager) remoteEnv() []string {
@@ -474,7 +637,7 @@ func (m *Manager) dockerFailure(err error) *refusal.Refusal {
 func (m *Manager) toolFailure(err error, res run.Result, what string) *refusal.Refusal {
 	if errors.Is(err, run.ErrNoTool) {
 		return refusal.New(http.StatusInternalServerError, "no-remote-tool",
-			"подъём двери (deploy/remote.sh) до контроллера не доехал — звать нечего",
+			"подъём вещи (deploy/remote.sh) до контроллера не доехал — звать нечего",
 			"это дефект образа контроллера: путь называется CONTROL_REMOTE_SH",
 			"см. control/README.md, раздел «что лежит в образе»")
 	}

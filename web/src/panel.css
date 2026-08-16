@@ -227,6 +227,16 @@
   color: var(--muted-foreground);
 }
 
+/* Вещи на ресурсе — список внутри строки фактов, а не ещё одна карточка: это подробность
+   ресурса, и ступенькой глубже она и должна выглядеть. */
+.pult__things {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.15rem;
+}
+
 .pult__facts dt {
   color: var(--muted-foreground);
 }

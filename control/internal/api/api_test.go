@@ -19,25 +19,32 @@ import (
 
 type стенд struct {
 	*httptest.Server
-	fake  *run.Fake
-	keys  string
-	scope string
-	pult  string
-	log   []string
+	fake    *run.Fake
+	keys    string
+	scope   string
+	pult    string
+	recipes string
+	log     []string
 }
 
 func поднять(t *testing.T, answer func(run.Command) (run.Result, error)) *стенд {
 	t.Helper()
 	dir := t.TempDir()
 	st := &стенд{
-		fake:  &run.Fake{Answer: answer},
-		keys:  filepath.Join(dir, "keys"),
-		scope: filepath.Join(dir, "scope"),
-		pult:  filepath.Join(dir, "pult"),
+		fake:    &run.Fake{Answer: answer},
+		keys:    filepath.Join(dir, "keys"),
+		scope:   filepath.Join(dir, "scope"),
+		pult:    filepath.Join(dir, "pult"),
+		recipes: filepath.Join(dir, "recipes"),
+	}
+	if err := os.MkdirAll(st.recipes, 0o755); err != nil {
+		t.Fatal(err)
 	}
 	h := New(Options{
 		Runner:     st.fake,
 		RemoteSh:   "/opt/world/deploy/remote.sh",
+		RecipesDir: st.recipes,
+		DoorRecipe: дверьРецепт,
 		Docker:     "docker",
 		KeysDir:    st.keys,
 		PultDir:    st.pult,
@@ -122,14 +129,32 @@ func отказ(t *testing.T, body map[string]any, want string) {
 	}
 }
 
+// Рецепт двери — там же, где его складывает подъём контроллера: рядом с готовым подъёмом.
+const дверьРецепт = "/opt/world/deploy/compose.yaml"
+
+// докерОтвечает — подставной докер, у которого на ресурсе стоит одна здоровая вещь. Он не
+// притворяется докером: отвечает ровно те поля, которые контроллер спросил.
 func докерОтвечает(c run.Command) (run.Result, error) {
 	switch {
-	case len(c.Args) > 1 && c.Args[0] == "context":
-		return run.Result{Out: "world-vps\tssh://world@10.8.0.5\n"}, nil
 	case strings.HasSuffix(c.Name, "remote.sh"):
 		return run.Result{}, nil
+	case содержит(c.Args, "context"):
+		return run.Result{Out: "world-vps\tssh://world@10.8.0.5\n"}, nil
+	case содержит(c.Args, "ps"):
+		return run.Result{Out: "aaa111\n"}, nil
+	case содержит(c.Args, "inspect"):
+		return run.Result{Out: "world\thealthy\trunning\n"}, nil
 	}
-	return run.Result{Out: "healthy"}, nil
+	return run.Result{}, nil
+}
+
+func содержит(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ── вход ─────────────────────────────────────────────────────────────────────
@@ -241,7 +266,99 @@ func TestИсточниковСтановитсяДва(t *testing.T) {
 		t.Fatalf("первым обязан идти ресурс контроллера: %v", first)
 	}
 	if !st.fake.Called("remote.sh", "add", "vps") {
-		t.Fatal("подъём двери написан заново вместо готового")
+		t.Fatal("подъём вещи написан заново вместо готового")
+	}
+	// Ресурс — МАШИНА, а что на ней стоит — отдельное поле: список вещей, а не одна дверь
+	// (`WORLD2-131`). Пульт делается по этой же таблице.
+	второй, _ := list[1].(map[string]any)
+	if второй["reach"] != "отвечает" {
+		t.Fatalf("ресурс не сказал, отвечает ли он сам: %v", второй)
+	}
+	things, _ := второй["things"].([]any)
+	if len(things) != 1 {
+		t.Fatalf("список вещей на ресурсе не собрался: %v", второй)
+	}
+	вещь, _ := things[0].(map[string]any)
+	if вещь["name"] != "world" || вещь["alive"] != true || вещь["state"] == "" {
+		t.Fatalf("вещь описана не так: %v", вещь)
+	}
+}
+
+// Рецепт — то, ЧТО поднимается. Он доезжает до подъёма ключом, а не подразумевается его
+// умолчанием: умолчание принадлежит команде соседа, и опора на него однажды подняла бы
+// не ту вещь.
+func TestРецептДоезжаетДоПодъёма(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	весы := filepath.Join(st.recipes, "весы.yaml")
+	if err := os.WriteFile(весы, []byte("name: весы\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.5","recipe":"весы"}`, "метка")
+	if status != http.StatusCreated {
+		t.Fatalf("вторая вещь не поднялась: %d %v", status, body)
+	}
+	if !st.fake.Called("remote.sh", "add", "vps", "--recipe", весы) {
+		t.Fatalf("подъём позван не тем рецептом: %s", st.fake.Line(0))
+	}
+
+	// Снятие называет рецепт тем же способом — своего реестра вещей зона не заводит.
+	if status, body = st.зов(t, "DELETE", "/api/resources/vps?recipe=весы", "", "метка"); status != http.StatusOK {
+		t.Fatalf("снятие отдало %d: %v", status, body)
+	}
+	if !st.fake.Called("remote.sh", "drop", "vps", "--recipe", весы) {
+		t.Fatalf("снятие пошло не тем рецептом: %s", st.fake.Line(len(st.fake.Calls())-1))
+	}
+}
+
+// Список того, чем контроллер умеет поднимать, ЧИТАЕТСЯ из каталога: положили файл — вещь
+// появилась, без правки кода и без пересборки образа (`WORLD2` 3.7).
+func TestСписокРецептовЧитаетсяИзКаталога(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+
+	status, body := st.зов(t, "GET", "/api/recipes", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("до входа рецепты видны: %d %v", status, body)
+	}
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body = st.зов(t, "GET", "/api/recipes", "", "метка")
+	list, _ := body["recipes"].([]any)
+	if status != http.StatusOK || len(list) != 1 {
+		t.Fatalf("в пустом ландшафте обязана быть одна дверь: %d %v", status, body)
+	}
+	дверь, _ := list[0].(map[string]any)
+	if дверь["name"] != "door" || дверь["path"] != дверьРецепт {
+		t.Fatalf("дверь описана не так: %v", дверь)
+	}
+
+	if err := os.WriteFile(filepath.Join(st.recipes, "весы.yaml"), []byte("name: весы\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, body = st.зов(t, "GET", "/api/recipes", "", "метка")
+	list, _ = body["recipes"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("положенный рецепт не появился, а обязан был: %v", body)
+	}
+}
+
+// Рецепт, которого нет, — наш отказ и наш код: имя рецепта это наше знание, и спрашивать
+// за него соседа не за что. До ресурса при этом дело не доходит.
+func TestНеизвестныйРецептОтказываетСвоимКодом(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+
+	status, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.5","recipe":"часы"}`, "метка")
+	if status != http.StatusNotFound {
+		t.Fatalf("неизвестный рецепт отдан как %d: %v", status, body)
+	}
+	отказ(t, body, "no-such-recipe")
+	if st.fake.Called("remote.sh") {
+		t.Fatalf("подъём позвали на рецепте, которого нет: %s", st.fake.Line(0))
 	}
 }
 

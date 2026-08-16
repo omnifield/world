@@ -1,7 +1,7 @@
 // Контроллер — руки юзера в мире (`WORLD2` 3.7).
 //
 // Мир сам не действует, поэтому всё, что происходит, происходит через контроллер: юзер
-// входит в свой скоуп, добавляет ресурсы, на них встают двери. Ставится контроллер РУКАМИ
+// входит в свой скоуп, добавляет ресурсы, на них встают вещи. Ставится контроллер РУКАМИ
 // человека — ни мир, ни другой контроллер его не разворачивают: цепочка начинается с
 // юзера, и первое звено не автоматизируется.
 //
@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/omnifield/world/control/internal/api"
@@ -33,13 +34,14 @@ import (
 
 const (
 	defaultAddr = ":8090"
-	// Путь к готовому подъёму двери. Умолчание — от корня репозитория, как его видит
+	// Путь к готовому подъёму вещи. Умолчание — от корня репозитория, как его видит
 	// запуск из `control/`; образ кладёт репозиторий в /opt/world и называет путь явно.
 	defaultRemoteSh = "../deploy/remote.sh"
 	// Хост-порт двери НА ТОМ ресурсе. Значение уезжает `deploy/remote.sh` его же
-	// переменной: два разных умолчания одного и того же однажды разъедутся.
+	// переменной: два разных умолчания одного и того же однажды разъедутся. Рецепт,
+	// который его не читает, о нём и не узнает.
 	defaultDoorPort = 8080
-	// Сколько ждём внешний инструмент. Подъём двери на чистом ресурсе везёт туда образ —
+	// Сколько ждём внешний инструмент. Подъём вещи на чистом ресурсе везёт туда образ —
 	// это минуты, а не секунды.
 	defaultToolTimeout = 300
 	// Сколько ждём ответа ssh при работе со скоупом. Меньше — быстрее краснеет.
@@ -68,10 +70,18 @@ func main() {
 	keys := env("CONTROL_KEYS", filepath.Join(home(), ".ssh"))
 	remoteSh := env("CONTROL_REMOTE_SH", defaultRemoteSh)
 	pultDir := env("CONTROL_PULT", defaultPultDir)
+	// Рецепт двери и каталог рецептов ВЫВОДЯТСЯ ИЗ ПУТИ К ПОДЪЁМУ, а не задаются вторым
+	// умолчанием: подъём и файл запуска двери едут в образ вместе и лежат рядом (то же
+	// правило и та же формула, что у точки входа образа — `control-entry.sh`). Второе
+	// независимое умолчание того же самого разъехалось бы с первым молча.
+	doorRecipe := env("CONTROL_DOOR_RECIPE", filepath.Join(filepath.Dir(remoteSh), "compose.yaml"))
+	recipesDir := env("CONTROL_RECIPES", filepath.Join(filepath.Dir(remoteSh), "recipes"))
 
 	handler := api.New(api.Options{
 		Runner:     run.Exec{Timeout: time.Duration(number("CONTROL_TOOL_TIMEOUT", defaultToolTimeout)) * time.Second},
 		RemoteSh:   remoteSh,
+		RecipesDir: recipesDir,
+		DoorRecipe: doorRecipe,
 		Docker:     env("CONTROL_DOCKER", "docker"),
 		KeysDir:    keys,
 		DoorPort:   number("CONTROL_DOOR_PORT", defaultDoorPort),
@@ -80,8 +90,13 @@ func main() {
 	})
 
 	log.Printf("control: руки юзера на %s", addr)
-	log.Printf("control: подъём двери — %s; докер — %s; связка — %s",
+	log.Printf("control: подъём вещи — %s; докер — %s; связка — %s",
 		remoteSh, env("CONTROL_DOCKER", "docker"), keys)
+	// Ландшафт рецептов называется В СТАРТОВОЙ СТРОКЕ: контроллер не знает, какие бывают
+	// вещи, — он знает, где они лежат, и человеку это надо видеть до первого добавления
+	// ресурса, а не по отказу `no-such-recipe`.
+	log.Printf("control: рецепт двери — %s; каталог рецептов — %s (%s)",
+		doorRecipe, recipesDir, recipesState(recipesDir))
 	// Состояние пульта называется В СТАРТОВОЙ СТРОКЕ, а не только на первом запросе:
 	// образ, уехавший без пульта, обнаруживается иначе тогда, когда человек уже открыл
 	// адрес и увидел отказ. Поднятию это не мешает — ручки работают и без лица.
@@ -89,7 +104,7 @@ func main() {
 	// Проверяем то, чем будем пользоваться, СРАЗУ и говорим вслух: инструмент, которого
 	// нет, обнаружится иначе только в момент, когда человек уже нажал «добавить ресурс».
 	if _, err := os.Stat(remoteSh); err != nil {
-		log.Printf("control: ВНИМАНИЕ — подъёма двери по пути %s нет (%v); добавление ресурса откажет кодом no-remote-tool", remoteSh, err)
+		log.Printf("control: ВНИМАНИЕ — подъёма вещи по пути %s нет (%v); добавление ресурса откажет кодом no-remote-tool", remoteSh, err)
 	}
 
 	srv := &http.Server{
@@ -103,7 +118,7 @@ func main() {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `Контроллер мира — руки юзера: вход в скоуп, источники ресурса, подъём дверей.
+	fmt.Fprint(w, `Контроллер мира — руки юзера: вход в скоуп, источники ресурса, подъём вещей.
 
   control            поднять контроллер (по умолчанию :8090)
   control help       эта подсказка
@@ -111,18 +126,24 @@ func usage(w io.Writer) {
 Ручки (тело и ответы — в control/README.md):
   POST   /api/session          вход: адрес скоупа и креды; create=true — завести здесь
   GET    /api/me               кто я сейчас
-  GET    /api/resources        источники ресурса: имя, адрес, жив ли
-  POST   /api/resources        добавить ресурс — на нём встаёт дверь
+  GET    /api/resources        источники ресурса: имя, адрес, отвечает ли, что на нём стоит
+  POST   /api/resources        добавить ресурс — на нём встаёт вещь, названная рецептом
   DELETE /api/resources/{имя}  снять ресурс; в ответе — что осталось на той машине
+  GET    /api/recipes          чем контроллер умеет поднимать: каталог рецептов
   GET    /api/fields           поля юзера
   POST   /api/fields           завести поле
   GET    /                     пульт — лицо для человека, собранное зоной web
 
+ЧТО ПОДНИМАЕТСЯ — говорит РЕЦЕПТ (файл запуска), а не контроллер: перечня вещей в нём нет
+вовсе. Не назвал рецепт — ставится дверь; назвал — то, что назвал. Свои вещи хозяин машины
+кладёт в каталог рецептов, и для этого не нужны ни правка кода, ни пересборка образа.
 
 Значения:
   CONTROL_ADDR=:8090                 где слушать
   CONTROL_KEYS=~/.ssh                связка контроллера: ключи ресурсов и config
-  CONTROL_REMOTE_SH=../deploy/remote.sh   готовый подъём двери — его контроллер зовёт
+  CONTROL_REMOTE_SH=../deploy/remote.sh   готовый подъём вещи — его контроллер зовёт
+  CONTROL_RECIPES=<рядом с подъёмом>/recipes  каталог рецептов (в образе /opt/world/recipes)
+  CONTROL_DOOR_RECIPE=<рядом с подъёмом>/compose.yaml   рецепт двери — умолчание подъёма
   CONTROL_PULT=../web/dist           где лежит СОБРАННЫЙ пульт (в образе /opt/world/pult)
   CONTROL_DOCKER=docker              чем говорим с докером
   CONTROL_DOOR_PORT=8080             хост-порт двери на добавляемом ресурсе
@@ -132,6 +153,33 @@ func usage(w io.Writer) {
 Отказ приходит тройкой: code (машине), why (причина человеку), ways[] (выходы).
 Контроллеру нужен сокет докера — его даёт хозяин при подъёме (./control/up.sh).
 `)
+}
+
+// recipesState — что в каталоге рецептов сейчас лежит, одной строкой. Пустой каталог и
+// каталога нет — РАЗНЫЕ состояния: первое чинит хозяин, положив файл, второе — раскладка
+// подъёма. Сказать «пусто» про обоих значило бы отправить чинить не то.
+func recipesState(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "каталога нет — вещей, кроме двери, контроллер не поднимет; смонтируй свой: control/README.md"
+		}
+		return "не прочитать: " + err.Error()
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(e.Name())) {
+		case ".yaml", ".yml":
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return "пуст — кроме двери поднимать нечего"
+	}
+	return "рецептов: " + strings.Join(names, ", ")
 }
 
 func env(name, def string) string {
