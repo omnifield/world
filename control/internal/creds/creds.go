@@ -1,0 +1,335 @@
+// Пакет creds — КРЕДЫ К МАШИНЕ: ключ или пароль, и что с ними делает контроллер.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПАРОЛЬ — НЕ ТРАНСПОРТ, А СПОСОБ ПОЛУЧИТЬ КЛЮЧ.                                       │
+// │                                                                                      │
+// │ Докер ходит до чужой машины СИСТЕМНЫМ ssh (`deploy/remote.sh`), а тот пароль          │
+// │ неинтерактивно не берёт. Обойти это можно было двумя способами, и оба отвергнуты      │
+// │ решением user: подменить `ssh` в `PATH` обёрткой над `sshpass` — хак поверх чужого    │
+// │ поведения; написать свой транспорт вместо `docker context` — прямо запрещено          │
+// │ (`deploy/remote.sh`: «своего подъёма мы для этого НЕ ПИШЕМ»).                          │
+// │                                                                                      │
+// │ Поэтому паролем контроллер заходит РОВНО ОДИН раз: кладёт публичный ключ юзера в      │
+// │ `~/.ssh/authorized_keys` той машины, а приватный отдаёт в скоуп. Дальше всё идёт по    │
+// │ ключу, и транспорт не меняется ни на строку. Это то же, что человек делает            │
+// │ `ssh-copy-id`, — только делает это контроллер, и юзер не открывает терминал ни разу.  │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ЦЕНА НАЗВАНА ВСЛУХ: КОНТРОЛЛЕР ПИШЕТ В ЧУЖУЮ МАШИНУ.                                 │
+// │                                                                                      │
+// │ Одна строка в `~/.ssh/authorized_keys` юзера — обратимая, но это изменение ЕГО        │
+// │ машины, и человек обязан узнать о нём ДО, а не после. Поэтому про запись сказано в    │
+// │ доке зоны, в подсказке процесса, в журнале подъёма и в каждом отказе этого пути.      │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// ПАРОЛЬ ЖИВЁТ РОВНО ОДИН ВЫЗОВ. Он не попадает ни в скоуп, ни в связку контроллера, ни в
+// журнал, ни в текст отказа — нигде и никогда. В скоуп уходит КЛЮЧ, который завёл
+// контроллер; пароль после установки ключа не нужен вовсе.
+//
+// ВИД КРЕД НАЗЫВАЕТСЯ ЯВНО, а не угадывается по виду строки. Угаданный вид однажды примет
+// ключ за пароль (или наоборот) — и разбираться человек будет с отказом ssh, а не с нашей
+// догадкой. Разбор здесь один и в одном месте (`ParseKind`).
+package creds
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
+
+	"github.com/omnifield/world/control/internal/refusal"
+)
+
+// Kind — вид кред. Их два, как в PuTTY: ключ либо пароль (решение user 2026-08-17).
+type Kind string
+
+const (
+	// Key — приватный ключ, названный юзером. Кладётся в скоуп и в связку как есть.
+	Key Kind = "key"
+	// Password — пароль к машине. Транспортом не становится: им контроллер один раз
+	// заходит и заводит ключ.
+	Password Kind = "password"
+)
+
+// comment — подпись в строке `authorized_keys`. Человек, открывший файл своей машины,
+// обязан понимать, откуда там эта строка и чем её убрать.
+const comment = "world-control"
+
+// ParseKind — вид кред, названный явно. Пустое и неизвестное — РАЗНЫЕ отказы: первое
+// значит «не сказали», второе «сказали не то», и чинятся они по-разному.
+func ParseKind(value string) (Kind, *refusal.Refusal) {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case string(Key), "ключ":
+		return Key, nil
+	case string(Password), "пароль":
+		return Password, nil
+	case "":
+		return "", refusal.New(http.StatusBadRequest, "no-creds-kind",
+			"вид кред не назван, а угадывать его по виду строки нельзя: угаданный однажды примет ключ за пароль",
+			`назови явно: creds = {"kind":"key","value":"<приватный ключ>"}`,
+			`либо паролем: creds = {"kind":"password","value":"<пароль машины>"} — контроллер заведёт ключ сам`)
+	default:
+		return "", refusal.New(http.StatusBadRequest, "bad-creds-kind",
+			fmt.Sprintf("вид кред %q контроллеру неизвестен", value),
+			`видов два, как в PuTTY: "key" — свой приватный ключ, "password" — пароль машины`)
+	}
+}
+
+// Machine — до кого дотягиваемся паролем. Разбор адреса живёт у соседа (`resource`), сюда
+// приезжает уже разобранный: второй разбор того же адреса разъехался бы с первым.
+type Machine struct {
+	User string
+	Host string
+	Port int
+}
+
+func (m Machine) String() string {
+	return m.User + "@" + net.JoinHostPort(m.Host, strconv.Itoa(m.Port))
+}
+
+// Pair — пара ключей юзера. Приватный уезжает в скоуп, публичный — на машину.
+type Pair struct {
+	// Private — приватный ключ в формате OpenSSH. Его берёт системный ssh, поэтому формат
+	// не наш выбор, а его требование.
+	Private string
+	// Authorized — ровно та строка, которую кладут в `authorized_keys`.
+	Authorized string
+}
+
+// Generate заводит новую пару. Ed25519, потому что это сегодняшнее умолчание OpenSSH:
+// короткий ключ, без параметров, которые надо выбирать (сверка с рынком 2026-08-17 —
+// `ssh-keygen` без ключей заводит ed25519 с OpenSSH 9).
+func Generate() (Pair, *refusal.Refusal) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return Pair{}, refusal.New(http.StatusInternalServerError, "no-key",
+			"пару ключей завести не вышло: "+err.Error(),
+			"попробуй ещё раз",
+			"если повторяется — это дефект контроллера, заведи задачу зоне control")
+	}
+	block, err := ssh.MarshalPrivateKey(priv, comment)
+	if err != nil {
+		return Pair{}, refusal.New(http.StatusInternalServerError, "no-key",
+			"приватный ключ не собрался: "+err.Error(),
+			"если повторяется — это дефект контроллера, заведи задачу зоне control")
+	}
+	signer, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return Pair{}, refusal.New(http.StatusInternalServerError, "no-key",
+			"публичный ключ не собрался: "+err.Error(),
+			"если повторяется — это дефект контроллера, заведи задачу зоне control")
+	}
+	return Pair{
+		Private:    string(pem.EncodeToMemory(block)),
+		Authorized: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer))) + " " + comment,
+	}, nil
+}
+
+// Authorized — строка `authorized_keys` по приватному ключу, который уже лежит в скоупе.
+// Публичный ключ в формате не хранится намеренно: он производен от приватного, а второе
+// поле того же самого однажды разъехалось бы с первым.
+func Authorized(private string) (string, *refusal.Refusal) {
+	signer, err := ssh.ParsePrivateKey([]byte(private))
+	if err != nil {
+		return "", refusal.New(http.StatusBadGateway, "bad-key",
+			"ключ из скоупа не разобрать: "+err.Error(),
+			"посмотри раздел «ключи» в состоянии: там лежит приватный ключ в формате OpenSSH",
+			"либо заведи территорию заново — контроллер заведёт новый ключ")
+	}
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + comment, nil
+}
+
+// Install кладёт публичный ключ на машину, зайдя туда ПАРОЛЕМ.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ РЕЗУЛЬТАТ ИЗМЕРЯЕТСЯ, А НЕ ВЫВОДИТСЯ ИЗ КОДА ВОЗВРАТА (`WORLD2` 4.2 п. 5).           │
+// │                                                                                      │
+// │ Команда на той стороне заканчивается подсчётом СВОИХ строк в `authorized_keys`, и мы  │
+// │ требуем ровно одну. Ноль значит «не записалось» — и отчитаться успехом тут нельзя;    │
+// │ два и больше — «заход плодит строки», а этого не должно быть никогда.                 │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// knownHosts — куда записать ключ САМОЙ машины. Тот же файл потом читает системный ssh, и
+// запись здесь означает, что первая встреча состоялась ровно один раз — при заведении.
+func Install(ctx context.Context, m Machine, password, authorized, knownHosts string, timeout int) *refusal.Refusal {
+	if timeout <= 0 {
+		timeout = 10
+	}
+	cfg := &ssh.ClientConfig{
+		User:            m.User,
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback: rememberHost(knownHosts),
+		Timeout:         time.Duration(timeout) * time.Second,
+	}
+
+	dialer := net.Dialer{Timeout: cfg.Timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(m.Port)))
+	if err != nil {
+		return reachFailure(m, err)
+	}
+	c, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(m.Host, strconv.Itoa(m.Port)), cfg)
+	if err != nil {
+		_ = conn.Close()
+		return handshakeFailure(m, err)
+	}
+	client := ssh.NewClient(c, chans, reqs)
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return refusal.New(http.StatusBadGateway, "key-not-installed",
+			fmt.Sprintf("на машине %s не открыть сеанс: %v", m, err),
+			"проверь, что на ней есть шелл для этого юзера",
+			"ключ на машину не положен — ничего не изменено")
+	}
+	defer session.Close()
+
+	out, err := session.Output(install(authorized))
+
+	// ┌─────────────────────────────────────────────────────────────────────────────────┐
+	// │ РЕШАЕТ СЧЁТ, А НЕ КОД ВОЗВРАТА. Команда заканчивается подсчётом НАШИХ строк в     │
+	// │ файле, и успех — это ровно одна. Ошибка команды идёт подробностью к отказу, а не  │
+	// │ вместо измерения: «код ноль» означает лишь, что шелл дошёл до конца, а записалось  │
+	// │ ли что-нибудь — вопрос к файлу (`WORLD2` 4.2 п. 5).                                │
+	// └─────────────────────────────────────────────────────────────────────────────────┘
+	count := strings.TrimSpace(lastLine(string(out)))
+	if count == "1" {
+		return nil
+	}
+
+	подробность := ""
+	if err != nil {
+		подробность = ": " + err.Error()
+	}
+	if n, cerr := strconv.Atoi(count); cerr == nil && n > 1 {
+		return refusal.New(http.StatusBadGateway, "key-doubled",
+			fmt.Sprintf("на машине %s наш ключ лежит в ~/.ssh/authorized_keys больше одного раза (%d)", m, n),
+			"убери лишние строки руками: они помечены подписью "+comment,
+			"это дефект контроллера, если строки появились не руками, — заведи задачу зоне control")
+	}
+	return refusal.New(http.StatusBadGateway, "key-not-installed",
+		fmt.Sprintf("на машине %s ключа в ~/.ssh/authorized_keys после записи нет — записать его не вышло%s", m, подробность),
+		"чаще всего это права на домашний каталог либо переполненный диск",
+		"проверь руками на той машине: ls -ld ~/.ssh && touch ~/.ssh/authorized_keys",
+		"на машине при этом ничего не сломано: ключ либо лёг, либо не лёг")
+}
+
+// lastLine — последняя непустая строка ответа. Считает наши строки ПОСЛЕДНЯЯ команда, а до
+// неё шелл мог сказать своё (например, про несозданный каталог), и это его право.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+// install — команда, которая идёт на ту сторону. Одна, и она ИДЕМПОТЕНТНА: тот же ключ
+// второй раз не дописывается. Заход, плодящий строки, однажды оставил бы в чужом файле
+// десяток наших ключей, и убирать их пришлось бы человеку руками.
+func install(authorized string) string {
+	line := quote(authorized)
+	return strings.Join([]string{
+		"umask 077",
+		"mkdir -p ~/.ssh",
+		"touch ~/.ssh/authorized_keys",
+		"chmod 700 ~/.ssh",
+		"chmod 600 ~/.ssh/authorized_keys",
+		"grep -qxF -- " + line + " ~/.ssh/authorized_keys || printf '%s\\n' " + line + " >> ~/.ssh/authorized_keys",
+		// Счёт печатается ВСЕГДА: `grep -c` на ноль совпадений выходит единицей, и без
+		// `|| true` «ноль строк» было бы неотличимо от «команда упала». А различать их
+		// надо: в первом случае мы точно знаем, что не записалось.
+		"grep -cxF -- " + line + " ~/.ssh/authorized_keys 2>/dev/null || true",
+	}, "\n")
+}
+
+// rememberHost — ключ САМОЙ машины, записанный при первой встрече. Это тот же порядок,
+// каким живёт системный ssh с `StrictHostKeyChecking=accept-new`, только запись делается
+// здесь и один раз: дальше её читает он сам и уже сверяет.
+//
+// Не записалось — не отказ: соединение состоялось, а запись это забота о следующем разе.
+func rememberHost(path string) ssh.HostKeyCallback {
+	return func(hostport string, _ net.Addr, key ssh.PublicKey) error {
+		if path == "" {
+			return nil
+		}
+		line := knownhosts.Line([]string{knownhosts.Normalize(hostport)}, key) + "\n"
+		if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), strings.TrimSpace(line)) {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil
+		}
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+		_, _ = f.WriteString(line)
+		return nil
+	}
+}
+
+// ── отказы ───────────────────────────────────────────────────────────────────
+//
+// Ступени те же, что во всей зоне: дорога · ответ · доступ. Чинят их разные люди, и общий
+// отказ «не дотянулись» отправляет человека чинить наугад (`WORLD2` 2.3).
+//
+// НИ В ОДНОМ отказе этого файла нет пароля. Он не подставляется в текст ни при каких
+// обстоятельствах: отказ читают люди, и он же уезжает в журнал.
+
+func reachFailure(m Machine, err error) *refusal.Refusal {
+	var dns *net.DNSError
+	switch {
+	case errors.As(err, &dns):
+		return refusal.New(http.StatusBadGateway, "no-route",
+			fmt.Sprintf("имя %s не разрешается — до машины нет дороги", m.Host),
+			"проверь адрес машины",
+			"пароль никуда не ушёл: соединение не состоялось")
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return refusal.New(http.StatusBadGateway, "no-answer",
+			fmt.Sprintf("дорога до %s есть, а ssh на порту %d не отвечает", m.Host, m.Port),
+			"проверь, что ssh на той машине поднят",
+			"если порт не 22 — назови его в адресе: user@машина:2222")
+	default:
+		return refusal.New(http.StatusGatewayTimeout, "no-answer",
+			fmt.Sprintf("до ssh на %s дотянуться не вышло: %v", m, err),
+			"проверь адрес и что машина жива",
+			"дай больше времени: CONTROL_SSH_TIMEOUT=30")
+	}
+}
+
+func handshakeFailure(m Machine, err error) *refusal.Refusal {
+	text := err.Error()
+	if strings.Contains(text, "unable to authenticate") || strings.Contains(text, "no supported methods") {
+		return refusal.New(http.StatusForbidden, "access-denied",
+			fmt.Sprintf("машина %s пароль не приняла", m),
+			"проверь пароль и юзера в адресе: ходим именно им",
+			"если на машине запрещён вход по паролю (PasswordAuthentication no) — заведи ключ руками и назови его видом «key»")
+	}
+	return refusal.New(http.StatusBadGateway, "no-answer",
+		fmt.Sprintf("ssh на %s не договорился с контроллером: %v", m, err),
+		"проверь, что по этому адресу и правда ssh",
+		"подробность выше — она от ssh, а не от мира")
+}
+
+// quote — единственный способ, которым значение попадает в команду на той стороне. Строка
+// ключа приходит от нас, но правило одно на всю зону: в чужую оболочку значения уезжают
+// закавыченными (грабля `WORLD2-96`, пункт 2).
+func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
