@@ -5,19 +5,30 @@
 // контроллере. Поэтому здесь нет ни одной ручки двери, и `/api/locations` из этой зоны ушёл
 // вместе с экраном, который его показывал.
 //
-// Инвариант файла остался прежним и от переезда не зависит:
+// Инвариант файла остался прежним и от переездов не зависит:
 //
 //	ПУЛЬТ ПОКАЗЫВАЕТ ТО, ЧТО ОТДАЛ КОНТРОЛЛЕР, и своего состояния мира не держит.
 //
 // Ни кэша, ни досчитанных полей, ни «ресурс наверняка ещё жив». Есть разбор ответа и перевод
 // неответа в ОТКАЗ, который называет причину и выходы (`WORLD2` 2.3).
 //
-// Контракт — таблица из `WORLD2-102`, она же `control/README.md`, пакет `control/internal/api`:
+// СКОУП ЛЕЖИТ ПО АДРЕСУ, А КОНТРОЛЛЕР ПУСТ (`WORLD2` 3.4, 1.9, задача `WORLD2-132`).
+// Личность юзера раздаётся раздачей на его машине, а контроллер до неё дотягивается: он
+// времянка, и своего состояния у него нет. Для пульта это сменило три вещи разом:
 //
-//	POST   /api/session            вход: адрес скоупа и креды (или create — завести здесь)
+//	вход — это АДРЕС РАЗДАЧИ И ПАРОЛЬ, и больше ничего;
+//	«завести здесь» НЕ СУЩЕСТВУЕТ (`3.7`) — заведение это отдельная ручка и отдельный адрес;
+//	выход — ручка, а не забытая метка: он снимает времянки контроллера.
+//
+// Контракт — `control/README.md` (разделы «Вход», «Завести скоуп», «Выход», «Территории»),
+// пакет `control/internal/api`:
+//
+//	POST   /api/scope              завести скоуп ТАМ, где юзер его назвал: две пары и личность
+//	POST   /api/session            вход: адрес раздачи и пароль
+//	DELETE /api/session            выход: времянки контроллера снимаются, скоуп не трогается
 //	GET    /api/me                 кто я сейчас
-//	GET    /api/resources          источники ресурса: имя, адрес, дотянулись ли, что на них стоит
-//	POST   /api/resources          добавить ресурс — на нём встаёт вещь (не названа — дверь)
+//	GET    /api/resources          территории юзера: имя, адрес, отвечает ли, что на них стоит
+//	POST   /api/resources          завести территорию — на ней встаёт вещь (не названа — дверь)
 //	GET    /api/fields             поля юзера
 //	POST   /api/fields             завести поле
 //
@@ -32,6 +43,7 @@
 
 /** Ручки контроллера. Те же пути, что в `control/internal/api`. */
 export const PATH = {
+  scope: "/api/scope",
   session: "/api/session",
   me: "/api/me",
   resources: "/api/resources",
@@ -66,14 +78,18 @@ export type Refusal = {
 /** Ответ ручки: либо значение, либо отказ. Исключений отсюда не вылетает — см. `call`. */
 export type Answer<T> = { kind: "ok"; value: T } | { kind: "refusal"; refusal: Refusal };
 
-/** Где лежит скоуп — так, как это увидел контроллер. */
+/**
+ * Где лежит скоуп — так, как это увидел контроллер.
+ *
+ * Адрес скоупа это ОБЫЧНЫЙ HTTP-АДРЕС РАЗДАЧИ, и состояние лежит в её корне (`WORLD2` 3.4):
+ * две раздачи — два скоупа, а не два пути в одной. Прежней пары «лежит ли он здесь» и «путь
+ * на машине» больше нет: она и означала личность, лежащую томом контроллера (`WORLD2-124`).
+ */
 export type ScopeView = {
-  /** адрес, названный человеком: `/scope/егор` либо `world@10.8.0.5:/srv/scope` */
+  /** адрес раздачи, названный человеком: `http://10.8.0.5:8070/` */
   addr: string;
-  /** скоуп лежит на ресурсе контроллера */
-  here: boolean;
-  /** путь до скоупа на том ресурсе */
-  path: string;
+  /** машина, на которой раздача стоит, — так, как её разобрал контроллер */
+  host: string;
 };
 
 /** Личность юзера — ровно то, что назвал канон (`WORLD2` 3.4): имя и бренд. */
@@ -85,8 +101,15 @@ export type Identity = {
   since: string;
 };
 
-/** Вход состоялся. `created` — скоуп завели прямо сейчас, а не нашли. */
+/** Вход состоялся. `created` — скоуп завели прямо сейчас, а не нашли по адресу. */
 export type Session = Identity & { created: boolean; token: string };
+
+/**
+ * Выход состоялся. Своего состояния он не трогает: скоуп лежит там, где лежал, и открывается
+ * тем же адресом и паролем. Снимаются ВРЕМЯНКИ контроллера, и он говорит об этом словами —
+ * `note` показывается человеку, а не проглатывается.
+ */
+export type Leaving = { note: string };
 
 /**
  * Вещь, поднятая на ресурсе. Своего перечня вещей пульт не держит и держать не может: какие
@@ -110,16 +133,17 @@ export type Thing = {
 };
 
 /**
- * Источник ресурса глазами юзера: МАШИНА, до которой дотянулись. Памяти и ядер здесь нет
- * намеренно (`WORLD2` 2.5), а двери нет потому, что ресурс перестал быть «машиной с дверью»
- * (`WORLD2-131`): что на нём стоит — отдельный вопрос и отдельное поле.
+ * Территория юзера глазами пульта: МАШИНА, до которой дотянулись. Памяти и ядер здесь нет
+ * намеренно (`WORLD2` 2.5), двери нет потому, что ресурс перестал быть «машиной с дверью»
+ * (`WORLD2-131`), а РЕСУРСА «ЗДЕСЬ» нет потому, что список берётся из СКОУПА (`WORLD2` 3.4):
+ * машина контроллера юзеру не принадлежит — он времянка, и своё хозяйство в его личность не
+ * подмешивает (`WORLD2-132`).
  */
 export type Resource = {
+  /** имя участка — его называет юзер, и в скоупе оно не повторяется (`WORLD2` 2.5 п. 11) */
   name: string;
-  /** адрес; у ресурса контроллера пуст — изнутри машины её собственный адрес неизвестен */
+  /** адрес машины: `world@10.8.0.5`. Участка без адреса не бывает — его называет юзер */
   addr: string;
-  /** на этом ресурсе стоит контроллер */
-  here: boolean;
   /** отвечает ли САМ ресурс: «отвечает» либо «молчит». Вопрос про машину, а не про вещь на ней */
   reach: string;
   /**
@@ -130,20 +154,51 @@ export type Resource = {
   things: Thing[] | null;
 };
 
-/** Поле юзера. Пока это ЗАПИСЬ о поле, а не поднятое поле — так говорит и сам контроллер. */
-export type Field = { name: string; created: string };
+/**
+ * Поле юзера. Пока это ЗАПИСЬ о поле, а не поднятое поле — так говорит и сам контроллер.
+ *
+ * Состав сменился вместе со ступенью 2: поля лежат в СКОУПЕ, формой мира (`имя` · `адрес` ·
+ * `состояние`), и ручка отдаёт эти три. Прежней даты заведения в контракте нет — пульт её не
+ * держит: поле, которого нет у мира, на экране было бы нашей выдумкой.
+ *
+ * `addr` и `state` пустыми БЫВАЮТ, и это законно: поле пока только записано, нигде не
+ * поднято, и адреса с состоянием у него ещё нет.
+ */
+export type Field = { name: string; addr: string; state: string };
 
-/** Чем входят: адрес скоупа и креды к нему; `create` — «скоупа нет, заведи здесь». */
-export type EnterRequest = {
-  addr: string;
-  creds?: string;
-  create?: boolean;
-  name?: string;
-  brand?: string;
+/**
+ * Чем входят: АДРЕС РАЗДАЧИ И ПАРОЛЬ, и больше ничего (`WORLD2` 3.7).
+ *
+ * Поля «завести здесь» тут нет и не появится: разница между «состояние есть» и «состояния
+ * нет» только в исходе, а спрашивается одно и то же. Контроллер такое поле не проглатывает
+ * молча, а отказывает (`bad-body`) — молча проглоченное выглядело бы сработавшим.
+ */
+export type EnterRequest = { addr: string; password: string };
+
+/**
+ * Чем заводят скоуп — ТАМ, где он будет лежать.
+ *
+ * ПАР ДВЕ, И ПУТАТЬ ИХ ДОРОГО (`WORLD2` 3.4, «Два адреса»): машина — это куда контроллер
+ * дотянется и поднимет раздачу; скоуп — это адрес, по которому потом входить. Креды машины
+ * юзер даёт руками ровно один раз, потому что скоупа в этот момент ещё нет; дальше они лежат
+ * в нём. На слиянии этих двух пар выросла мёртвая `WORLD2-77`.
+ *
+ * `machine` НЕОБЯЗАТЕЛЬНА: раздачу юзер вправе поднять сам — это его вилка, и мир в неё не
+ * смотрит (`WORLD2` 0.3). Называется она целиком или не называется вовсе, и решает это
+ * человек явно, а не пульт по пустоте полей.
+ */
+export type CreateScopeRequest = {
+  scope: { addr: string; password: string };
+  identity: { name: string; brand: string };
+  machine?: { name: string; addr: string; creds: string };
 };
 
-/** Чем добавляют ресурс: имя, адрес машины и ключ к ней. */
-export type AddResourceRequest = { name: string; addr: string; creds?: string };
+/**
+ * Чем заводят территорию: ТРИ вещи, а не две (`WORLD2` 2.5 п. 11) — имя участка, адрес
+ * машины и креды к ней. Имя не выводится из адреса и не подставляется молча: на нём стоит
+ * адрес локации. Креды обязательны — без них контроллер отказывает (`no-creds`).
+ */
+export type AddResourceRequest = { name: string; addr: string; creds: string };
 
 /**
  * Всё, что пульт умеет спросить у мира. Интерфейсом, а не набором функций, ради одного:
@@ -152,6 +207,8 @@ export type AddResourceRequest = { name: string; addr: string; creds?: string };
  */
 export type Control = {
   enter(req: EnterRequest): Promise<Answer<Session>>;
+  createScope(req: CreateScopeRequest): Promise<Answer<Session>>;
+  leave(): Promise<Answer<Leaving>>;
   me(): Promise<Answer<Identity>>;
   resources(): Promise<Answer<Resource[]>>;
   addResource(req: AddResourceRequest): Promise<Answer<{ added: Resource; resources: Resource[] }>>;
@@ -168,6 +225,9 @@ const browserFetch: Fetcher = (input, init) => globalThis.fetch(input, init);
 export type Logf = (line: string) => void;
 
 const browserLog: Logf = (line) => console.debug(line);
+
+/** Глагол запроса. Своего значения не несёт — это глагол контракта, и он назван явно. */
+type Method = "GET" | "POST" | "DELETE";
 
 /** Часы замера. `performance` есть не везде, а трасса без времени — не трасса. */
 function сейчас(): number {
@@ -189,27 +249,45 @@ export function liveControl(doFetch: Fetcher = browserFetch, logf: Logf = browse
   let token = "";
 
   const ask = <T>(
+    method: Method,
     path: string,
     read: (parsed: unknown, path: string) => Answer<T>,
     body?: unknown,
-  ) => call(doFetch, path, token, read, body, logf);
+  ) => call(doFetch, method, path, token, read, body, logf);
+
+  /** Вход и заведение отдают одно и то же: личность, скоуп и метку сессии. */
+  const запомнить = (answer: Answer<Session>): Answer<Session> => {
+    if (answer.kind === "ok") {
+      token = answer.value.token;
+    }
+    return answer;
+  };
 
   return {
     async enter(req) {
-      const answer = await ask(PATH.session, readSession, req);
+      return запомнить(await ask("POST", PATH.session, readSession, req));
+    },
+    async createScope(req) {
+      return запомнить(await ask("POST", PATH.scope, readSession, req));
+    },
+    async leave() {
+      const answer = await ask("DELETE", PATH.session, readLeaving);
+      // Метку роняем ТОЛЬКО на состоявшемся выходе. Выход отказал — времянки контроллера не
+      // сняты, сессия жива, и забытая здесь метка сделала бы её недостижимой: человек видел
+      // бы экран входа, а следующий вошедший — чужие территории.
       if (answer.kind === "ok") {
-        token = answer.value.token;
+        token = "";
       }
       return answer;
     },
-    me: () => ask(PATH.me, readIdentity),
-    resources: () => ask(PATH.resources, readResources),
+    me: () => ask("GET", PATH.me, readIdentity),
+    resources: () => ask("GET", PATH.resources, readResources),
     // Список приезжает ТЕМ ЖЕ ответом — второй раз не спрашиваем: главное, ради чего человек
     // жал кнопку, — увидеть, что источников стало два (`WORLD2-80`), и лишний запрос между
     // действием и этим видом добавляет только ещё одну возможность не ответить.
-    addResource: (req) => ask(PATH.resources, readAddedResource, req),
-    fields: () => ask(PATH.fields, readFields),
-    addField: (name) => ask(PATH.fields, readAddedField, { name }),
+    addResource: (req) => ask("POST", PATH.resources, readAddedResource, req),
+    fields: () => ask("GET", PATH.fields, readFields),
+    addField: (name) => ask("POST", PATH.fields, readAddedField, { name }),
   };
 }
 
@@ -225,6 +303,7 @@ export function liveControl(doFetch: Fetcher = browserFetch, logf: Logf = browse
  */
 async function call<T>(
   doFetch: Fetcher,
+  method: Method,
   path: string,
   token: string,
   read: (parsed: unknown, path: string) => Answer<T>,
@@ -235,13 +314,13 @@ async function call<T>(
   const итог = (answer: Answer<T>, http: number | string): Answer<T> => {
     const код = answer.kind === "refusal" ? answer.refusal.code : "-";
     logf(
-      `пульт: ${body === undefined ? "GET" : "POST"} ${path} http=${http} ` +
+      `пульт: ${method} ${path} http=${http} ` +
         `refusal=${код} dur=${(сейчас() - начало).toFixed(1)}ms`,
     );
     return answer;
   };
 
-  const init: RequestInit = { method: body === undefined ? "GET" : "POST" };
+  const init: RequestInit = { method };
   const headers: Record<string, string> = {};
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -317,7 +396,7 @@ async function call<T>(
 // ПОЛЕ ЕСТЬ И ПУСТО — ЭТО НЕ «ПОЛЯ НЕТ» (`WORLD2` 3.4, задача `WORLD2-135`). Пустое законно
 // везде в мире, и мерка у каждого поля своя:
 //
-//	`typeof … === "string"` — пустая строка ЗАКОННОЕ ЗНАЧЕНИЕ (бренд, адрес «здесь»);
+//	`typeof … === "string"` — пустая строка ЗАКОННОЕ ЗНАЧЕНИЕ (бренд);
 //	`isFilled`              — пустой строки у поля не бывает, и пустая значит поломку.
 //
 // Мерка выбирается не на вкус: она берётся оттуда, где поле рождается. Требование непустоты,
@@ -340,7 +419,7 @@ function readSession(parsed: unknown, path: string): Answer<Session> {
   if (typeof rec.brand !== "string") return notExpected(path, "нет строки «brand»");
 
   const scope = readScope(rec.scope);
-  if (!scope) return notExpected(path, "нет объекта «scope» с полями addr, here, path");
+  if (!scope) return notExpected(path, "нет объекта «scope» с полями addr, host");
 
   return {
     kind: "ok",
@@ -364,7 +443,7 @@ function readIdentity(parsed: unknown, path: string): Answer<Identity> {
   if (typeof rec.brand !== "string") return notExpected(path, "нет строки «brand»");
 
   const scope = readScope(rec.scope);
-  if (!scope) return notExpected(path, "нет объекта «scope» с полями addr, here, path");
+  if (!scope) return notExpected(path, "нет объекта «scope» с полями addr, host");
 
   return {
     kind: "ok",
@@ -378,12 +457,31 @@ function readIdentity(parsed: unknown, path: string): Answer<Identity> {
   };
 }
 
-/** Адрес и путь скоупа — ЛЮБЫЕ строки: непустоту здесь никто не обещал, и требовать её нечем. */
+/**
+ * Адрес скоупа и машина, на которой он раздаётся, — обе строки НЕПУСТЫЕ, и мерка эта взята
+ * оттуда, где поля рождаются: адрес называет человек, и без него контроллер отказывает
+ * (`no-address`), а машину он вынимает из этого же адреса и отказывает, если её там нет
+ * (`bad-address`). Пустым здесь ни то ни другое не приезжает.
+ */
 function readScope(raw: unknown): ScopeView | null {
   const rec = asRecord(raw);
   if (!rec) return null;
-  if (typeof rec.addr !== "string" || typeof rec.path !== "string") return null;
-  return { addr: rec.addr, here: rec.here === true, path: rec.path };
+  if (!isFilled(rec.addr) || !isFilled(rec.host)) return null;
+  return { addr: rec.addr as string, host: rec.host as string };
+}
+
+/**
+ * Выход состоялся. `out` спрашиваем БУЛЕВЫМ и строго: им контроллер говорит, что времянки
+ * сняты, — а не сняты они значит, что следующий вошедший увидит чужие территории. Догадка в
+ * пользу «наверное, вышли» стоила бы ровно того, ради чего ступень 2 и делалась.
+ */
+function readLeaving(parsed: unknown, path: string): Answer<Leaving> {
+  const rec = asRecord(parsed);
+  if (!rec) return notExpected(path, "это не объект");
+  if (rec.out !== true) return notExpected(path, "нет «out»: контроллер не сказал, что вышли");
+  // `note` говорит вслух, чего выход НЕ тронул: скоуп лежит там, где лежал. Проглотить эту
+  // строку значило бы оставить человека гадать, не стёрлась ли вместе с сессией личность.
+  return { kind: "ok", value: { note: typeof rec.note === "string" ? rec.note : "" } };
 }
 
 function readResources(parsed: unknown, path: string): Answer<Resource[]> {
@@ -422,20 +520,21 @@ function readResourceList(raw: unknown, path: string): Answer<Resource[]> {
 function readOneResource(raw: unknown): Resource | null {
   const rec = asRecord(raw);
   if (!rec) return null;
-  // Имя ресурса называет человек, и пустым оно не бывает: сосед отсекает его правилом имени
-  // (`bad-name`), а имя «здесь» занято контроллером.
+  // Имя участка называет ЮЗЕР, и пустым оно не бывает: сосед отсекает его правилом имени
+  // (`bad-name`), а занятое — отказом механики (`name-taken`).
   if (!isFilled(rec.name)) return null;
-  // `addr` у ресурса контроллера пуст ЗАКОННО, а `reach` — это измеренный ответ самого
-  // ресурса, и без него строка списка врала бы молчанием. Поэтому проверки у них разные.
-  if (typeof rec.addr !== "string" || !isFilled(rec.reach)) return null;
+  // Адрес участка тоже НЕПУСТОЙ — и это сменилось вместе со ступенью 2 (`WORLD2-132`): пустым
+  // он бывал у ресурса «здесь», машины контроллера, а её в списке больше нет. Список — это
+  // территории юзера из его скоупа, и каждую он завёл по адресу, который назвал сам.
+  // `reach` — измеренный ответ самого ресурса, и без него строка списка врала бы молчанием.
+  if (!isFilled(rec.addr) || !isFilled(rec.reach)) return null;
 
   const things = readThings(rec.things);
   if (things === НЕ_ТА_ФОРМА) return null;
 
   return {
     name: rec.name as string,
-    addr: rec.addr,
-    here: rec.here === true,
+    addr: rec.addr as string,
     reach: rec.reach as string,
     things,
   };
@@ -522,10 +621,17 @@ function readFieldList(raw: unknown, path: string): Answer<Field[]> {
 function readOneField(raw: unknown): Field | null {
   const rec = asRecord(raw);
   if (!rec) return null;
-  // Поле заводится ПО ИМЕНИ, безымянного контроллер не заводит (отказ `no-name`). А `created`
-  // — дата, и её отсутствие законно: без даты поле показать можно, соврать датой нельзя.
+  // Поле заводится ПО ИМЕНИ, безымянного контроллер не заводит (отказ `no-name`).
   if (!isFilled(rec.name)) return null;
-  return { name: rec.name as string, created: typeof rec.created === "string" ? rec.created : "" };
+  // Адреса и состояния у ЗАВЕДЁННОГО поля нет вовсе: ответ на заведение приезжает одним
+  // именем, а в списке те же поля лежат пустыми, пока поле никуда не поднято. Требовать их
+  // здесь значило бы отказать на правильном ответе мира — той же ошибкой, что стоила входа
+  // всякому новому юзеру (`WORLD2-135`).
+  return {
+    name: rec.name as string,
+    addr: typeof rec.addr === "string" ? rec.addr : "",
+    state: typeof rec.state === "string" ? rec.state : "",
+  };
 }
 
 /** Отказ, названный контроллером: `{"code":…,"why":…,"ways":[…]}`. Не та форма — не наш случай. */
@@ -569,7 +675,7 @@ function notExpected<T>(path: string, why: string): Answer<T> {
   return refuse(
     "answer-not-expected",
     `ответ по ${path} не той формы, которую держит контракт: ${why}`,
-    "форма ответов — в control/README.md (таблица ручек из WORLD2-102)",
+    "форма ответов — в control/README.md (разделы «Вход», «Завести скоуп», «Территории»)",
     "разошлась форма — это вопрос к зоне control: пульт её не додумывает и не подстраивается молча",
   );
 }
