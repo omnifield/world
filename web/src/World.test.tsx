@@ -52,7 +52,7 @@ type Ответы = {
   me?: Answer<Identity>;
   resources?: Answer<Resource[]>;
   fields?: Answer<Field[]>;
-  addResource?: Answer<{ added: Resource; resources: Resource[] }>;
+  addResource?: Answer<{ added: Resource; resources: Resource[]; note: string }>;
   addField?: Answer<{ added: Field; fields: Field[]; note: string }>;
   leave?: Answer<Leaving>;
 };
@@ -81,7 +81,7 @@ function контроллер(ответы: Ответы) {
     },
     async addResource(req) {
       звонки.push({ ручка: "addResource", чем: req });
-      return ответы.addResource ?? ok({ added: МОЛЧУН, resources: [УЧАСТОК, МОЛЧУН] });
+      return ответы.addResource ?? ok({ added: МОЛЧУН, resources: [УЧАСТОК, МОЛЧУН], note: "" });
     },
     async fields() {
       звонки.push({ ручка: "fields", чем: undefined });
@@ -340,12 +340,19 @@ describe("источники ресурса", () => {
 
     ввести(корень, "Имя", "home");
     ввести(корень, "Адрес", "world@10.8.0.6");
-    ввести(корень, "Креды", "ключ целиком");
+    ввести(корень, "Приватный ключ", "ключ целиком");
     нажать(корень, "Добавить ресурс");
     await осесть();
 
     expect(звонки.filter((з) => з.ручка === "addResource")).toEqual([
-      { ручка: "addResource", чем: { name: "home", addr: "world@10.8.0.6", creds: "ключ целиком" } },
+      {
+        ручка: "addResource",
+        чем: {
+          name: "home",
+          addr: "world@10.8.0.6",
+          creds: { kind: "key", value: "ключ целиком" },
+        },
+      },
     ]);
   });
 
@@ -354,7 +361,7 @@ describe("источники ресурса", () => {
 
     ввести(корень, "Имя", "home");
     ввести(корень, "Адрес", "world@10.8.0.6");
-    ввести(корень, "Креды", "ключ целиком");
+    ввести(корень, "Приватный ключ", "ключ целиком");
     нажать(корень, "Добавить ресурс");
     await осесть();
 
@@ -362,6 +369,65 @@ describe("источники ресурса", () => {
     expect(корень.querySelector(`[data-resource='${МОЛЧУН.name}']`)).not.toBeNull();
     // Список берётся из ответа на добавление — второй раз контроллер не спрашивается.
     expect(звонки.filter((з) => з.ручка === "resources")).toHaveLength(1);
+  });
+
+  it("креды двух видов, и вид называет человек — не пульт по виду строки", async () => {
+    // `WORLD2-141`: два вида, как в PuTTY. Угаданный вид однажды примет ключ за пароль, и
+    // разбираться человек будет с отказом ssh, а не с нашей догадкой.
+    const { корень, звонки } = await показать({ resources: ok([УЧАСТОК]) });
+
+    ввести(корень, "Имя", "home");
+    ввести(корень, "Адрес", "world@10.8.0.6");
+    нажать(корень, "Пароль машины");
+    ввести(корень, "Пароль машины", "пароль рута");
+    нажать(корень, "Добавить ресурс");
+    await осесть();
+
+    expect(звонки.filter((з) => з.ручка === "addResource")).toEqual([
+      {
+        ручка: "addResource",
+        чем: {
+          name: "home",
+          addr: "world@10.8.0.6",
+          creds: { kind: "password", value: "пароль рута" },
+        },
+      },
+    ]);
+  });
+
+  it("ЦЕНА пути с паролем названа ДО кнопки, а не после", async () => {
+    // `WORLD2-142`, решение user. Путь с паролем пишет в ЧУЖУЮ машину строку в её
+    // `~/.ssh/authorized_keys`. Узнать об этом после — значит узнать поздно.
+    const { корень } = await показать({ resources: ok([УЧАСТОК]) });
+    const форма = корень.querySelector<HTMLElement>("[data-block='resources'] .pult__form")!;
+
+    expect(форма.querySelector("[data-price]")).toBeNull();
+    нажать(корень, "Пароль машины");
+
+    const цена = форма.querySelector<HTMLElement>("[data-price='password']")!;
+    expect(цена).not.toBeNull();
+    // Ни одной кнопки действия ПЕРЕД ценой: человек читает её раньше, чем доберётся до кнопки.
+    const узлы = [...форма.querySelectorAll("[data-price], button[type='submit']")];
+    expect(узлы[0]).toBe(цена);
+  });
+
+  it("что изменено на ЧУЖОЙ машине — сказано словами контроллера, дословно", async () => {
+    const цена =
+      "на машину world@10.8.0.6 положен публичный ключ юзера (одна строка в её " +
+      "~/.ssh/authorized_keys, подпись world-control)";
+    const { корень } = await показать({
+      resources: ok([УЧАСТОК]),
+      addResource: ok({ added: МОЛЧУН, resources: [УЧАСТОК, МОЛЧУН], note: цена }),
+    });
+
+    ввести(корень, "Имя", "home");
+    ввести(корень, "Адрес", "world@10.8.0.6");
+    нажать(корень, "Пароль машины");
+    ввести(корень, "Пароль машины", "пароль рута");
+    нажать(корень, "Добавить ресурс");
+    await осесть();
+
+    expect(корень.querySelector("[data-note='machine']")?.textContent).toBe(цена);
   });
 
   it("занятое имя участка — отказ рядом с формой, а не молчаливая перезапись", async () => {
@@ -383,7 +449,7 @@ describe("источники ресурса", () => {
 
     ввести(корень, "Имя", УЧАСТОК.name);
     ввести(корень, "Адрес", "world@10.8.0.9");
-    ввести(корень, "Креды", "ключ");
+    ввести(корень, "Приватный ключ", "ключ");
     нажать(корень, "Добавить ресурс");
     const блок = await дождаться(
       () => корень.querySelector<HTMLElement>("[data-refusal='name-taken']"),
@@ -411,7 +477,7 @@ describe("источники ресурса", () => {
 
     ввести(корень, "Имя", "home");
     ввести(корень, "Адрес", "world@10.8.0.6");
-    ввести(корень, "Креды", "ключ");
+    ввести(корень, "Приватный ключ", "ключ");
     нажать(корень, "Добавить ресурс");
     const блок = await дождаться(
       () => корень.querySelector<HTMLElement>("[data-refusal='no-docker']"),

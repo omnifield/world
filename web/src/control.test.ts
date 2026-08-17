@@ -87,12 +87,29 @@ const ВЫХОД = {
   note: "вышли: контексты докера, ключи и блоки в config сняты. Скоуп не тронут",
 };
 
+/**
+ * Креды к машине — ДВА ВИДА, и вид называется явно (`WORLD2-141`). Плоской строкой они
+ * больше не бывают: контроллер такую не принимает вовсе.
+ */
+const КЛЮЧ = { kind: "key", value: "ключ целиком" } as const;
+const ПАРОЛЬ_МАШИНЫ = { kind: "password", value: "пароль машины" } as const;
+
+/**
+ * Цена, названная контроллером ПОСЛЕ записи: он изменил чужую машину. Приезжает только на
+ * пути с паролем — заведение по ключу не меняет на той стороне ничего.
+ */
+const ЦЕНА =
+  "на машину world@10.8.0.5 положен публичный ключ юзера (одна строка в её " +
+  "~/.ssh/authorized_keys, подпись world-control) — пароль дальше не нужен и нигде не сохранён";
+
 describe("вход — адрес и пароль, и больше ничего", () => {
   it("отдаёт личность и скоуп в том виде, в каком их назвал контроллер", async () => {
     const { fetch, записи } = отвечает([{ body: JSON.stringify(ВХОД) }]);
     const answer = await liveControl(fetch).enter({ addr: АДРЕС, password: ПАРОЛЬ });
 
-    expect(answer).toEqual({ kind: "ok", value: { ...ВХОД, since: "" } });
+    // `since` и `note` пульт ставит пустыми: первого у ответа входа не бывает вовсе, второе
+    // приезжает только тогда, когда контроллер и правда изменил чужую машину.
+    expect(answer).toEqual({ kind: "ok", value: { ...ВХОД, since: "", note: "" } });
     expect(записи[0]?.path).toBe(PATH.session);
     expect(записи[0]?.method).toBe("POST");
   });
@@ -134,7 +151,7 @@ describe("завести скоуп — там, где он будет лежа�
     const answer = await liveControl(fetch).createScope({
       scope: { addr: АДРЕС, password: ПАРОЛЬ },
       identity: { name: "егор", brand: "омнифилд" },
-      machine: { name: "vps", addr: "world@10.8.0.5", creds: "ключ целиком" },
+      machine: { name: "vps", addr: "world@10.8.0.5", creds: КЛЮЧ },
     });
 
     expect(записи[0]?.path).toBe(PATH.scope);
@@ -151,13 +168,13 @@ describe("завести скоуп — там, где он будет лежа�
     await liveControl(fetch).createScope({
       scope: { addr: АДРЕС, password: ПАРОЛЬ },
       identity: { name: "егор", brand: "омнифилд" },
-      machine: { name: "vps", addr: "world@10.8.0.5", creds: "ключ целиком" },
+      machine: { name: "vps", addr: "world@10.8.0.5", creds: КЛЮЧ },
     });
 
     expect(записи[0]?.body).toEqual({
       scope: { addr: АДРЕС, password: ПАРОЛЬ },
       identity: { name: "егор", brand: "омнифилд" },
-      machine: { name: "vps", addr: "world@10.8.0.5", creds: "ключ целиком" },
+      machine: { name: "vps", addr: "world@10.8.0.5", creds: КЛЮЧ },
     });
   });
 
@@ -257,6 +274,68 @@ describe("выход — ручка, а не забытая метка", () => {
   });
 });
 
+describe("креды к машине — вид называется явно, и цена доезжает словами", () => {
+  it("вид уезжает ОБЪЕКТОМ, а не плоской строкой", async () => {
+    // `WORLD2-141`: угадывать вид по виду строки нельзя — угаданный однажды примет ключ за
+    // пароль, и разбираться человек будет с отказом ssh, а не с нашей догадкой. Плоскую
+    // строку контроллер не принимает вовсе.
+    const { fetch, записи } = отвечает([
+      { body: JSON.stringify({ resource: УЧАСТОК, resources: [УЧАСТОК] }), status: 201 },
+    ]);
+    await liveControl(fetch).addResource({
+      name: "vps",
+      addr: "world@10.8.0.5",
+      creds: ПАРОЛЬ_МАШИНЫ,
+    });
+
+    expect((записи[0]?.body as { creds: unknown }).creds).toEqual({
+      kind: "password",
+      value: "пароль машины",
+    });
+  });
+
+  it("цена, названная контроллером, доезжает до человека дословно — и при заведении тоже", async () => {
+    // Контроллер изменил ЧУЖУЮ машину и говорит об этом словами. Проглотить их значило бы
+    // смолчать о том, что мир тронул машину юзера.
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resource: УЧАСТОК, resources: [УЧАСТОК], note: ЦЕНА }), status: 201 },
+    ]);
+    const добавили = await liveControl(fetch).addResource({
+      name: "vps",
+      addr: "world@10.8.0.5",
+      creds: ПАРОЛЬ_МАШИНЫ,
+    });
+
+    const { fetch: fetch2 } = отвечает([
+      { body: JSON.stringify({ ...ВХОД, created: true, note: ЦЕНА }), status: 201 },
+    ]);
+    const завели = await liveControl(fetch2).createScope({
+      scope: { addr: АДРЕС, password: ПАРОЛЬ },
+      identity: { name: "егор", brand: "" },
+      machine: { name: "vps", addr: "world@10.8.0.5", creds: ПАРОЛЬ_МАШИНЫ },
+    });
+
+    expect(добавили.kind === "ok" && добавили.value.note).toBe(ЦЕНА);
+    expect(завели.kind === "ok" && завели.value.note).toBe(ЦЕНА);
+  });
+
+  it("цены НЕТ — это не поломка формы: путь по ключу чужую машину не трогает", async () => {
+    // `note` приезжает только тогда, когда есть что сказать. Требовать его всегда значило бы
+    // отказать на правильном ответе мира — той же ошибкой, что стоила входа новичкам.
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resource: УЧАСТОК, resources: [УЧАСТОК] }), status: 201 },
+    ]);
+    const answer = await liveControl(fetch).addResource({
+      name: "vps",
+      addr: "world@10.8.0.5",
+      creds: КЛЮЧ,
+    });
+
+    expect(answer.kind).toBe("ok");
+    expect(answer.kind === "ok" && answer.value.note).toBe("");
+  });
+});
+
 describe("свежесозданный скоуп — первое, что видит новый юзер", () => {
   // `WORLD2-135`: пульт требовал непустой бренд и не пускал в мир НИКОГО, кто входит впервые.
   // Ни одна из проб зоны этого не поймала, и сверка с образцом контракта не поймала бы тоже:
@@ -348,7 +427,7 @@ describe("отказ приходит целиком", () => {
     const answer = await liveControl(fetch).addResource({
       name: "vps",
       addr: "world@10.8.0.5",
-      creds: "ключ",
+      creds: КЛЮЧ,
     });
 
     expect(answer.kind === "refusal" && answer.refusal.code).toBe("no-docker");
@@ -599,13 +678,13 @@ describe("добавление", () => {
     const answer = await liveControl(fetch).addResource({
       name: "home",
       addr: "world@10.8.0.6",
-      creds: "ключ",
+      creds: КЛЮЧ,
     });
 
     expect(answer.kind === "ok" && answer.value.resources).toEqual([УЧАСТОК, МОЛЧУН]);
     expect(answer.kind === "ok" && answer.value.added).toEqual(МОЛЧУН);
     expect(записи).toHaveLength(1);
-    expect(записи[0]?.body).toEqual({ name: "home", addr: "world@10.8.0.6", creds: "ключ" });
+    expect(записи[0]?.body).toEqual({ name: "home", addr: "world@10.8.0.6", creds: КЛЮЧ });
   });
 
   it("слова контроллера о том, что поле НЕ поднято, доезжают до пульта", async () => {

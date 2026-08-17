@@ -101,8 +101,14 @@ export type Identity = {
   since: string;
 };
 
-/** Вход состоялся. `created` — скоуп завели прямо сейчас, а не нашли по адресу. */
-export type Session = Identity & { created: boolean; token: string };
+/**
+ * Вход состоялся. `created` — скоуп завели прямо сейчас, а не нашли по адресу.
+ *
+ * `note` — ЦЕНА, названная контроллером: он изменил чужую машину. Приезжает только на пути с
+ * паролем (`WORLD2-141`) и только после того, как запись состоялась; пустая строка значит,
+ * что менять было нечего. Пульт её не сокращает и не пересказывает.
+ */
+export type Session = Identity & { created: boolean; token: string; note: string };
 
 /**
  * Выход состоялся. Своего состояния он не трогает: скоуп лежит там, где лежал, и открывается
@@ -190,15 +196,35 @@ export type EnterRequest = { addr: string; password: string };
 export type CreateScopeRequest = {
   scope: { addr: string; password: string };
   identity: { name: string; brand: string };
-  machine?: { name: string; addr: string; creds: string };
+  machine?: { name: string; addr: string; creds: Creds };
 };
+
+/**
+ * Вид кред к машине. Называется ЯВНО и юзером (`WORLD2-141`, решение user): два вида, как в
+ * PuTTY, — свой ключ либо пароль машины.
+ *
+ * Угадывать вид по виду строки нельзя, и не только контроллеру: угаданный однажды примет
+ * ключ за пароль, и разбираться человек будет с отказом ssh, а не с нашей догадкой. Не
+ * назван — контроллер отказывает `no-creds-kind`, назван неизвестный — `bad-creds-kind`.
+ */
+export type CredsKind = "key" | "password";
+
+/**
+ * Креды к машине: вид и значение.
+ *
+ * **У двух видов разная цена, и она не в наших словах, а в том, что произойдёт.** `key` не
+ * меняет на машине юзера ничего. `password` — заход паролем ОДИН раз и **строка в чужом
+ * `~/.ssh/authorized_keys`**; сам пароль дальше не участвует ни в чём и нигде не сохраняется.
+ * Сказать об этом ДО кнопки — работа лица, потому что жмут её здесь (`WORLD2` 2.3, 0.1).
+ */
+export type Creds = { kind: CredsKind; value: string };
 
 /**
  * Чем заводят территорию: ТРИ вещи, а не две (`WORLD2` 2.5 п. 11) — имя участка, адрес
  * машины и креды к ней. Имя не выводится из адреса и не подставляется молча: на нём стоит
  * адрес локации. Креды обязательны — без них контроллер отказывает (`no-creds`).
  */
-export type AddResourceRequest = { name: string; addr: string; creds: string };
+export type AddResourceRequest = { name: string; addr: string; creds: Creds };
 
 /**
  * Всё, что пульт умеет спросить у мира. Интерфейсом, а не набором функций, ради одного:
@@ -211,7 +237,9 @@ export type Control = {
   leave(): Promise<Answer<Leaving>>;
   me(): Promise<Answer<Identity>>;
   resources(): Promise<Answer<Resource[]>>;
-  addResource(req: AddResourceRequest): Promise<Answer<{ added: Resource; resources: Resource[] }>>;
+  addResource(
+    req: AddResourceRequest,
+  ): Promise<Answer<{ added: Resource; resources: Resource[]; note: string }>>;
   fields(): Promise<Answer<Field[]>>;
   addField(name: string): Promise<Answer<{ added: Field; fields: Field[]; note: string }>>;
 };
@@ -430,6 +458,9 @@ function readSession(parsed: unknown, path: string): Answer<Session> {
       since: "",
       created: rec.created === true,
       token: rec.token as string,
+      // `note` есть только тогда, когда контроллер и правда изменил чужую машину: заведение
+      // по ключу не меняет на ней ничего, и цены у него нет. Отсутствие — не поломка формы.
+      note: typeof rec.note === "string" ? rec.note : "",
     },
   };
 }
@@ -493,7 +524,7 @@ function readResources(parsed: unknown, path: string): Answer<Resource[]> {
 function readAddedResource(
   parsed: unknown,
   path: string,
-): Answer<{ added: Resource; resources: Resource[] }> {
+): Answer<{ added: Resource; resources: Resource[]; note: string }> {
   const rec = asRecord(parsed);
   if (!rec) return notExpected(path, "это не объект");
 
@@ -503,7 +534,12 @@ function readAddedResource(
   const list = readResourceList(rec.resources, path);
   if (list.kind === "refusal") return list;
 
-  return { kind: "ok", value: { added, resources: list.value } };
+  // `note` — что изменено на ЧУЖОЙ машине (`WORLD2-141`). Приезжает только на пути с паролем;
+  // проглотить эту строку значило бы смолчать о том, что мир тронул машину юзера.
+  return {
+    kind: "ok",
+    value: { added, resources: list.value, note: typeof rec.note === "string" ? rec.note : "" },
+  };
 }
 
 function readResourceList(raw: unknown, path: string): Answer<Resource[]> {

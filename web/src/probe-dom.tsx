@@ -63,14 +63,33 @@ export function ввести(корень: HTMLElement, подпись: string, 
   поле.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-/** Нажатие по надписи на кнопке. */
+/**
+ * Нажатие по надписи на кнопке — ВКЛАДКИ при этом пропускаются.
+ *
+ * На экране входа надпись «Войти» стоит дважды: на вкладке и на кнопке формы (`WORLD2-142`).
+ * Это не небрежность — так и должно быть у человека: дверь и действие за ней называются
+ * одинаково. А проба обязана различать их, иначе она жала бы вкладку, думая, что отправляет
+ * форму. Вкладку жмут своим помощником — `открыть`.
+ */
 export function нажать(корень: HTMLElement, надпись: string): void {
-  const кнопка = [...корень.querySelectorAll("button")].find((b) =>
-    b.textContent?.trim().includes(надпись),
+  const кнопка = [...корень.querySelectorAll("button")].find(
+    (b) => b.getAttribute("role") !== "tab" && b.textContent?.trim().includes(надпись),
   );
   if (!кнопка) {
     const есть = [...корень.querySelectorAll("button")].map((b) => b.textContent?.trim());
     throw new Error(`нет кнопки «${надпись}»; на экране: ${JSON.stringify(есть)}`);
   }
   кнопка.click();
+}
+
+/** Открыть вкладку по надписи — так же, как её открывает человек и скринридер (`role=tab`). */
+export function открыть(корень: HTMLElement, надпись: string): void {
+  const вкладка = [...корень.querySelectorAll<HTMLElement>('[role="tab"]')].find(
+    (t) => t.textContent?.trim() === надпись,
+  );
+  if (!вкладка) {
+    const есть = [...корень.querySelectorAll('[role="tab"]')].map((t) => t.textContent?.trim());
+    throw new Error(`нет вкладки «${надпись}»; на экране: ${JSON.stringify(есть)}`);
+  }
+  вкладка.click();
 }

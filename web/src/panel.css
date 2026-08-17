@@ -210,6 +210,48 @@
   gap: 0.5rem;
 }
 
+/* Две двери — вход и заведение. Выбор виден ДО заполнения (`WORLD2-142`): пряталась вторая
+   строкой внизу — человек находил не её, а отказ. Выбранная дверь помечена каймой снизу, а
+   не заливкой: это выбор, а не действие. */
+.pult__doors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.pult__doors [role="tab"][aria-selected="true"] {
+  border-color: var(--foreground);
+  color: var(--foreground);
+}
+
+/* Креды: вид называет человек, и выбранный вид видно по кнопке. */
+.pult__creds {
+  display: grid;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.pult__creds [aria-pressed="true"] {
+  border-color: var(--foreground);
+  color: var(--foreground);
+}
+
+.pult__label {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+
+/* ЦЕНА, названная ДО кнопки: мир сейчас изменит чужую машину. Не краснота — это не поломка,
+   а честная цена; но и не серая подпись — её читают, а не проглядывают. */
+.pult__price {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 2px solid var(--foreground);
+  font-size: 0.875rem;
+}
+
 /* Слова контроллера о том, чего НЕ произошло. Не отказ — поэтому не каймой отказа. */
 .pult__note {
   margin: 0;
