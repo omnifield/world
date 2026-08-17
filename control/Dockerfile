@@ -38,6 +38,15 @@ COPY --from=build /out/control /usr/local/bin/control
 COPY deploy/remote.sh /opt/world/deploy/remote.sh
 COPY deploy/compose.yaml /opt/world/deploy/compose.yaml
 
+# РЕЦЕПТ РАЗДАЧИ СКОУПА — тем же порядком и по той же причине. Завести скоуп значит поднять
+# раздачу на машине, которую назвал юзер (`WORLD2` 3.4), а поднимается она рецептом, как
+# любая вещь мира. Рецепт — файл зоны `share`, и приезжает он КОПИЕЙ (`WORLD2` 1.5): правит
+# его владелец той зоны, к нам он попадает вместе с новой сборкой образа.
+#
+# Образ самой раздачи здесь НЕ лежит: его везёт на ту машину подъём — копией отсюда либо
+# из реестра. Чего именно не хватает, скажет отказ соседа, и он назовёт имя образа сам.
+COPY share/compose.yaml /opt/world/share/compose.yaml
+
 # ── каталог рецептов ─────────────────────────────────────────────────────────
 # ЧТО ПОДНИМАЕТСЯ НА РЕСУРСЕ — ГОВОРИТ РЕЦЕПТ, А НЕ КОНТРОЛЛЕР (`WORLD2` 3.7, `WORLD2-131`).
 # Каталог едет ПУСТЫМ, и это не забывчивость: перечня вещей у мира нет, а дверь лежит рядом
@@ -73,6 +82,7 @@ RUN test -s /opt/world/pult/index.html || { \
 ENV CONTROL_ADDR=":8090" \
     CONTROL_REMOTE_SH="/opt/world/deploy/remote.sh" \
     CONTROL_RECIPES="/opt/world/recipes" \
+    CONTROL_SHARE_RECIPE="/opt/world/share/compose.yaml" \
     CONTROL_KEYS="/root/.ssh" \
     CONTROL_PULT="/opt/world/pult" \
     CONTROL_DOCKER="docker"
@@ -94,10 +104,14 @@ ENV CONTROL_ADDR=":8090" \
 COPY control/control-entry.sh /usr/local/bin/control-entry.sh
 COPY control/knock.sh /usr/local/bin/control-knock.sh
 
-# Связка ключей и контексты докера — это СОСТОЯНИЕ контроллера, и оба лежат в томах
-# (`control/compose.yaml`). Каталоги заводятся здесь с правами, которые примет ssh: ключ в
-# каталоге, открытом всем, ssh молча не возьмёт и скажет про формат.
-RUN mkdir -p /root/.ssh /root/.docker /scope && chmod 700 /root/.ssh
+# Связка ключей и контексты докера — ВРЕМЯНКИ контроллера (`WORLD2` 1.9): они раскладываются
+# из скоупа при входе и снимаются при выходе. Каталоги заводятся здесь с правами, которые
+# примет ssh: ключ в каталоге, открытом всем, ssh молча не возьмёт и скажет про формат.
+#
+# Каталога под скоупы здесь НЕТ и не будет: личность юзера лежит там, где он её положил, и
+# контроллер до неё дотягивается. Пока она лежала здесь, снос контроллера означал потерю
+# себя (`WORLD2-124`, найдено живым прогоном).
+RUN mkdir -p /root/.ssh /root/.docker && chmod 700 /root/.ssh
 
 EXPOSE 8090
 

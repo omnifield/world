@@ -1,4 +1,16 @@
-// Пакет resource — источники ресурса: машины, до которых юзер дотянулся.
+// Пакет resource — источники ресурса: территории юзера, до которых он дотянулся.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ТЕРРИТОРИИ ЖИВУТ В СКОУПЕ, А НЕ ЗДЕСЬ (`WORLD2` 3.4 п. 2, `1.9`, `WORLD2-124`).      │
+// │                                                                                      │
+// │ Раньше списком ресурсов были контексты докера на машине контроллера — то есть         │
+// │ состояние МАШИНЫ: зашёл под другой личностью и видел чужое. Теперь список — это       │
+// │ раздел `территории` скоупа, а контексты докера, ключи в связке и блоки в `config`     │
+// │ стали ПРОИЗВОДНЫМИ: поднялись из скоупа при входе, ушли при выходе.                   │
+// │                                                                                      │
+// │ Отсюда главное свойство зоны: контроллер ПУСТ. Снёс и поднял на другой машине —       │
+// │ вошёл по тому же адресу, и всё на месте (`1.9`: контроллеру положено быть времянкой). │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
 // │ ЭТОТ ПАКЕТ НЕ ПОДНИМАЕТ ВЕЩЬ. Подъём вещи на названном ресурсе уже написан и лежит   │
@@ -7,32 +19,13 @@
 // │ человек получил бы две двери, которые ставятся по-разному.                            │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
-// ┌─────────────────────────────────────────────────────────────────────────────────────┐
-// │ РЕСУРС — ЭТО МАШИНА, А НЕ «МАШИНА С ДВЕРЬЮ» (`WORLD2` 3.7, `WORLD2-131`).            │
-// │                                                                                      │
-// │ Что на ней стоит — отдельный вопрос и отдельный ответ: СПИСОК поднятых вещей, а не    │
-// │ одно поле про дверь. Пока здесь жило `Door string`, зона знала ровно одну вещь мира,  │
-// │ и вторая потребовала бы правки кода — значит вещь была зашита, а не описана.          │
-// │                                                                                      │
-// │ Имён контейнеров, образов и портов у зоны поэтому нет вовсе: они принадлежат рецепту, │
-// │ и знать их контроллеру неоткуда. Чем поднимать — говорит рецепт (`internal/recipe`).  │
-// └─────────────────────────────────────────────────────────────────────────────────────┘
+// РЕСУРС — ЭТО МАШИНА, А НЕ «МАШИНА С ДВЕРЬЮ» (`WORLD2` 3.7, `WORLD2-131`). Что на ней
+// стоит — отдельный вопрос и отдельное поле: СПИСОК вещей. Имён контейнеров, образов и
+// портов у зоны нет вовсе: они принадлежат рецепту, и знать их контроллеру неоткуда.
 //
-// Своего реестра ресурсов зона тоже НЕ заводит. Список — это контексты докера, ровно те
-// же, что читает `deploy/remote.sh list`: один источник истины, а не два списка одного и
-// того же (довод целиком — в шапке `deploy/remote.sh`). Мы читаем ту же истину, а не
-// копируем её к себе. Список ВЕЩЕЙ на ресурсе читается там же, где его читает сосед, — по
-// метке проекта, которую компоуз ставит на всё, что заводит сам.
-//
-// Что здесь ЕСТЬ своего и чего нет у соседа:
-//
-//   - креды. `docker context` поля для ключа не имеет вовсе, а юзер называет ключ, когда
-//     добавляет ресурс. Контроллер кладёт ключ в свою связку и приписывает его к машине в
-//     `~/.ssh/config` — то самое место, откуда ssh (а значит и докер) его берёт;
-//   - состояние одной строкой на весь список: пульту нужен список с состоянием, а не
-//     четырнадцать строк вывода `status` на каждый ресурс;
-//   - ресурс «здесь» — тот, на котором стоит сам контроллер. У соседа его нет и быть не
-//     может: он ведёт список ЧУЖИХ ресурсов, а свой контроллер знает про себя сам.
+// У ТЕРРИТОРИИ ЕСТЬ ИМЯ, И ЕГО ДАЁТ ЮЗЕР (`2.5` п. 11). Мир его не выдумывает и из адреса
+// машины не выводит; неповторимость имени в скоупе стережёт контроллер (`internal/state`),
+// потому что раздача файл не разбирает вовсе.
 package resource
 
 import (
@@ -49,131 +42,85 @@ import (
 	"github.com/omnifield/world/control/internal/recipe"
 	"github.com/omnifield/world/control/internal/refusal"
 	"github.com/omnifield/world/control/internal/run"
+	"github.com/omnifield/world/control/internal/state"
 )
 
 const (
 	// ContextPrefix — приставка имени контекста докера (`PREFIX` в deploy/remote.sh).
 	// Значение ПРИНАДЛЕЖИТ зоне `deploy` и здесь повторено: по нему мы узнаём свои
 	// контексты среди чужих. Повтор — это шов, и он стережётся пробой (`probe-control.sh`
-	// читает `deploy/remote.sh` и краснеет, если там стало другое). Молчаливый повтор
-	// чужой константы — то, что разъезжается тише всего.
-	//
-	// Больше повторов у зоны нет: имя контейнера, образ и порт принадлежат РЕЦЕПТУ, а не
-	// соседу и не нам (`WORLD2-131`).
+	// читает `deploy/remote.sh` и краснеет, если там стало другое).
 	ContextPrefix = "world-"
-	// HereName — имя ресурса, на котором стоит сам контроллер. Занятое имя: завести
-	// второй «здесь» нельзя, иначе список начнёт врать про то, где мы стоим.
-	HereName = "here"
 	// projectLabel — метка компоуза, по которой видно, ЧЬЁ это хозяйство. Ставит её сам
-	// компоуз на всё, что заводит (контейнеры, тома, сети), и читает её же сосед
-	// (`deploy/remote.sh`, `thing_volumes` и `status`). Это правило докера, а не наше
-	// знание о вещах: имя вещи здесь читается, а не перечисляется.
+	// компоуз на всё, что заводит, и читает её же сосед (`deploy/remote.sh`).
 	projectLabel = "com.docker.compose.project"
 )
 
-// nameRe — имя ресурса. Правило то же, что у соседа (`bad-name` в deploy/remote.sh), и
-// проверяем мы его ДО вызова не ради второй проверки, а потому что имя идёт в ИМЯ ФАЙЛА
-// ключа в нашей связке: имя с косой чертой увело бы запись из связки в чужой каталог.
+// nameRe — имя территории. Правило то же, что у соседа (`bad-name` в deploy/remote.sh):
+// имя идёт в имя контекста докера и в имя файла ключа в связке.
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
 
-// Thing — вещь, поднятая на ресурсе. Имя — имя проекта компоуза: им помечено всё, что
+// Thing — вещь, поднятая на территории. Имя — имя проекта компоуза: им помечено всё, что
 // вещь на той машине завела, и его же называет рецепт. Своего перечня вещей у зоны нет.
 type Thing struct {
 	Name string `json:"name"`
-	// State — что видно про вещь словами: «здорова», «поднимается», «нездорова»,
-	// «запущена не вся», «запущена, здоровья не спросить». Измеренное, а не выведенное:
-	// состояние, выведенное вместо измеренного, врёт ровно тогда, когда на него смотрят
-	// (`WORLD2` 4.2).
+	// State — что видно про вещь словами. Измеренное, а не выведенное: состояние,
+	// выведенное вместо измеренного, врёт ровно тогда, когда на него смотрят (`4.2`).
 	State string `json:"state"`
-	// Alive — вещь ОТВЕЧАЕТ, а не «запущена». Разные вещи: запуск подтверждает докер,
-	// ответ — HEALTHCHECK изнутри контейнера. У вещи без HEALTHCHECK-а ответ не спросить
-	// вовсе, и тогда здесь `false` — не «мертва», а «не подтверждено», и это сказано
-	// словами в `State`.
+	// Alive — вещь ОТВЕЧАЕТ, а не «запущена». У вещи без HEALTHCHECK-а ответ не спросить
+	// вовсе, и тогда здесь `false` — не «мертва», а «не подтверждено».
 	Alive bool `json:"alive"`
 }
 
-// Resource — источник ресурса глазами юзера: машина, до которой дотянулись. Ни памяти, ни
-// ядер здесь нет: ресурс в цифрах даёт отдельный инструмент осмотра, и он сознательно
-// отложен (`WORLD2` 2.5).
+// Resource — территория глазами юзера. Ни памяти, ни ядер здесь нет: ресурс в цифрах даёт
+// отдельный инструмент осмотра, и он сознательно отложен (`WORLD2` 2.5 п. 10).
 type Resource struct {
 	Name string `json:"name"`
 	Addr string `json:"addr"`
-	// Here — на этом ресурсе стоит контроллер.
-	Here bool `json:"here"`
-	// Reach — отвечает ли САМ ресурс: «отвечает» либо «молчит». Вопрос про машину, а не
+	// Reach — отвечает ли САМА машина: «отвечает» либо «молчит». Вопрос про машину, а не
 	// про вещь на ней, и ответ на него не выводится из другого поля.
 	Reach string `json:"reach"`
-	// Things — что на ресурсе поднято. `null` означает «не спросили» (ресурс молчит), а
-	// пустой список — «спросили, и там ничего нет». Разные ответы: пустой список вместо
-	// «не спросили» читался бы как знание, которого у нас нет (`WORLD2` 4.2).
+	// Things — что на территории поднято. `null` означает «не спросили» (машина молчит), а
+	// пустой список — «спросили, и там ничего нет» (`WORLD2` 4.2).
 	Things []Thing `json:"things"`
 }
 
-// Manager — работа с источниками ресурса.
+// Manager — работа с территориями юзера.
 type Manager struct {
 	Runner run.Runner
-	// RemoteSh — путь к готовому подъёму вещи. Значение, а не константа: в образе
-	// контроллера он лежит по своему пути, в девбоксе — по своему, а проба подменяет его
-	// заглушкой, чтобы проверить ПОВЕДЕНИЕ там, где докера нет.
+	// RemoteSh — путь к готовому подъёму вещи. Значение, а не константа: в образе он
+	// лежит по своему пути, в девбоксе — по своему, а проба подменяет его заглушкой.
 	RemoteSh string
-	// Recipes — где контроллер берёт рецепты. Чем поднимать вещь, знает рецепт, а какие
-	// рецепты есть — каталог; в коде их перечня нет (`internal/recipe`).
+	// Recipes — где контроллер берёт рецепты (`internal/recipe`).
 	Recipes *recipe.Catalog
 	// Docker — имя докер-клиента. Подменяется пробой по той же причине.
 	Docker string
-	// KeysDir — связка контроллера (`~/.ssh` внутри его образа): ключи ресурсов и
-	// `config`, из которого их берёт ssh.
+	// KeysDir — связка контроллера (`~/.ssh` внутри его образа). ВРЕМЯНКА: ключи в неё
+	// кладутся из скоупа при входе и снимаются при выходе.
 	KeysDir string
-	// Port — хост-порт двери на том ресурсе; едет в `deploy/remote.sh` тем же именем,
-	// каким тот его ждёт. Рецепт, который его не читает, о нём и не узнает.
+	// Port — хост-порт двери на той машине; едет `deploy/remote.sh` тем же именем, каким
+	// тот его ждёт. Рецепт, который его не читает, о нём и не узнает.
 	Port int
 }
 
-// List — все источники ресурса: «здесь» плюс заведённые.
-func (m *Manager) List(ctx context.Context) ([]Resource, *refusal.Refusal) {
-	out := []Resource{m.here(ctx)}
+// ── список ───────────────────────────────────────────────────────────────────
 
-	res, err := m.Runner.Run(ctx, run.Command{
-		Name: m.Docker,
-		Args: []string{"context", "ls", "--format", "{{.Name}}\t{{.DockerEndpoint}}"},
-	})
-	if ref := m.dockerFailure(err); ref != nil {
-		return nil, ref
-	}
-	if res.Code != 0 {
-		return nil, refusal.New(http.StatusBadGateway, "no-daemon",
-			"докер на этой машине не отвечает, а список ресурсов — это его контексты",
-			"проверь, что сокет докера отдан контроллеру при подъёме: control/README.md",
-			"подробность: "+tail(res.Err))
-	}
-
-	for _, line := range strings.Split(res.Out, "\n") {
-		name, endpoint, ok := strings.Cut(strings.TrimSpace(line), "\t")
-		if !ok || !strings.HasPrefix(name, ContextPrefix) {
-			continue
-		}
-		short := strings.TrimPrefix(name, ContextPrefix)
-		r := Resource{Name: short, Addr: strings.TrimPrefix(endpoint, "ssh://")}
-		r.Reach, r.Things = m.things(ctx, name)
+// List — территории юзера с тем, что на них сейчас стоит. Список берётся ИЗ СКОУПА, а
+// живое состояние спрашивается у машин: список — знание юзера, состояние — знание машины,
+// и выводить одно из другого нельзя.
+func (m *Manager) List(ctx context.Context, territories []state.Territory) []Resource {
+	out := make([]Resource, 0, len(territories))
+	for _, t := range territories {
+		r := Resource{Name: t.Name, Addr: t.Addr}
+		r.Reach, r.Things = m.things(ctx, ContextPrefix+t.Name)
 		out = append(out, r)
 	}
-	return out, nil
+	return out
 }
 
-// here — ресурс, на котором стоит контроллер. Адреса у него нет намеренно: изнутри
-// машины её собственный адрес неизвестен, а выдуманный («localhost») однажды уедет в
-// пульт и станет ложью для того, кто смотрит снаружи.
-func (m *Manager) here(ctx context.Context) Resource {
-	r := Resource{Name: HereName, Here: true}
-	r.Reach, r.Things = m.things(ctx, "")
-	return r
-}
-
-// things — что стоит на ресурсе. Пустой контекст означает «здесь».
-//
-// Спрашиваем ДЕМОН той машины, а не свой список: какие вещи там подняты — знание той
-// стороны, и у нас его взять неоткуда. Вопросов два, и они разные: «отвечает ли ресурс» и
-// «что на нём стоит». Вывести второй из первого нельзя — молчащий ресурс это не пустая
+// things — что стоит на территории. Спрашиваем ДЕМОН той машины, а не свой список: какие
+// вещи там подняты — знание той стороны. Вопросов два, и они разные: «отвечает ли машина»
+// и «что на ней стоит». Вывести второй из первого нельзя — молчащая машина это не пустая
 // машина (`WORLD2` 4.2).
 func (m *Manager) things(ctx context.Context, dockerContext string) (string, []Thing) {
 	res, err := m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: m.args(dockerContext, "ps", "-a", "--format", "{{.ID}}")})
@@ -194,7 +141,7 @@ func (m *Manager) things(ctx context.Context, dockerContext string) (string, []T
 	res, err = m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: append(args, ids...)})
 	if err != nil || res.Code != 0 {
 		// Контейнеры есть, а спросить их не вышло. Врать «ничего не стоит» нельзя, и
-		// назвать вещи нечем — значит ресурс для нас молчит.
+		// назвать вещи нечем — значит машина для нас молчит.
 		return "молчит", nil
 	}
 
@@ -206,30 +153,29 @@ func (m *Manager) things(ctx context.Context, dockerContext string) (string, []T
 		project, rest, ok := strings.Cut(strings.TrimRight(line, " \t\r"), "\t")
 		if !ok || project == "" {
 			// Контейнер, поднятый не компоузом, вещью мира не является: у него нет
-			// рецепта, и назвать его нам нечем. Чужое хозяйство хозяина машины мы не
-			// перечисляем — оно не наше и не про нас.
+			// рецепта, и назвать его нам нечем.
 			continue
 		}
-		health, state, _ := strings.Cut(rest, "\t")
+		health, st, _ := strings.Cut(rest, "\t")
 		t, known := seen[project]
 		if !known {
 			t = &tally{}
 			seen[project] = t
 			order = append(order, project)
 		}
-		t.add(health, state)
+		t.add(health, st)
 	}
 
 	out := make([]Thing, 0, len(order))
 	for _, name := range order {
-		state, alive := seen[name].verdict()
-		out = append(out, Thing{Name: name, State: state, Alive: alive})
+		st, alive := seen[name].verdict()
+		out = append(out, Thing{Name: name, State: st, Alive: alive})
 	}
 	return "отвечает", out
 }
 
-// args — общее начало команды докера. Пустой контекст означает «здесь»: у своей машины
-// контекст не спрашивается вовсе.
+// args — общее начало команды докера. Пустой контекст означает «машина контроллера»: у
+// своей машины контекст не спрашивается вовсе.
 func (m *Manager) args(dockerContext string, rest ...string) []string {
 	var args []string
 	if dockerContext != "" {
@@ -239,7 +185,7 @@ func (m *Manager) args(dockerContext string, rest ...string) []string {
 }
 
 // tally — контейнеры одной вещи, посчитанные по состояниям. Вещь не бывает целой по
-// одному контейнеру: сколько их у неё и какие — знает рецепт, и судить о ней по первому
+// одному контейнеру: сколько их у неё — знает рецепт, и судить о ней по первому
 // попавшемуся значило бы выдать часть за целое.
 type tally struct{ stopped, sick, rising, healthy, unchecked int }
 
@@ -255,8 +201,7 @@ func (t *tally) add(health, state string) {
 		t.rising++
 	case "none", "":
 		// У образа нет HEALTHCHECK-а. Это НЕ «здоров»: ждать нечего и спрашивать нечего —
-		// приблизительная запись хуже отсутствующей. То же правило и та же развилка, что
-		// у соседа в `deploy/remote.sh`.
+		// приблизительная запись хуже отсутствующей. То же правило, что у соседа.
 		t.unchecked++
 	default:
 		t.sick++
@@ -280,34 +225,15 @@ func (t *tally) verdict() (string, bool) {
 	}
 }
 
-// Add — добавить ресурс: креды в связку, дальше готовый подъём НАЗВАННОЙ РЕЦЕПТОМ вещи.
-// Рецепт не назван — берётся дверь: прежний путь («поставь дверь на ресурс») остаётся
-// запросом без единого лишнего поля.
-func (m *Manager) Add(ctx context.Context, name, addr, creds, recipeName string) (Resource, *refusal.Refusal) {
-	if ref := validName(name); ref != nil {
-		return Resource{}, ref
-	}
-	host, ref := checkAddr(addr)
-	if ref != nil {
-		return Resource{}, ref
-	}
-	// Рецепт находим ДО того, как тронули связку и ресурс: неизвестное имя обязано
-	// отказать, не оставив за собой ни ключа, ни контекста (`WORLD2` 2.3).
-	recipePath, ref := m.recipe(recipeName)
-	if ref != nil {
-		return Resource{}, ref
-	}
+// ── подъём и снятие вещи ─────────────────────────────────────────────────────
 
-	// Ключ кладётся ДО подъёма: докер пойдёт по ssh сам и возьмёт его из связки — своего
-	// поля под ключ у контекста нет вовсе (см. шапку deploy/remote.sh).
-	installed := false
-	if creds != "" {
-		if ref := m.installKey(name, host, creds); ref != nil {
-			return Resource{}, ref
-		}
-		installed = true
-	}
-
+// Raise — поднять НАЗВАННУЮ РЕЦЕПТОМ вещь на территории. Ключ к машине кладётся ДО вызова
+// (`Bind`/`PutKey`): докер пойдёт по ssh сам и возьмёт его из связки — своего поля под
+// ключ у контекста нет вовсе.
+//
+// `env` — значения, которые читает сам рецепт. Контроллер их не толкует: что вещи нужно,
+// знает вещь, а не он.
+func (m *Manager) Raise(ctx context.Context, name, addr, recipePath string, env []string) *refusal.Refusal {
 	// Рецепт называется ВСЕГДА, даже когда он тот же самый, что у соседа по умолчанию.
 	// Умолчание принадлежит ЕГО команде, а не нашему вызову: положись мы на него, смена
 	// умолчания у соседа молча сменила бы вещь, которую поднимает контроллер.
@@ -315,32 +241,12 @@ func (m *Manager) Add(ctx context.Context, name, addr, creds, recipeName string)
 	res, err := m.Runner.Run(ctx, run.Command{
 		Name: m.RemoteSh,
 		Args: args,
-		Env:  m.remoteEnv(),
+		Env:  append(m.remoteEnv(), env...),
 	})
 	if err != nil || res.Code != 0 {
-		// Подъём не удался — свой след убираем за собой. Оставленный ключ означал бы,
-		// что вторая попытка пойдёт кредами, которых юзер уже не называет, и отказ
-		// «ключ не принят» приехал бы про ключ-призрак.
-		if installed {
-			_ = m.removeKey(name)
-		}
-		return Resource{}, m.toolFailure(err, res, "поставить вещь по рецепту "+recipePath+" на "+addr+" не вышло")
+		return m.toolFailure(err, res, "поставить вещь по рецепту "+recipePath+" на "+addr+" не вышло")
 	}
-
-	out := Resource{Name: name, Addr: addr}
-	out.Reach, out.Things = m.things(ctx, ContextPrefix+name)
-	return out, nil
-}
-
-// recipe — путь рецепта по имени, названному человеком. Каталога рецептов может не быть
-// вовсе (зона его не заводит — это ландшафт машины), и тогда остаётся дверь.
-func (m *Manager) recipe(name string) (string, *refusal.Refusal) {
-	if m.Recipes == nil {
-		return "", refusal.New(http.StatusInternalServerError, "no-recipes",
-			"контроллеру не назвали, где брать рецепты, — поднимать нечем",
-			"это дефект подъёма контроллера: см. control/README.md, CONTROL_RECIPES")
-	}
-	return m.Recipes.Find(name)
+	return nil
 }
 
 // Dropped — что осталось на той машине после снятия. Ответ обязан это называть: «снял» без
@@ -350,28 +256,16 @@ type Dropped struct {
 	Removed []string `json:"removed"`
 	Left    []string `json:"left"`
 	Ways    []string `json:"ways"`
+	// Note — сказанное вслух про то, чего НЕ случилось. Пусто — значит сказать нечего.
+	Note string `json:"note,omitempty"`
 }
 
-// Drop — снять ресурс. Состояние поля и образ по умолчанию остаются: стереть их молча
-// значило бы потерять то, что юзер клал не сюда и не сейчас.
+// Lower — снять вещь с территории. Состояние вещи и образ по умолчанию остаются: стереть
+// их молча значило бы потерять то, что юзер клал не сюда и не сейчас.
 //
 // Рецепт называется и здесь: снимаем ТО ЖЕ, что ставили, а своего реестра вещей зона не
 // заводит — «что мы там поднимали», помнит человек (тот же довод, что у соседа).
-func (m *Manager) Drop(ctx context.Context, name string, withState, withImage bool, recipeName string) (Dropped, *refusal.Refusal) {
-	if ref := validName(name); ref != nil {
-		return Dropped{}, ref
-	}
-	if name == HereName {
-		return Dropped{}, refusal.New(http.StatusConflict, "drop-here",
-			"«здесь» — это ресурс, на котором стоит сам контроллер; снять его контроллером нельзя",
-			"вещи на этом ресурсе снимаются своим подъёмом: ./deploy/up.sh down",
-			"сам контроллер снимается руками того, кто его ставил: ./control/up.sh down")
-	}
-	recipePath, ref := m.recipe(recipeName)
-	if ref != nil {
-		return Dropped{}, ref
-	}
-
+func (m *Manager) Lower(ctx context.Context, name, recipePath, recipeName string, withState, withImage bool) (Dropped, *refusal.Refusal) {
 	args := []string{"drop", name, "--recipe", recipePath}
 	if withState {
 		args = append(args, "--with-state")
@@ -380,23 +274,24 @@ func (m *Manager) Drop(ctx context.Context, name string, withState, withImage bo
 		args = append(args, "--with-image")
 	}
 	res, err := m.Runner.Run(ctx, run.Command{Name: m.RemoteSh, Args: args, Env: m.remoteEnv()})
-	if err != nil || res.Code != 0 {
-		return Dropped{}, m.toolFailure(err, res, "снять ресурс «"+name+"» не вышло")
-	}
 
-	// Ключ ресурса снимается вместе с ним: связка контроллера — это тоже след, и
-	// оставленный ключ пережил бы ресурс, к которому он был.
-	if ref := m.removeKey(name); ref != nil {
+	out := Dropped{
+		Name:    name,
+		Removed: []string{"контейнеры рецепта", "сеть мира, если в ней больше никого", "контекст докера", "ключ территории из связки контроллера"},
+	}
+	if err != nil || res.Code != 0 {
+		ref := m.toolFailure(err, res, "снять вещь с территории «"+name+"» не вышло")
+		// «Такого ресурса у меня нет» — это НЕ повод оставить участок в скоупе навсегда.
+		// Иначе снятие, споткнувшееся один раз, запирало бы запись в личности насмерть:
+		// вещи там уже нет, а убрать участок нечем. Говорим вслух, что вещь не трогали.
+		if ref.Code == "no-such-resource" {
+			out.Removed = nil
+			out.Note = "вещи на этой территории подъём не нашёл — участок убран из скоупа, на машине ничего не тронуто"
+			return out, nil
+		}
 		return Dropped{}, ref
 	}
 
-	// Перечисляем то, что снято, БЕЗ имён: имена контейнеров, томов и образа принадлежат
-	// рецепту, и знать их контроллеру неоткуда. Названное наугад имя выглядело бы знанием
-	// и разъехалось бы с рецептом молча (`WORLD2` 4.2).
-	out := Dropped{
-		Name:    name,
-		Removed: []string{"контейнеры рецепта", "сеть мира, если в ней больше никого", "контекст докера", "ключ ресурса из связки контроллера"},
-	}
 	query := "?recipe=" + recipeName
 	if recipeName == "" {
 		query = ""
@@ -437,18 +332,156 @@ func (m *Manager) remoteEnv() []string {
 	return []string{"WORLD_PORT=" + strconv.Itoa(m.Port)}
 }
 
-// ── связка ключей контроллера ────────────────────────────────────────────────
+// ── времянки контроллера: ключи, config, контексты ───────────────────────────
 //
-// Здесь единственное место, где контроллер трогает креды. Он их НЕ ЗАВОДИТ и не выдаёт —
-// он кладёт то, что назвал юзер, туда, откуда это возьмёт ssh (`WORLD2` 3.0: креды
-// принадлежат юзеру и его связке). Блок в `config` помечен именем ресурса, чтобы снятие
-// убирало ровно свой блок, а не «похожий».
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ВСЁ, ЧТО В ЭТОМ РАЗДЕЛЕ, — ПРОИЗВОДНОЕ ОТ СКОУПА, А НЕ СОСТОЯНИЕ (`WORLD2` 1.9).     │
+// │                                                                                      │
+// │ Ключи в связке, блоки в `config` и контексты докера поднимаются из скоупа при ВХОДЕ   │
+// │ и снимаются при ВЫХОДЕ. Своего списка контроллер не держит: держал бы — вошедший под  │
+// │ другой личностью увидел бы чужие территории, и «личность» перестала бы что-то значить.│
+// └─────────────────────────────────────────────────────────────────────────────────────┘
 
-func (m *Manager) keyPath(name string) string {
-	return filepath.Join(m.KeysDir, ContextPrefix+name)
+// Bind — привести времянки контроллера в соответствие со скоупом. Делается при входе, и
+// делается целиком: сначала снимаем всё своё, потом раскладываем то, что лежит в скоупе.
+// Так вход под другой личностью не оставляет ни одного следа прежней.
+func (m *Manager) Bind(ctx context.Context, st *state.State) *refusal.Refusal {
+	if ref := m.Unbind(ctx); ref != nil {
+		return ref
+	}
+	for _, t := range st.Territories {
+		if ref := validName(t.Name); ref != nil {
+			return ref
+		}
+		host, port, ref := checkAddr(t.Addr)
+		if ref != nil {
+			return ref
+		}
+		if t.Key != "" {
+			key, found := st.Key(t.Key)
+			if !found {
+				return refusal.New(http.StatusBadGateway, "scope-broken",
+					fmt.Sprintf("участок «%s» ссылается на ключ «%s», а такого ключа в связке скоупа нет", t.Name, t.Key),
+					"поправь файл состояния: ключи лежат в разделе «ключи», а территории ссылаются на них по имени (`WORLD2` 3.4)",
+					"или заведи участок заново: DELETE /api/resources/"+t.Name+", затем POST /api/resources")
+			}
+			if ref := m.putKey(t.Name, host, key.Value); ref != nil {
+				return ref
+			}
+		}
+		if ref := m.putContext(ctx, t.Name, t.Addr, host, port); ref != nil {
+			return ref
+		}
+	}
+	return nil
 }
 
-func (m *Manager) installKey(name, host, creds string) *refusal.Refusal {
+// Unbind — снять всё своё: контексты, ключи, блоки в `config`. Делается при выходе и перед
+// каждым входом. Чужие контексты и чужие строки в `config` не трогаются: связка принадлежит
+// юзеру, мы в ней гости, а машина — хозяину.
+func (m *Manager) Unbind(ctx context.Context) *refusal.Refusal {
+	for _, name := range m.ours(ctx) {
+		res, err := m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: []string{"context", "rm", "-f", name}})
+		if err != nil || res.Code != 0 {
+			return refusal.New(http.StatusBadGateway, "context-failed",
+				fmt.Sprintf("контекст докера %s не снять: %s", name, tail(res.Err)),
+				"посмотри, что мешает: docker context rm -f "+name,
+				"контексты контроллера — времянка: они поднимаются из скоупа при входе")
+		}
+	}
+	if m.KeysDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(m.KeysDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return refusal.New(http.StatusInternalServerError, "no-keyring",
+			"связку контроллера не прочитать: "+err.Error(),
+			"проверь том, смонтированный под связку: control/README.md")
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), ContextPrefix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(m.KeysDir, e.Name())); err != nil && !os.IsNotExist(err) {
+			return refusal.New(http.StatusInternalServerError, "no-keyring",
+				fmt.Sprintf("ключ %s из связки не снялся: %v", e.Name(), err),
+				"убери его руками: "+filepath.Join(m.KeysDir, e.Name()))
+		}
+		if ref := m.dropConfigBlock(strings.TrimPrefix(e.Name(), ContextPrefix)); ref != nil {
+			return ref
+		}
+	}
+	return nil
+}
+
+// ours — контексты докера, заведённые нами. Узнаём их по приставке — той же, что у соседа.
+// Докера может не быть вовсе (девбокс, проба): тогда снимать нечего, и это не отказ.
+func (m *Manager) ours(ctx context.Context) []string {
+	res, err := m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: []string{"context", "ls", "--format", "{{.Name}}"}})
+	if err != nil || res.Code != 0 {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(res.Out, "\n") {
+		name := strings.TrimSpace(line)
+		if strings.HasPrefix(name, ContextPrefix) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// putContext — контекст докера на территорию. Формула адреса — та же, что у соседа
+// (`docker_endpoint` в deploy/remote.sh): один разбор, две сборки, разъехаться нечему.
+// Это ШОВ, и он стережётся пробой.
+func (m *Manager) putContext(ctx context.Context, name, addr, host string, port int) *refusal.Refusal {
+	endpoint := "ssh://" + userAt(addr, host) + ":" + strconv.Itoa(port)
+	full := ContextPrefix + name
+
+	res, err := m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: []string{"context", "inspect", full}})
+	verb := "create"
+	if err == nil && res.Code == 0 {
+		verb = "update"
+	}
+	res, err = m.Runner.Run(ctx, run.Command{
+		Name: m.Docker,
+		Args: []string{"context", verb, full, "--description", "мир: территория " + name, "--docker", "host=" + endpoint},
+	})
+	if err != nil {
+		if errors.Is(err, run.ErrNoTool) {
+			return refusal.New(http.StatusInternalServerError, "no-docker",
+				"докера в контроллере нет, а до территорий он ходит контекстами докера",
+				"это дефект образа контроллера — заведи задачу зоне control")
+		}
+		return refusal.New(http.StatusGatewayTimeout, "no-daemon",
+			fmt.Sprintf("докер не ответил, когда заводили контекст %s: %v", full, err),
+			"проверь, что сокет докера отдан контроллеру при подъёме: control/README.md")
+	}
+	if res.Code != 0 {
+		return refusal.New(http.StatusBadGateway, "context-failed",
+			fmt.Sprintf("контекст докера %s на %s не завести: %s", full, endpoint, tail(res.Err)),
+			"посмотри, что мешает: docker context "+verb+" "+full+" --docker host="+endpoint,
+			"имя занято чем-то чужим — возьми другое имя территории")
+	}
+	return nil
+}
+
+// userAt — «юзер@машина» из адреса территории. Адрес разобран уже дважды (нами и соседом),
+// и третьего разбора здесь нет: берём то, что до двоеточия, и подставляем разобранный хост.
+func userAt(addr, host string) string {
+	if user, _, ok := strings.Cut(addr, "@"); ok {
+		return user + "@" + host
+	}
+	return host
+}
+
+// putKey кладёт ключ территории туда, откуда его возьмёт ssh (а через ssh — докер). Мир
+// кред НЕ ЗАВОДИТ и не выдаёт: он кладёт то, что назвал юзер и что лежит в его скоупе
+// (`WORLD2` 3.0).
+func (m *Manager) putKey(name, host, creds string) *refusal.Refusal {
 	if m.KeysDir == "" {
 		return refusal.New(http.StatusInternalServerError, "no-keyring",
 			"контроллеру некуда положить ключ: связка не названа",
@@ -466,21 +499,47 @@ func (m *Manager) installKey(name, host, creds string) *refusal.Refusal {
 	}
 	if err := os.WriteFile(m.keyPath(name), []byte(creds), 0o600); err != nil {
 		return refusal.New(http.StatusInternalServerError, "no-keyring",
-			fmt.Sprintf("ключ ресурса не записался: %v", err),
+			fmt.Sprintf("ключ территории не записался: %v", err),
 			"проверь права на связку контроллера")
 	}
 	return m.writeConfigBlock(name, host)
 }
 
-// blockMarks — границы нашего блока в `config`. По имени ресурса, а не по хосту: на одной
-// машине может стоять один ресурс, но имя — это то, чем юзер его зовёт.
+// PutKey — положить ключ до того, как скоуп о нём знает. Нужен ровно в одном месте: когда
+// территорию ЗАВОДЯТ, ключ должен лежать в связке ещё до подъёма вещи — иначе ssh не
+// пустит, и отказ приедет про несуществующий ключ.
+func (m *Manager) PutKey(name, addr, creds string) *refusal.Refusal {
+	host, _, ref := checkAddr(addr)
+	if ref != nil {
+		return ref
+	}
+	return m.putKey(name, host, creds)
+}
+
+// DropKey — снять ключ территории и её блок в `config`. Зовётся, когда подъём не удался:
+// оставленный ключ означал бы, что вторая попытка пойдёт кредами, которых юзер уже не
+// называет, и отказ «ключ не принят» приехал бы про ключ-призрак.
+func (m *Manager) DropKey(name string) {
+	if m.KeysDir == "" {
+		return
+	}
+	_ = os.Remove(m.keyPath(name))
+	_ = m.dropConfigBlock(name)
+}
+
+func (m *Manager) keyPath(name string) string {
+	return filepath.Join(m.KeysDir, ContextPrefix+name)
+}
+
+// blockMarks — границы нашего блока в `config`. По имени территории: имя — это то, чем
+// юзер её зовёт, и снятие обязано убирать ровно свой блок, а не «похожий».
 func blockMarks(name string) (string, string) {
 	return "# >>> world " + name, "# <<< world " + name
 }
 
 func (m *Manager) writeConfigBlock(name, host string) *refusal.Refusal {
 	open, end := blockMarks(name)
-	block := fmt.Sprintf(`%s — поставил контроллер, снимается вместе с ресурсом
+	block := fmt.Sprintf(`%s — поставил контроллер, снимается при выходе из скоупа
 Host %s
     HostName %s
     IdentityFile %s
@@ -493,8 +552,7 @@ Host %s
 	if ref != nil {
 		return ref
 	}
-	body := rest + block
-	if err := os.WriteFile(m.configPath(), []byte(body), 0o600); err != nil {
+	if err := os.WriteFile(m.configPath(), []byte(rest+block), 0o600); err != nil {
 		return refusal.New(http.StatusInternalServerError, "no-keyring",
 			fmt.Sprintf("связка контроллера не записалась: %v", err),
 			"проверь права на связку контроллера")
@@ -502,9 +560,30 @@ Host %s
 	return nil
 }
 
+func (m *Manager) dropConfigBlock(name string) *refusal.Refusal {
+	rest, ref := m.configWithout(name)
+	if ref != nil {
+		return ref
+	}
+	if rest == "" {
+		if err := os.Remove(m.configPath()); err != nil && !os.IsNotExist(err) {
+			return refusal.New(http.StatusInternalServerError, "no-keyring",
+				fmt.Sprintf("связка контроллера не почистилась: %v", err),
+				"убери блок руками: "+m.configPath())
+		}
+		return nil
+	}
+	if err := os.WriteFile(m.configPath(), []byte(rest), 0o600); err != nil {
+		return refusal.New(http.StatusInternalServerError, "no-keyring",
+			fmt.Sprintf("связка контроллера не переписалась: %v", err),
+			"убери блок руками: "+m.configPath())
+	}
+	return nil
+}
+
 func (m *Manager) configPath() string { return filepath.Join(m.KeysDir, "config") }
 
-// configWithout — содержимое `config` без нашего блока про этот ресурс. Чужие строки в
+// configWithout — содержимое `config` без нашего блока про эту территорию. Чужие строки в
 // файле остаются нетронутыми: связка принадлежит юзеру, мы в ней только гости.
 func (m *Manager) configWithout(name string) (string, *refusal.Refusal) {
 	data, err := os.ReadFile(m.configPath())
@@ -537,97 +616,64 @@ func (m *Manager) configWithout(name string) (string, *refusal.Refusal) {
 	return body, nil
 }
 
-func (m *Manager) removeKey(name string) *refusal.Refusal {
-	if m.KeysDir == "" {
-		return nil
-	}
-	if err := os.Remove(m.keyPath(name)); err != nil && !os.IsNotExist(err) {
-		return refusal.New(http.StatusInternalServerError, "no-keyring",
-			fmt.Sprintf("ключ ресурса не снялся: %v", err),
-			"убери его руками из связки контроллера: "+m.keyPath(name))
-	}
-	rest, ref := m.configWithout(name)
-	if ref != nil {
-		return ref
-	}
-	if rest == "" {
-		if err := os.Remove(m.configPath()); err != nil && !os.IsNotExist(err) {
-			return refusal.New(http.StatusInternalServerError, "no-keyring",
-				fmt.Sprintf("связка контроллера не почистилась: %v", err),
-				"убери блок руками: "+m.configPath())
-		}
-		return nil
-	}
-	if err := os.WriteFile(m.configPath(), []byte(rest), 0o600); err != nil {
-		return refusal.New(http.StatusInternalServerError, "no-keyring",
-			fmt.Sprintf("связка контроллера не переписалась: %v", err),
-			"убери блок руками: "+m.configPath())
-	}
-	return nil
-}
-
 // ── отказы ───────────────────────────────────────────────────────────────────
+
+// ValidName — имя территории, проверенное до всякого докера. Имя даёт юзер (`2.5` п. 11),
+// а идёт оно в имя контекста и в имя файла ключа: имя с косой чертой увело бы запись из
+// связки в чужой каталог.
+func ValidName(name string) *refusal.Refusal { return validName(name) }
 
 func validName(name string) *refusal.Refusal {
 	if name == "" {
 		return refusal.New(http.StatusBadRequest, "no-name",
-			"имя ресурса не названо, а по нему потом искать и снимать",
-			"назови короткое своё: vps, дом-рядом → dom-ryadom")
+			"имя территории не названо, а мир его не выдумывает и из адреса машины не выводит",
+			"назови короткое своё: vps, дом-рядом → dom-ryadom",
+			"на имени стоит адрес локации — оно часть адреса, а не подпись (`WORLD2` 2.5 п. 11)")
 	}
 	if !nameRe.MatchString(name) {
 		return refusal.New(http.StatusBadRequest, "bad-name",
-			fmt.Sprintf("имя %q не подходит: имя ресурса идёт в имя контекста докера и в имя файла ключа", name),
+			fmt.Sprintf("имя %q не подходит: имя территории идёт в имя контекста докера и в имя файла ключа", name),
 			"возьми строчные латинские буквы, цифры и дефис: vps, home, box-2")
 	}
 	return nil
 }
 
-// checkAddr проверяет адрес ресурса ровно настолько, насколько его касается контроллер:
-// юзер назван, машина названа. Разбирать его дальше не наше дело — адрес уезжает соседу
-// как есть, и второй разбор того же адреса разъехался бы с первым.
-func checkAddr(addr string) (string, *refusal.Refusal) {
+// CheckAddr — адрес машины ровно настолько, насколько его касается контроллер: юзер назван,
+// машина названа. Разбирать его дальше не наше дело — адрес уезжает соседу как есть.
+func CheckAddr(addr string) (string, int, *refusal.Refusal) { return checkAddr(addr) }
+
+func checkAddr(addr string) (string, int, *refusal.Refusal) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
-		return "", refusal.New(http.StatusBadRequest, "no-address",
-			"адрес ресурса не назван — угадать его нельзя",
+		return "", 0, refusal.New(http.StatusBadRequest, "no-address",
+			"адрес машины не назван — угадать его нельзя",
 			"назови: user@10.8.0.5 или user@10.8.0.5:2222")
 	}
 	user, hostPort, ok := strings.Cut(addr, "@")
 	if !ok || user == "" {
 		// Пустой юзер ssh проглатывает молча и идёт текущим — человек назвал одного, а
 		// пошли бы другим (грабля `WORLD2-96`, пункт 4).
-		return "", refusal.New(http.StatusBadRequest, "bad-address",
+		return "", 0, refusal.New(http.StatusBadRequest, "bad-address",
 			fmt.Sprintf("в адресе %q не назван юзер", addr),
 			"назови целиком: user@10.8.0.5")
 	}
 	host, port, hasPort := strings.Cut(hostPort, ":")
 	if host == "" {
-		return "", refusal.New(http.StatusBadRequest, "bad-address",
+		return "", 0, refusal.New(http.StatusBadRequest, "bad-address",
 			fmt.Sprintf("в адресе %q не названа машина", addr),
 			"назови целиком: user@10.8.0.5")
 	}
+	sshPort := 22
 	if hasPort {
-		if n, err := strconv.Atoi(port); err != nil || n <= 0 || n > 65535 {
-			return "", refusal.New(http.StatusBadRequest, "bad-address",
+		n, err := strconv.Atoi(port)
+		if err != nil || n <= 0 || n > 65535 {
+			return "", 0, refusal.New(http.StatusBadRequest, "bad-address",
 				fmt.Sprintf("в адресе %q после двоеточия стоит %q — это не порт ssh", addr, port),
 				"порт — число: user@10.8.0.5:2222")
 		}
+		sshPort = n
 	}
-	return host, nil
-}
-
-func (m *Manager) dockerFailure(err error) *refusal.Refusal {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, run.ErrNoTool) {
-		return refusal.New(http.StatusInternalServerError, "no-docker",
-			"докера в контроллере нет, а ресурсы — это его контексты",
-			"это дефект образа контроллера — заведи задачу зоне control")
-	}
-	return refusal.New(http.StatusGatewayTimeout, "no-daemon",
-		fmt.Sprintf("докер не ответил: %v", err),
-		"проверь, что сокет докера отдан контроллеру при подъёме: control/README.md")
+	return host, sshPort, nil
 }
 
 // toolFailure — отказ соседнего инструмента, довезённый до человека БЕЗ перевода.

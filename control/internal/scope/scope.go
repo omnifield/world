@@ -1,494 +1,355 @@
-// Пакет scope — скоуп юзера: его личность и его поля, лежащие ТАМ, где он их положил.
+// Пакет scope — скоуп юзера: его личность, лежащая ТАМ, где он её положил.
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-// │ ГЛАВНОЕ ПРАВИЛО ЭТОГО ПАКЕТА: скоуп берётся СВЯЗЬЮ, а не копией (`WORLD2` 1.6, 3.0). │
-// │ Мы не тянем его к себе, не кэшируем и не «синхронизируем» — каждое чтение и каждая   │
-// │ запись идут туда, где скоуп лежит. Копия завела бы вторую истину о личности юзера:   │
-// │ она разъезжается молча, и заметно это становится ровно тогда, когда человек вошёл с  │
-// │ другой машины и увидел себя прежним.                                                 │
+// │ СКОУП ОПРЕДЕЛЯЕТСЯ АДРЕСОМ (`WORLD2` 3.4, «Копий нет — есть адреса»).                │
+// │                                                                                      │
+// │ Дело контроллера ровно два: взять то, что даёт раздача по названному адресу, и        │
+// │ поменять то, что меняет ручка по тому же адресу. Он не сличает копии, не ищет         │
+// │ «настоящую» и не хранит тождества — их не существует. Две раздачи это два скоупа.     │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
-// Скоуп юзера ОДИН и общий для всех полей — это его личность, и она едет с ним
-// (`WORLD2` 3.4). Поэтому здесь только личность и список полей; локации, застройка и
-// рейтинг живут в поле и сюда не попадают.
+// Адрес скоупа — ОБЫЧНЫЙ HTTP-АДРЕС, и состояние лежит в корне:
 //
-// Адрес скоупа — две формы, и обе называет человек:
+//	http://10.8.0.5:8070/
 //
-//	/srv/scope                 путь на ресурсе, ГДЕ СТОИТ КОНТРОЛЛЕР
-//	user@10.8.0.5:/srv/scope   на другом ресурсе — берём связью, по ssh
-//	user@10.8.0.5:2222:/srv/scope   то же, если ssh не на 22
+// Форма стыковки — розетка мира (`0.3`), и она вся здесь: `GET /` отдаёт состояние
+// целиком, `PUT /` принимает его целиком, пароль проверяет сама раздача (`Authorization:
+// Basic`). Больше в ней ничего нет, и это её главное свойство: **чужая раздача равноправна
+// нашей** — отдал файл, принял файл, проверил пароль, «хоть на ардуино».
 //
-// Отдельной пары «личность плюс пароль» здесь нет и не заводится: дотянулся — значит твой
-// (`WORLD2-77`, решение user). Креды — это ключ к АДРЕСУ, а не к личности.
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ КЛИЕНТ ЧИТАЕТ СТАТУС, А ТЕЛО — КАК ПОДРОБНОСТЬ (`share/PROTOCOL.md`).                │
+// │                                                                                      │
+// │ Наша раздача отвечает отказом-тройкой, но чужая вправе ответить голым `401` без       │
+// │ тела — и это законная раздача. Узнавать «свою» по заголовку, телу или `realm` нельзя  │
+// │ вовсе: узнав, мир перестал бы принимать чужие вилки (`0.3`).                          │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// Прежняя редакция этого пакета брала скоуп по ssh с пути на машине контроллера. Так
+// личность лежала ТОМОМ КОНТРОЛЛЕРА: снёс контроллер — потерял себя (`WORLD2-124`,
+// найдено живым прогоном 2026-08-16). Контроллеру положено быть времянкой (`1.9`, `3.7`),
+// и состояния он не держит — он до него дотягивается.
 package scope
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
-	"os"
-	"path"
-	"path/filepath"
-	"strconv"
+	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/omnifield/world/control/internal/refusal"
-	"github.com/omnifield/world/control/internal/run"
+	"github.com/omnifield/world/control/internal/state"
 )
 
-// Имена файлов внутри скоупа. Их два, и это весь состав: личность и список полей.
-const (
-	identityFile = "identity.json"
-	fieldsFile   = "fields.json"
-)
-
-// missingMarker — код выхода, которым удалённая сторона говорит «файла нет». Свой код
-// нужен потому, что `cat` на отсутствующий файл и `cat` на непрочитанный отвечают
-// одинаково (1), а отказы из них получаются разные: «скоупа нет» — это приглашение
-// завести, «не прочитали» — поломка.
-const missingMarker = 66
+// readLimit — сколько байт состояния мы согласны прочитать. Не мнение о содержимом, а
+// граница памяти: без неё раздача, отдающая бесконечный поток, съела бы контроллер молча.
+// Предел записи у нашей раздачи того же порядка (`share/PROTOCOL.md`).
+const readLimit = 8 << 20
 
 // Address — разобранный адрес скоупа.
 type Address struct {
-	Raw string
-	// Here — скоуп лежит на том же ресурсе, где стоит контроллер. Тогда ни ssh, ни
-	// кред не нужно: контроллер дотягивается до него собственными правами.
-	Here   bool
-	UserAt string // `user@host` целиком — ровно в том виде, в каком его берёт ssh
-	Host   string
-	Port   int
-	Path   string
+	Raw  string
+	URL  *url.URL
+	Host string
 }
 
 func (a Address) String() string { return a.Raw }
 
 // Parse разбирает адрес ОДИН раз и в одном месте. Разъедутся два разбора — вход пойдёт по
-// одному пути, а запись поля по другому, и юзер обнаружит два скоупа вместо одного.
+// одному адресу, а запись по другому, и юзер обнаружит два скоупа вместо одного.
 func Parse(raw string) (Address, *refusal.Refusal) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return Address{}, refusal.New(http.StatusBadRequest, "no-address",
-			"адрес скоупа не назван, а угадать его нельзя",
-			"назови путь на этом ресурсе: /scope/егор",
-			"или адрес на другом: user@10.8.0.5:/srv/scope")
+			"адрес скоупа не назван, а угадать его нельзя: личность лежит там, где её положил юзер",
+			"назови адрес раздачи: http://10.8.0.5:8070/",
+			"скоупа ещё нет — заведи его: POST /api/scope")
 	}
 
-	if strings.HasPrefix(raw, "/") {
-		return Address{Raw: raw, Here: true, Path: path.Clean(raw)}, nil
-	}
-
-	at := strings.Index(raw, "@")
-	if at < 0 {
+	u, err := url.Parse(raw)
+	if err != nil {
 		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
-			fmt.Sprintf("адрес %q не похож ни на путь, ни на «юзер@машина:путь»", raw),
-			"путь на этом ресурсе начинается со слэша: /scope/егор",
-			"адрес на другом ресурсе: user@10.8.0.5:/srv/scope")
+			fmt.Sprintf("адрес %q не разобрать: %v", raw, err),
+			"адрес скоупа — обычный HTTP-адрес: http://10.8.0.5:8070/")
 	}
-	// Пустой юзер молча проглатывать нельзя: ssh взял бы текущего, и человек получил бы
-	// НЕ ТОГО, кого назвал. Грабля соседней зоны (`WORLD2-96`, пункт 4) — здесь закрыта
-	// отказом, а не молчанием.
-	if at == 0 {
+	switch u.Scheme {
+	case "http", "https":
+	case "":
 		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
-			fmt.Sprintf("в адресе %q не назван юзер — до собачки пусто", raw),
-			"назови его целиком: user@10.8.0.5:/srv/scope")
-	}
-
-	rest := raw[at+1:]
-	parts := strings.SplitN(rest, ":", 3)
-	if len(parts) < 2 {
-		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
-			fmt.Sprintf("в адресе %q нет пути — назван только ресурс", raw),
-			"допиши путь через двоеточие: "+raw+":/srv/scope")
-	}
-
-	addr := Address{Raw: raw, Host: parts[0], Port: 22}
-	switch len(parts) {
-	case 2:
-		addr.Path = parts[1]
+			fmt.Sprintf("в адресе %q не назван протокол, а достраивать его за юзера мир не берётся", raw),
+			"назови целиком: http://"+raw,
+			"скоуп на пути в файловой системе больше не заводится — он раздаётся по адресу (`WORLD2` 3.4)")
 	default:
-		port, err := strconv.Atoi(parts[1])
-		if err != nil || port <= 0 || port > 65535 {
-			return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
-				fmt.Sprintf("между машиной и путём стоит %q — это не порт", parts[1]),
-				"порт — число: user@10.8.0.5:2222:/srv/scope",
-				"без порта — просто: user@10.8.0.5:/srv/scope")
-		}
-		addr.Port = port
-		addr.Path = parts[2]
+		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
+			fmt.Sprintf("адрес %q говорит по %q, а раздача скоупа — это HTTP", raw, u.Scheme),
+			"назови http- или https-адрес: http://10.8.0.5:8070/")
 	}
-
-	if addr.Host == "" {
+	if u.Host == "" {
 		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
 			fmt.Sprintf("в адресе %q не названа машина", raw),
-			"назови её: user@10.8.0.5:/srv/scope")
+			"назови целиком: http://10.8.0.5:8070/")
 	}
-	if !strings.HasPrefix(addr.Path, "/") {
+	if u.User != nil {
+		// Пароль скоупа называется ОТДЕЛЬНЫМ полем, а не прячется в адрес: адрес юзер
+		// показывает и пересылает, а пароль — нет.
 		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
-			fmt.Sprintf("путь %q не абсолютный, а относительный путь на чужой машине означает «где-то у кого-то дома»", addr.Path),
-			"назови путь от корня: "+raw[:at+1]+addr.Host+":/srv/scope")
+			"в адресе скоупа не место паролю — он называется отдельным полем",
+			"убери часть до собачки: http://10.8.0.5:8070/",
+			"пароль пришли полем password")
 	}
-	addr.Path = path.Clean(addr.Path)
-	addr.UserAt = raw[:at] + "@" + addr.Host
-	return addr, nil
+	if path := strings.Trim(u.Path, "/"); path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return Address{}, refusal.New(http.StatusBadRequest, "bad-address",
+			fmt.Sprintf("в адресе %q назван путь внутри раздачи, а состояние лежит в корне и только в корне", raw),
+			"назови корень: "+u.Scheme+"://"+u.Host+"/",
+			"две раздачи — два скоупа, а не два пути в одной (`WORLD2` 3.4)")
+	}
+
+	u.Path = "/"
+	return Address{Raw: raw, URL: u, Host: u.Hostname()}, nil
 }
 
-// Identity — личность юзера. Ровно то, что назвал канон: имя и бренд (`WORLD2` 3.4).
-// Ключи личности сюда не кладутся: мир кред не заводит и не хранит (`WORLD2` 3.0).
-type Identity struct {
-	Name    string `json:"name"`
-	Brand   string `json:"brand"`
-	Created string `json:"created"`
-}
-
-// Field — поле юзера в его списке. Пока это ЗАПИСЬ о поле, а не поднятое поле: само поле
-// разбирается следующей итерацией (`WORLD2-101`), и опережать её здесь нечем.
-type Field struct {
-	Name    string `json:"name"`
-	Created string `json:"created"`
-}
-
-// Scope — открытый доступ к скоупу по адресу. Состояния внутри не держит: каждый вызов
-// идёт до места. Это дороже одного кэша и честнее его.
+// Scope — доступ к состоянию по адресу. Ни копии, ни кэша внутри нет: каждое чтение и
+// каждая запись идут туда, где скоуп лежит (`WORLD2` 1.6). Копия завела бы вторую истину о
+// личности, и заметно это стало бы ровно тогда, когда человек вошёл с другой машины.
 type Scope struct {
 	Addr Address
 
-	runner run.Runner
-	// key — файл ключа для ssh. Пусто — обычный порядок ssh (агент, `~/.ssh/config`):
-	// креды принадлежат юзеру и его связке, мир своего хранилища не заводит.
-	key     string
-	timeout int
-	now     func() time.Time
+	password string
+	client   *http.Client
 }
 
 // Open готовит доступ. Связь при этом НЕ проверяется: проверка — отдельное действие
-// (`Enter`), и сливать их значило бы получить «открыли, но не знаем, есть ли что».
-func Open(addr Address, runner run.Runner, key string, timeout int, now func() time.Time) *Scope {
+// (`Read`), и сливать их значило бы получить «открыли, но не знаем, есть ли что».
+func Open(addr Address, password string, timeout int) *Scope {
 	if timeout <= 0 {
 		timeout = 10
 	}
-	if now == nil {
-		now = time.Now
+	return &Scope{
+		Addr:     addr,
+		password: password,
+		client:   &http.Client{Timeout: time.Duration(timeout) * time.Second},
 	}
-	return &Scope{Addr: addr, runner: runner, key: key, timeout: timeout, now: now}
 }
 
-// Enter — вход: дотянуться до скоупа и прочитать, кто это. Скоупа по адресу нет — это не
-// поломка, а развилка: юзеру предлагается завести его здесь (`no-scope`).
-func (s *Scope) Enter(ctx context.Context) (*Identity, *refusal.Refusal) {
-	data, found, ref := s.read(ctx, identityFile)
+// Presence — что стоит по адресу. Три состояния, и они разные: раздачи нет вовсе · раздача
+// есть, состояния ещё нет · состояние лежит. Заведение скоупа опирается ровно на это.
+type Presence int
+
+const (
+	// PresenceNone — по адресу никто не ответил. Раздачу надо поднять.
+	PresenceNone Presence = iota
+	// PresenceEmpty — раздача отвечает, а состояния в ней ещё нет (`404 no-state`). Это
+	// не поломка, а развилка: свежая раздача так и отвечает.
+	PresenceEmpty
+	// PresenceState — по адресу лежит состояние.
+	PresenceState
+)
+
+// Look — что по адресу: без разбора содержимого и без отказа на «никого нет». Заведение
+// скоупа обязано различать «поднимать раздачу» и «писать в готовую».
+func (s *Scope) Look(ctx context.Context) (Presence, *refusal.Refusal) {
+	res, ref := s.do(ctx, http.MethodGet, nil)
+	if ref != nil {
+		if ref.Code == "no-route" || ref.Code == "no-answer" || ref.Code == "scope-silent" {
+			return PresenceNone, nil
+		}
+		return PresenceNone, ref
+	}
+	defer res.Body.Close()
+
+	switch res.StatusCode {
+	case http.StatusOK:
+		return PresenceState, nil
+	case http.StatusNotFound:
+		return PresenceEmpty, nil
+	default:
+		return PresenceNone, s.answerFailure(res)
+	}
+}
+
+// Read — состояние по адресу, прочитанное как состояние. Всё, что могло не сойтись,
+// названо ступенями: дорога · ответ · пароль · формат.
+func (s *Scope) Read(ctx context.Context) (*state.State, *refusal.Refusal) {
+	res, ref := s.do(ctx, http.MethodGet, nil)
 	if ref != nil {
 		return nil, ref
 	}
-	if !found {
+	defer res.Body.Close()
+
+	switch res.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		// Раздача отвечает, а состояния в ней нет. Это развилка, а не поломка: свежая
+		// раздача отвечает именно так, и заводящий скоуп на это опирается.
 		return nil, refusal.New(http.StatusNotFound, "no-scope",
-			fmt.Sprintf("по адресу %s скоупа нет — дотянулись, а личности там не лежит", s.Addr),
-			"завести его здесь: POST /api/session с create=true, name и brand",
-			"или назови адрес, где скоуп уже лежит")
-	}
-	var id Identity
-	if err := json.Unmarshal(data, &id); err != nil {
-		return nil, refusal.New(http.StatusBadGateway, "scope-broken",
-			fmt.Sprintf("по адресу %s лежит %s, но прочитать его как личность не вышло: %v", s.Addr, identityFile, err),
-			"посмотри файл глазами: он должен быть объектом с полями name и brand",
-			"или назови другой адрес")
-	}
-	if id.Name == "" {
-		return nil, refusal.New(http.StatusBadGateway, "scope-broken",
-			fmt.Sprintf("в %s по адресу %s нет имени", identityFile, s.Addr),
-			"поправь файл: имя — это то, чем юзер зовётся в мире")
-	}
-	return &id, nil
-}
-
-// Create разворачивает личность. Только ЗДЕСЬ, на ресурсе контроллера: первый вход
-// заводит скоуп там, где юзер вошёл, а перенести его он сможет потом (решение user,
-// `WORLD2-101`). Заводить личность на чужом ресурсе одной ручкой мы не беремся — это
-// уже не «завести», а «развернуть у соседа», и делается оно подъёмом.
-func (s *Scope) Create(ctx context.Context, name, brand string) (*Identity, *refusal.Refusal) {
-	if !s.Addr.Here {
-		return nil, refusal.New(http.StatusConflict, "create-elsewhere",
-			fmt.Sprintf("скоуп заводится на ресурсе, где стоит контроллер, а %s — другой ресурс", s.Addr),
-			"назови путь здесь: /scope/"+safeName(name),
-			"а на тот ресурс перенесёшь его, когда он появится")
-	}
-	if name == "" {
-		return nil, refusal.New(http.StatusBadRequest, "no-name",
-			"личность заводится с именем, а имя не названо",
-			"назови его: name=«егор»")
+			fmt.Sprintf("по адресу %s раздача отвечает, а состояния в ней нет", s.Addr),
+			"заведи его здесь же: POST /api/scope с этим адресом, паролем и именем",
+			"или назови адрес, где состояние уже лежит")
+	default:
+		return nil, s.answerFailure(res)
 	}
 
-	if _, found, ref := s.read(ctx, identityFile); ref != nil {
-		return nil, ref
-	} else if found {
-		return nil, refusal.New(http.StatusConflict, "scope-exists",
-			fmt.Sprintf("по адресу %s личность уже лежит — заводить поверх неё значит стереть её", s.Addr),
-			"войди в неё: POST /api/session без create",
-			"или назови другой путь")
-	}
-
-	id := Identity{Name: name, Brand: brand, Created: s.stamp()}
-	if ref := s.writeJSON(ctx, identityFile, id); ref != nil {
-		return nil, ref
-	}
-	// Список полей заводится сразу пустым, а не «когда появится первое»: пустой список и
-	// отсутствующий файл — разные вещи, и второе пришлось бы каждый раз разбирать как
-	// «то ли поля не заводили, то ли скоуп покалечен».
-	if ref := s.writeJSON(ctx, fieldsFile, []Field{}); ref != nil {
-		return nil, ref
-	}
-	return &id, nil
-}
-
-// Fields — поля юзера. Списка нет вовсе (скоуп заведён руками, старый) — это пустой
-// список, а не отказ.
-func (s *Scope) Fields(ctx context.Context) ([]Field, *refusal.Refusal) {
-	data, found, ref := s.read(ctx, fieldsFile)
-	if ref != nil {
-		return nil, ref
-	}
-	if !found {
-		return []Field{}, nil
-	}
-	var fields []Field
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return nil, refusal.New(http.StatusBadGateway, "scope-broken",
-			fmt.Sprintf("список полей по адресу %s прочитать не вышло: %v", s.Addr, err),
-			"посмотри "+fieldsFile+" глазами: он должен быть массивом объектов с полем name")
-	}
-	if fields == nil {
-		fields = []Field{}
-	}
-	return fields, nil
-}
-
-// AddField заводит ЗАПИСЬ о поле. Поле при этом не поднимается — и говорить об этом надо
-// вслух, иначе человек ждёт поднятого поля и не получает ни его, ни отказа.
-func (s *Scope) AddField(ctx context.Context, name string) (Field, []Field, *refusal.Refusal) {
-	if strings.TrimSpace(name) == "" {
-		return Field{}, nil, refusal.New(http.StatusBadRequest, "no-name",
-			"у поля должно быть имя, а оно не названо",
-			"назови его: name=«дом»")
-	}
-	fields, ref := s.Fields(ctx)
-	if ref != nil {
-		return Field{}, nil, ref
-	}
-	for _, f := range fields {
-		if f.Name == name {
-			return Field{}, nil, refusal.New(http.StatusConflict, "field-exists",
-				fmt.Sprintf("поле «%s» в твоём списке уже есть", name),
-				"назови другое имя",
-				"или посмотри список: GET /api/fields")
-		}
-	}
-	field := Field{Name: name, Created: s.stamp()}
-	fields = append(fields, field)
-	if ref := s.writeJSON(ctx, fieldsFile, fields); ref != nil {
-		return Field{}, nil, ref
-	}
-	return field, fields, nil
-}
-
-func (s *Scope) stamp() string { return s.now().UTC().Format(time.RFC3339) }
-
-// ── доступ до места ──────────────────────────────────────────────────────────
-//
-// Ниже — единственные два действия, которыми контроллер трогает скоуп: прочитать файл и
-// записать файл. Обе ветки (здесь / по связи) держатся рядом намеренно: разъедутся они —
-// и локальный скоуп начнёт вести себя не так, как удалённый, а юзеру обещано, что это
-// одно и то же место, просто лежащее в разных местах.
-
-func (s *Scope) read(ctx context.Context, name string) ([]byte, bool, *refusal.Refusal) {
-	if s.Addr.Here {
-		data, err := os.ReadFile(filepath.Join(s.Addr.Path, name))
-		switch {
-		case err == nil:
-			return data, true, nil
-		case os.IsNotExist(err):
-			return nil, false, nil
-		default:
-			return nil, false, refusal.New(http.StatusInternalServerError, "scope-unreadable",
-				fmt.Sprintf("%s по адресу %s не прочитался: %v", name, s.Addr, err),
-				"проверь права на путь внутри контроллера",
-				"путь монтируется томом при подъёме — см. control/README.md")
-		}
-	}
-
-	// Удалённая сторона отвечает нашим кодом 66, если файла нет: `cat` своим кодом
-	// «нет файла» и «не прочитал» не различает.
-	remote := fmt.Sprintf("if [ -e %s ]; then cat -- %s; else exit %d; fi",
-		quote(s.file(name)), quote(s.file(name)), missingMarker)
-	res, err := s.runner.Run(ctx, run.Command{Name: "ssh", Args: append(s.sshArgs(), remote)})
-	if ref := s.sshFailure(res, err); ref != nil {
-		return nil, false, ref
-	}
-	if res.Code == missingMarker {
-		return nil, false, nil
-	}
-	if res.Code != 0 {
-		return nil, false, refusal.New(http.StatusBadGateway, "scope-unreadable",
-			fmt.Sprintf("%s по адресу %s не прочитался: %s", name, s.Addr, tail(res.Err)),
-			"проверь права на путь на том ресурсе",
-			"путь и юзер в адресе — те же, что у ssh")
-	}
-	return []byte(res.Out), true, nil
-}
-
-func (s *Scope) writeJSON(ctx context.Context, name string, v any) *refusal.Refusal {
-	data, err := json.MarshalIndent(v, "", "  ")
+	data, err := io.ReadAll(io.LimitReader(res.Body, readLimit+1))
 	if err != nil {
-		return refusal.New(http.StatusInternalServerError, "scope-unwritable",
-			fmt.Sprintf("%s не собрался в JSON: %v", name, err),
+		return nil, refusal.New(http.StatusBadGateway, "scope-unreachable",
+			fmt.Sprintf("раздача по адресу %s оборвала ответ на полпути: %v", s.Addr, err),
+			"повтори попытку",
+			"если повторяется — смотри журнал самой раздачи: она на машине юзера, а не здесь")
+	}
+	if len(data) > readLimit {
+		return nil, refusal.New(http.StatusBadGateway, "state-too-big",
+			fmt.Sprintf("по адресу %s отдают больше %d байт — столько состояние не весит", s.Addr, readLimit),
+			"проверь, что по адресу стоит раздача скоупа, а не что-то другое")
+	}
+	return state.Parse(data)
+}
+
+// Write — состояние целиком. Ручек по разделам нет и не заводится: раздача принимает файл,
+// и точка (`WORLD2` 3.4). Цена названа вслух там же: **последний пишущий затирает
+// предыдущего**. Пока пульт один, этого не случится.
+func (s *Scope) Write(ctx context.Context, st *state.State) *refusal.Refusal {
+	data, err := st.Bytes()
+	if err != nil {
+		return refusal.New(http.StatusInternalServerError, "state-unwritable",
+			"состояние не собралось в файл: "+err.Error(),
 			"это дефект контроллера — заведи задачу зоне control")
 	}
-	data = append(data, '\n')
 
-	if s.Addr.Here {
-		if err := os.MkdirAll(s.Addr.Path, 0o700); err != nil {
-			return refusal.New(http.StatusInternalServerError, "scope-unwritable",
-				fmt.Sprintf("каталог скоупа %s не завёлся: %v", s.Addr.Path, err),
-				"проверь, что том смонтирован и права на нём есть")
-		}
-		// Через времянку и переименование: оборванная запись не должна оставлять
-		// покалеченную личность. Личность у юзера одна, второй попытки прочитать её
-		// «как было» у него нет.
-		tmp := filepath.Join(s.Addr.Path, "."+name+".tmp")
-		if err := os.WriteFile(tmp, data, 0o600); err != nil {
-			return refusal.New(http.StatusInternalServerError, "scope-unwritable",
-				fmt.Sprintf("%s не записался: %v", name, err),
-				"проверь права на путь внутри контроллера")
-		}
-		if err := os.Rename(tmp, filepath.Join(s.Addr.Path, name)); err != nil {
-			return refusal.New(http.StatusInternalServerError, "scope-unwritable",
-				fmt.Sprintf("%s не встал на место: %v", name, err),
-				"проверь права на путь внутри контроллера")
-		}
-		return nil
-	}
-
-	tmp := s.file("." + name + ".tmp")
-	remote := fmt.Sprintf("mkdir -p %s && cat > %s && mv %s %s",
-		quote(s.Addr.Path), quote(tmp), quote(tmp), quote(s.file(name)))
-	res, err := s.runner.Run(ctx, run.Command{Name: "ssh", Args: append(s.sshArgs(), remote), Stdin: string(data)})
-	if ref := s.sshFailure(res, err); ref != nil {
+	res, ref := s.do(ctx, http.MethodPut, data)
+	if ref != nil {
 		return ref
 	}
-	if res.Code != 0 {
-		return refusal.New(http.StatusBadGateway, "scope-unwritable",
-			fmt.Sprintf("%s по адресу %s не записался: %s", name, s.Addr, tail(res.Err)),
-			"проверь права юзера из адреса на этот путь",
-			"проверь, что на том ресурсе есть место")
-	}
-	return nil
-}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16))
 
-func (s *Scope) file(name string) string { return path.Join(s.Addr.Path, name) }
-
-// sshArgs — как мы ходим по связи. `BatchMode` обязателен: без него ssh на непринятом
-// ключе уходит спрашивать пароль в пустой терминал и висит до предела времени, а человеку
-// вместо «ключ не принят» приезжает молчание.
-func (s *Scope) sshArgs() []string {
-	args := []string{
-		"-o", "BatchMode=yes",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "ConnectTimeout=" + strconv.Itoa(s.timeout),
-	}
-	if s.Addr.Port != 22 {
-		args = append(args, "-p", strconv.Itoa(s.Addr.Port))
-	}
-	if s.key != "" {
-		// IdentitiesOnly — чтобы агент не подсунул первый попавшийся ключ: юзер назвал
-		// креды к ЭТОМУ адресу, и ходить надо ими, иначе «ключ не принят» приедет про
-		// чужой ключ.
-		args = append(args, "-i", s.key, "-o", "IdentitiesOnly=yes")
-	}
-	return append(args, s.Addr.UserAt)
-}
-
-// sshFailure разбирает, ЧТО именно не получилось. Ступени взяты те же, что у шлюза
-// (`gate/README.md`): дорога · ответ · доступ. Чинят их разные люди, и общий отказ
-// «не дотянулись» отправляет человека чинить наугад.
-func (s *Scope) sshFailure(res run.Result, err error) *refusal.Refusal {
-	if err != nil {
-		if errors.Is(err, run.ErrNoTool) {
-			return refusal.New(http.StatusInternalServerError, "no-ssh",
-				"скоуп лежит на другом ресурсе, а ssh в контроллере нет",
-				"это дефект образа контроллера — заведи задачу зоне control",
-				"пока: положи скоуп на ресурс контроллера — путь /scope/…")
-		}
-		return refusal.New(http.StatusGatewayTimeout, "scope-silent",
-			fmt.Sprintf("ресурс %s не ответил за отведённое время", s.Addr.Host),
-			"разобрать по ступеням: ./gate/gate.sh check (GATE_ADDR="+s.Addr.UserAt+")",
-			"дай больше времени: CONTROL_SSH_TIMEOUT=30")
-	}
-	if res.Code != 255 {
-		return nil // 255 у ssh — «связь не состоялась»; всё прочее сказала уже команда
-	}
-
-	text := res.Err
-	switch {
-	case containsAny(text, "Permission denied", "Too many authentication failures", "no such identity", "Host key verification failed"):
-		return refusal.New(http.StatusForbidden, "access-denied",
-			fmt.Sprintf("ресурс %s ответил, но креды не принял", s.Addr.Host),
-			"проверь ключ: он приезжает полем creds при входе",
-			"проверь юзера в адресе: ходим именно им",
-			"подробность: "+tail(text))
-	case containsAny(text, "No route to host", "Network is unreachable", "Name or service not known", "could not resolve", "Could not resolve", "nodename nor servname"):
-		return refusal.New(http.StatusBadGateway, "no-route",
-			fmt.Sprintf("до ресурса %s нет дороги — адрес не разрешается или не маршрутизируется", s.Addr.Host),
-			"проверь адрес",
-			"если ресурс за туннелем — подними его: это хозяйство машины, не мира",
-			"подробность: "+tail(text))
-	case containsAny(text, "Connection refused", "Connection timed out", "Connection closed", "Operation timed out"):
-		return refusal.New(http.StatusBadGateway, "no-answer",
-			fmt.Sprintf("дорога до %s есть, а ssh на порту %d не отвечает", s.Addr.Host, s.Addr.Port),
-			"проверь, что ssh на том ресурсе поднят",
-			"если порт не 22 — назови его: user@host:2222:/srv/scope",
-			"подробность: "+tail(text))
+	switch res.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		return nil
 	default:
-		return refusal.New(http.StatusBadGateway, "scope-unreachable",
-			fmt.Sprintf("до скоупа %s дотянуться не вышло", s.Addr),
-			"разобрать по ступеням: ./gate/gate.sh check (GATE_ADDR="+s.Addr.UserAt+")",
-			"подробность: "+tail(text))
+		return s.answerFailure(res)
 	}
 }
 
-// ── мелочи, у которых есть причина ───────────────────────────────────────────
+// ── разговор с раздачей ──────────────────────────────────────────────────────
 
-// quote — единственный способ, которым значение попадает в команду на той стороне.
-// Путь называет человек, и одинарная кавычка в нём ломала бы команду. Соседняя зона на
-// этом уже поймана ревью (`WORLD2-96`, пункт 2) — повторять её грабли незачем.
-func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
-
-func containsAny(text string, needles ...string) bool {
-	for _, n := range needles {
-		if strings.Contains(text, n) {
-			return true
-		}
+func (s *Scope) do(ctx context.Context, method string, body []byte) (*http.Response, *refusal.Refusal) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
 	}
-	return false
+	req, err := http.NewRequestWithContext(ctx, method, s.Addr.URL.String(), reader)
+	if err != nil {
+		return nil, refusal.New(http.StatusBadRequest, "bad-address",
+			fmt.Sprintf("по адресу %s запрос не собрался: %v", s.Addr, err),
+			"назови адрес раздачи целиком: http://10.8.0.5:8070/")
+	}
+	// Имя в `Basic` не смотрится — личность определяется адресом, а не именем
+	// (`share/PROTOCOL.md`). Пустое имя названо здесь явно, чтобы это было видно.
+	req.SetBasicAuth("", s.password)
+	if body != nil {
+		// Тип называем честно: внутрь файла мы не смотрим, а раздача не разбирает его тем
+		// более. Свой заголовок сюда не ставится ни один — узнавать «свою» раздачу нельзя.
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, s.reachFailure(err)
+	}
+	return res, nil
 }
 
-// tail — последняя внятная строка чужого вывода. Целиком его в отказ не кладём: человеку
-// нужна причина, а не журнал ssh.
-func tail(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if line := strings.TrimSpace(lines[i]); line != "" {
-			return line
-		}
+// reachFailure — ступени связи: дорога · ответ · тишина. Чинят их разные люди, и общий
+// отказ «не дотянулись» отправляет человека чинить наугад (`WORLD2` 2.3). Ступени те же,
+// что у шлюза (`gate/README.md`) и у соседних зон.
+func (s *Scope) reachFailure(err error) *refusal.Refusal {
+	where := s.Addr.String()
+
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return refusal.New(http.StatusBadGateway, "no-route",
+			fmt.Sprintf("имя %s не разрешается — до раздачи скоупа нет дороги", s.Addr.Host),
+			"проверь адрес: "+where,
+			"если машина за туннелем — подними его: это хозяйство машины, не мира")
 	}
-	return "(инструмент промолчал)"
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return refusal.New(http.StatusBadGateway, "no-answer",
+			fmt.Sprintf("до %s дорога есть, а раздача по адресу %s не отвечает — порт закрыт", s.Addr.Host, where),
+			"проверь, что раздача на той машине поднята: docker ps на ней покажет её контейнер",
+			"подними её: POST /api/scope с этим адресом и машиной, где раздача должна стоять",
+			"адрес назван с другим портом — проверь его: раздача по умолчанию слушает 8070")
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return refusal.New(http.StatusGatewayTimeout, "scope-silent",
+			fmt.Sprintf("раздача по адресу %s не ответила за отведённое время", where),
+			"дай больше времени: CONTROL_SCOPE_TIMEOUT=30",
+			"проверь, что машина с раздачей жива и её порт виден отсюда")
+	}
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+		return refusal.New(http.StatusBadGateway, "no-route",
+			fmt.Sprintf("до машины %s нет дороги", s.Addr.Host),
+			"проверь адрес: "+where,
+			"если машина за туннелем — подними его: это хозяйство машины, не мира")
+	}
+	return refusal.New(http.StatusBadGateway, "scope-unreachable",
+		fmt.Sprintf("до раздачи по адресу %s дотянуться не вышло: %v", where, err),
+		"проверь адрес и то, что раздача на той машине поднята",
+		"подробность выше — она от сети, а не от мира")
 }
 
-// safeName — имя в подсказке пути. Только для текста выхода: в путь оно не идёт.
-func safeName(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "" {
-		return "мой-скоуп"
+// answerFailure — раздача ОТВЕТИЛА, но не тем. Разбираем СТАТУС, а тело берём подробностью:
+// чужая вилка вправе ответить голым кодом без тела, и требовать от неё наших слов нельзя.
+func (s *Scope) answerFailure(res *http.Response) *refusal.Refusal {
+	where := s.Addr.String()
+	detail := body(res)
+
+	switch res.StatusCode {
+	case http.StatusUnauthorized:
+		return refusal.New(http.StatusUnauthorized, "bad-password",
+			fmt.Sprintf("раздача по адресу %s пароль не приняла%s", where, detail),
+			"проверь пароль скоупа — им закрыта раздача, и внутри файла состояния его нет",
+			"пароль называется при подъёме раздачи (SHARE_PASSWORD у нашей вилки)",
+			"адрес мог указывать на ЧУЖУЮ раздачу — проверь его")
+	case http.StatusForbidden:
+		return refusal.New(http.StatusForbidden, "access-denied",
+			fmt.Sprintf("раздача по адресу %s пускать отказалась%s", where, detail),
+			"это решение той раздачи, а не мира: смотри её правила и её журнал")
+	case http.StatusRequestEntityTooLarge:
+		return refusal.New(http.StatusRequestEntityTooLarge, "state-too-big",
+			fmt.Sprintf("раздача по адресу %s не приняла состояние: оно больше её предела записи%s", where, detail),
+			"подними предел у раздачи (SHARE_LIMIT у нашей вилки)",
+			"или убери из скоупа лишнее — ключи и территории, которыми не пользуешься")
+	case http.StatusMethodNotAllowed:
+		return refusal.New(http.StatusBadGateway, "not-a-share",
+			fmt.Sprintf("по адресу %s кто-то отвечает, но двух ручек скоупа у него нет%s", where, detail),
+			"проверь адрес: раздача отдаёт состояние по GET и принимает по PUT в корне",
+			"форма стыковки целиком — `WORLD2` 3.4 и share/PROTOCOL.md")
+	default:
+		return refusal.New(http.StatusBadGateway, "share-failed",
+			fmt.Sprintf("раздача по адресу %s ответила %d%s", where, res.StatusCode, detail),
+			"это ответ той раздачи, а не мира — смотри её журнал: она на машине юзера",
+			"проверь, что по адресу стоит раздача скоупа, а не другая вещь")
 	}
-	return strings.ReplaceAll(s, " ", "-")
+}
+
+// body — тело чужого ответа коротким куском. Тело здесь ПОДРОБНОСТЬ, а не источник кода:
+// решение принято по статусу выше, и голое тело ничего не меняет.
+func body(res *http.Response) string {
+	data, err := io.ReadAll(io.LimitReader(res.Body, 400))
+	if err != nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return ""
+	}
+	return " — она сказала: " + strings.ReplaceAll(text, "\n", " ")
 }

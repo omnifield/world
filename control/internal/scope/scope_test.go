@@ -2,322 +2,333 @@ package scope
 
 import (
 	"context"
-	"encoding/json"
-	"os"
-	"path/filepath"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
-	"time"
 
-	"github.com/omnifield/world/control/internal/run"
+	"github.com/omnifield/world/control/internal/state"
 )
 
-func fixedNow() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) }
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ЧТО ЗДЕСЬ СТЕРЕЖЁТСЯ: контроллер разговаривает с РАЗДАЧЕЙ по форме мира (`WORLD2`    │
+// │ 3.4, `0.3`) и не узнаёт «свою» ни по чему. Поэтому подставная раздача ниже — голая:  │
+// │ она отвечает статусом и телом, каких вправе ответить чужая вилка «хоть на ардуино».  │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
 
-func local(t *testing.T, dir string) *Scope {
+// раздача — подставная вилка. Она НЕ притворяется нашей: две ручки, пароль, и больше
+// ничего. Ни одного своего заголовка она не ставит — и контроллер обязан работать так же.
+type раздача struct {
+	*httptest.Server
+	пароль    string
+	состояние []byte
+	принято   []byte
+	метод     []string
+	// голыйОтказ — отвечать `401` БЕЗ тела, как вправе отвечать чужая раздача.
+	голыйОтказ bool
+}
+
+func поднятьРаздачу(t *testing.T, пароль string, состояние []byte) *раздача {
 	t.Helper()
-	addr, ref := Parse(dir)
-	if ref != nil {
-		t.Fatalf("адрес %s не разобрался: %v", dir, ref)
+	ш := &раздача{пароль: пароль, состояние: состояние}
+	ш.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ш.метод = append(ш.метод, r.Method+" "+r.URL.Path)
+		_, пароль, есть := r.BasicAuth()
+		if !есть || пароль != ш.пароль {
+			w.WriteHeader(http.StatusUnauthorized)
+			if !ш.голыйОтказ {
+				_, _ = w.Write([]byte(`{"code":"bad-creds","why":"пароль не подошёл","ways":["проверь пароль"]}`))
+			}
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			if ш.состояние == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write(ш.состояние)
+		case http.MethodPut:
+			buf := make([]byte, 1<<20)
+			n, _ := r.Body.Read(buf)
+			ш.принято = buf[:n]
+			ш.состояние = ш.принято
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.Header().Set("Allow", "GET, PUT")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(ш.Close)
+	return ш
+}
+
+func личность(t *testing.T) []byte {
+	t.Helper()
+	data, err := state.New("егор", "омнифилд").Bytes()
+	if err != nil {
+		t.Fatal(err)
 	}
-	return Open(addr, &run.Fake{}, "", 5, fixedNow)
+	return data
+}
+
+func открыть(t *testing.T, ш *раздача, пароль string) *Scope {
+	t.Helper()
+	addr, ref := Parse(ш.URL)
+	if ref != nil {
+		t.Fatalf("свой же адрес не разобрался: %s", ref.Why)
+	}
+	return Open(addr, пароль, 5)
 }
 
 // ── адрес ────────────────────────────────────────────────────────────────────
 
-func TestParseРазбираетОбеФормы(t *testing.T) {
-	cases := []struct {
-		raw  string
-		here bool
-		user string
-		port int
-		path string
+func TestАдресСкоупаЭтоКореньРаздачи(t *testing.T) {
+	addr, ref := Parse("http://10.8.0.5:8070")
+	if ref != nil {
+		t.Fatalf("законный адрес не принят: %s", ref.Why)
+	}
+	if addr.URL.Path != "/" || addr.Host != "10.8.0.5" {
+		t.Fatalf("адрес разобран не так: %+v", addr)
+	}
+}
+
+func TestАдресОтказываетТамГдеУгадыватьНельзя(t *testing.T) {
+	tests := []struct {
+		имя   string
+		адрес string
+		код   string
 	}{
-		{"/scope/егор", true, "", 0, "/scope/егор"},
-		{"/scope/../scope/егор/", true, "", 0, "/scope/егор"},
-		{"world@10.8.0.5:/srv/scope", false, "world@10.8.0.5", 22, "/srv/scope"},
-		{"world@10.8.0.5:2222:/srv/scope", false, "world@10.8.0.5", 2222, "/srv/scope"},
+		{"пусто", "", "no-address"},
+		{"без протокола", "10.8.0.5:8070", "bad-address"},
+		{"чужой протокол", "ssh://world@10.8.0.5/scope", "bad-address"},
+		{"путь внутри раздачи", "http://10.8.0.5:8070/егор", "bad-address"},
+		{"пароль в адресе", "http://:пароль@10.8.0.5:8070/", "bad-address"},
+		{"прежняя форма — путь на машине", "/scope/егор", "bad-address"},
 	}
-	for _, c := range cases {
-		addr, ref := Parse(c.raw)
-		if ref != nil {
-			t.Fatalf("%s: неожиданный отказ %s", c.raw, ref.Code)
-		}
-		if addr.Here != c.here || addr.UserAt != c.user || addr.Path != c.path {
-			t.Fatalf("%s разобрался как here=%v user=%q path=%q", c.raw, addr.Here, addr.UserAt, addr.Path)
-		}
-		if !c.here && addr.Port != c.port {
-			t.Fatalf("%s: порт %d вместо %d", c.raw, addr.Port, c.port)
-		}
-	}
-}
-
-func TestParseОтказываетКодом(t *testing.T) {
-	cases := map[string]string{
-		"":                       "no-address",
-		"   ":                    "no-address",
-		"просто-слово":           "bad-address",
-		"@10.8.0.5:/srv/scope":   "bad-address", // юзер не назван — молча брать текущего нельзя
-		"world@10.8.0.5":         "bad-address", // пути нет
-		"world@:/srv/scope":      "bad-address", // машины нет
-		"world@10.8.0.5:xx:/srv": "bad-address", // порт не число
-		"world@10.8.0.5:srv":     "bad-address", // путь не абсолютный
-	}
-	for raw, want := range cases {
-		_, ref := Parse(raw)
-		if ref == nil {
-			t.Fatalf("%q: отказа не было, а обязан", raw)
-		}
-		if ref.Code != want {
-			t.Fatalf("%q: код %s вместо %s", raw, ref.Code, want)
-		}
-		if len(ref.Ways) == 0 {
-			t.Fatalf("%q: отказ без выхода — тупик (WORLD2 2.3)", raw)
-		}
+	for _, tt := range tests {
+		t.Run(tt.имя, func(t *testing.T) {
+			_, ref := Parse(tt.адрес)
+			if ref == nil {
+				t.Fatalf("адрес %q принят молча", tt.адрес)
+			}
+			if ref.Code != tt.код || len(ref.Ways) == 0 {
+				t.Fatalf("отказ не тот: %+v", ref)
+			}
+		})
 	}
 }
 
-// ── скоуп здесь ──────────────────────────────────────────────────────────────
+// ── чтение и запись ──────────────────────────────────────────────────────────
 
-func TestЗавестиИВойти(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "scope")
-	sc := local(t, dir)
+func TestСостояниеБерётсяПоАдресуЦеликом(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", личность(t))
+	sc := открыть(t, ш, "тайна")
 
-	id, ref := sc.Create(context.Background(), "егор", "омнифилд")
+	st, ref := sc.Read(context.Background())
 	if ref != nil {
-		t.Fatalf("личность не завелась: %v", ref)
+		t.Fatalf("состояние не прочиталось: %s — %s", ref.Code, ref.Why)
 	}
-	if id.Name != "егор" || id.Created != "2026-08-14T12:00:00Z" {
-		t.Fatalf("личность собралась не так: %+v", id)
+	if st.Identity.Name != "егор" {
+		t.Fatalf("прочиталась не та личность: %+v", st.Identity)
 	}
-
-	again, ref := sc.Enter(context.Background())
-	if ref != nil {
-		t.Fatalf("вход не состоялся: %v", ref)
-	}
-	if again.Name != "егор" || again.Brand != "омнифилд" {
-		t.Fatalf("вошли не в ту личность: %+v", again)
-	}
-
-	// Список полей заведён сразу пустым — «полей нет» и «файла нет» не должны быть
-	// одним и тем же состоянием.
-	fields, ref := sc.Fields(context.Background())
-	if ref != nil || len(fields) != 0 {
-		t.Fatalf("список полей: %v %v", fields, ref)
+	if len(ш.метод) != 1 || ш.метод[0] != "GET /" {
+		t.Fatalf("контроллер ходил в раздачу не одной ручкой в корне: %v", ш.метод)
 	}
 }
 
-func TestВходБезСкоупаЗовётЗавести(t *testing.T) {
-	sc := local(t, filepath.Join(t.TempDir(), "пусто"))
-	_, ref := sc.Enter(context.Background())
+func TestЗаписьИдётЦеликомВКорень(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", личность(t))
+	sc := открыть(t, ш, "тайна")
+
+	st, _ := sc.Read(context.Background())
+	_ = st.AddField("дом")
+	if ref := sc.Write(context.Background(), st); ref != nil {
+		t.Fatalf("состояние не записалось: %s — %s", ref.Code, ref.Why)
+	}
+	if ш.метод[len(ш.метод)-1] != "PUT /" {
+		t.Fatalf("запись пошла не PUT в корень: %v", ш.метод)
+	}
+	if !strings.Contains(string(ш.принято), `"дом"`) {
+		t.Fatalf("в раздачу уехало не состояние целиком:\n%s", ш.принято)
+	}
+	// Ручек по разделам нет и не заводится (`WORLD2` 3.4): приезжает ФАЙЛ, а в нём все
+	// разделы, включая нетронутые.
+	for _, раздел := range []string{"личность", "ключи", "территории", "поля"} {
+		if !strings.Contains(string(ш.принято), раздел) {
+			t.Fatalf("в записанном файле нет раздела %q — записан не файл целиком", раздел)
+		}
+	}
+}
+
+// ── ступени отказа: дорога · ответ · пароль · формат ──────────────────────────
+
+func TestНеверныйПарольЭтоОтказСПричинойИВыходом(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", личность(t))
+	sc := открыть(t, ш, "не-та")
+
+	_, ref := sc.Read(context.Background())
+	if ref == nil || ref.Code != "bad-password" || len(ref.Ways) == 0 {
+		t.Fatalf("отказ не тот: %+v", ref)
+	}
+}
+
+// Чужая раздача вправе ответить ГОЛЫМ `401` без тела — и это законная раздача (`0.3`).
+// Клиент читает СТАТУС, а тело берёт подробностью: разъедься это правило, мир перестал бы
+// принимать чужие вилки.
+func TestГолыйОтказЧужойРаздачиЧитаетсяТакЖе(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", личность(t))
+	ш.голыйОтказ = true
+	sc := открыть(t, ш, "не-та")
+
+	_, ref := sc.Read(context.Background())
+	if ref == nil || ref.Code != "bad-password" {
+		t.Fatalf("голый 401 прочитан иначе, чем наш: %+v", ref)
+	}
+}
+
+func TestРаздачаЕстьАСостоянияНетЭтоРазвилка(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", nil)
+	sc := открыть(t, ш, "тайна")
+
+	_, ref := sc.Read(context.Background())
 	if ref == nil || ref.Code != "no-scope" {
-		t.Fatalf("ждали no-scope, получили %v", ref)
+		t.Fatalf("свежая раздача прочиталась не как развилка: %+v", ref)
 	}
-	if !strings.Contains(strings.Join(ref.Ways, " "), "create") {
-		t.Fatalf("отказ не назвал выход «завести здесь»: %v", ref.Ways)
-	}
-}
-
-func TestЗавестиПоверхЛичностиНельзя(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "scope")
-	sc := local(t, dir)
-	if _, ref := sc.Create(context.Background(), "егор", ""); ref != nil {
-		t.Fatalf("первая личность не завелась: %v", ref)
-	}
-	_, ref := sc.Create(context.Background(), "другой", "")
-	if ref == nil || ref.Code != "scope-exists" {
-		t.Fatalf("ждали scope-exists, получили %v", ref)
-	}
-	// И главное: та, что была, осталась цела.
-	id, _ := sc.Enter(context.Background())
-	if id.Name != "егор" {
-		t.Fatalf("личность затёрта: %+v", id)
+	if !strings.Contains(strings.Join(ref.Ways, " "), "/api/scope") {
+		t.Fatalf("отказ не позвал завести скоуп по адресу: %v", ref.Ways)
 	}
 }
 
-func TestЗавестиНаЧужомРесурсеОтказ(t *testing.T) {
-	addr, _ := Parse("world@10.8.0.5:/srv/scope")
-	sc := Open(addr, &run.Fake{}, "", 5, fixedNow)
-	_, ref := sc.Create(context.Background(), "егор", "")
-	if ref == nil || ref.Code != "create-elsewhere" {
-		t.Fatalf("ждали create-elsewhere, получили %v", ref)
+func TestПоАдресуЛежитНеНашФормат(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", []byte(`{"формат":2,"личность":{"имя":"егор"}}`))
+	sc := открыть(t, ш, "тайна")
+
+	_, ref := sc.Read(context.Background())
+	if ref == nil || ref.Code != "bad-format" {
+		t.Fatalf("чужая версия формата принята: %+v", ref)
+	}
+	if !strings.Contains(ref.Why, "2") || !strings.Contains(ref.Why, "1") {
+		t.Fatalf("отказ не назвал, что приехало и что мы умеем: %s", ref.Why)
 	}
 }
 
-func TestПоляЗаводятсяИНеДублируются(t *testing.T) {
-	sc := local(t, filepath.Join(t.TempDir(), "scope"))
-	if _, ref := sc.Create(context.Background(), "егор", ""); ref != nil {
-		t.Fatalf("личность не завелась: %v", ref)
-	}
-
-	field, fields, ref := sc.AddField(context.Background(), "дом")
-	if ref != nil || field.Name != "дом" || len(fields) != 1 {
-		t.Fatalf("поле не завелось: %v %v %v", field, fields, ref)
-	}
-	if _, _, ref := sc.AddField(context.Background(), "дом"); ref == nil || ref.Code != "field-exists" {
-		t.Fatalf("ждали field-exists, получили %v", ref)
-	}
-	if _, _, ref := sc.AddField(context.Background(), "  "); ref == nil || ref.Code != "no-name" {
-		t.Fatalf("ждали no-name, получили %v", ref)
-	}
-
-	// Поля лежат в СКОУПЕ, а не в памяти процесса: новый доступ по тому же адресу
-	// обязан их видеть — иначе это была бы копия, а обещана связь.
-	fresh := local(t, sc.Addr.Path)
-	got, _ := fresh.Fields(context.Background())
-	if len(got) != 1 || got[0].Name != "дом" {
-		t.Fatalf("поля не доехали до места: %v", got)
-	}
-}
-
-func TestПокалеченнаяЛичностьНеПритворяетсяВходом(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, identityFile), []byte("{это не json"), 0o600); err != nil {
+func TestРаздачаНедоступнаНазываетАдресИВыход(t *testing.T) {
+	// Порт, на котором заведомо никто не слушает: занимаем и сразу отпускаем.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		t.Fatal(err)
 	}
-	sc := local(t, dir)
-	_, ref := sc.Enter(context.Background())
-	if ref == nil || ref.Code != "scope-broken" {
-		t.Fatalf("ждали scope-broken, получили %v", ref)
-	}
-}
+	мёртвый := "http://" + l.Addr().String() + "/"
+	_ = l.Close()
 
-// ── скоуп по связи ───────────────────────────────────────────────────────────
-
-func TestУдалённыйСкоупЧитаетсяСвязью(t *testing.T) {
-	id := Identity{Name: "егор", Brand: "омнифилд"}
-	data, _ := json.Marshal(id)
-
-	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
-		return run.Result{Out: string(data)}, nil
-	}}
-	addr, _ := Parse("world@10.8.0.5:2222:/srv/scope")
-	sc := Open(addr, fake, "/keys/scope-key", 7, fixedNow)
-
-	got, ref := sc.Enter(context.Background())
+	addr, ref := Parse(мёртвый)
 	if ref != nil {
-		t.Fatalf("вход по связи не состоялся: %v", ref)
+		t.Fatal(ref.Why)
 	}
-	if got.Name != "егор" {
-		t.Fatalf("прочитали не ту личность: %+v", got)
+	_, ref = Open(addr, "тайна", 2).Read(context.Background())
+	if ref == nil || ref.Code != "no-answer" {
+		t.Fatalf("отказ не назвал ступень связи: %+v", ref)
+	}
+	if !strings.Contains(ref.Why, мёртвый) || len(ref.Ways) == 0 {
+		t.Fatalf("отказ не назвал адрес или выход: %+v", ref)
+	}
+}
+
+// Ступени связи разные, и чинят их разные люди: имя не разрешается — чинит адрес; порт
+// закрыт — поднимает раздачу; тишина — смотрит на машину. Схлопнуть их в одно «не
+// дотянулись» значит отправить человека чинить наугад (`WORLD2` 2.3).
+//
+// Проверяется РАЗБОР ошибки, а не настоящий резолвер: имя, которого нет, в разных сетях
+// отвечает по-разному (где отказом, где тишиной), и проба, зависящая от сети, стережёт
+// сеть, а не контроллер.
+func TestСтупениСвязиНеСхлопываются(t *testing.T) {
+	addr, _ := Parse("http://10.8.0.5:8070/")
+	sc := Open(addr, "тайна", 5)
+
+	tests := []struct {
+		имя    string
+		ошибка error
+		код    string
+	}{
+		{"имя не разрешается", &net.DNSError{Err: "no such host", Name: "10.8.0.5", IsNotFound: true}, "no-route"},
+		{"порт закрыт", syscall.ECONNREFUSED, "no-answer"},
+		{"машины не видно", syscall.EHOSTUNREACH, "no-route"},
+		{"тишина", &таймаут{}, "scope-silent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.имя, func(t *testing.T) {
+			ref := sc.reachFailure(tt.ошибка)
+			if ref.Code != tt.код {
+				t.Fatalf("ступень названа не та: %q вместо %q (%s)", ref.Code, tt.код, ref.Why)
+			}
+			if len(ref.Ways) == 0 {
+				t.Fatalf("отказ без выхода — тупик: %+v", ref)
+			}
+		})
+	}
+}
+
+// таймаут — ошибка сети, которая говорит о себе «я тишина». Настоящую тишину пришлось бы
+// ждать секундами, а проверяем мы разбор, а не терпение.
+type таймаут struct{}
+
+func (*таймаут) Error() string   { return "i/o timeout" }
+func (*таймаут) Timeout() bool   { return true }
+func (*таймаут) Temporary() bool { return true }
+
+// ── три состояния адреса ─────────────────────────────────────────────────────
+
+func TestLookРазличаетТриСостояния(t *testing.T) {
+	ш := поднятьРаздачу(t, "тайна", личность(t))
+	if есть, ref := открыть(t, ш, "тайна").Look(context.Background()); ref != nil || есть != PresenceState {
+		t.Fatalf("состояние по адресу не увидено: %v %+v", есть, ref)
 	}
 
-	line := fake.Line(0)
-	for _, want := range []string{
-		"ssh", "BatchMode=yes", "ConnectTimeout=7", "-p 2222",
-		"-i /keys/scope-key", "IdentitiesOnly=yes", "world@10.8.0.5",
-		"'/srv/scope/identity.json'",
-	} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("в вызове ssh нет %q:\n%s", want, line)
+	пустая := поднятьРаздачу(t, "тайна", nil)
+	if есть, ref := открыть(t, пустая, "тайна").Look(context.Background()); ref != nil || есть != PresenceEmpty {
+		t.Fatalf("свежая раздача прочиталась не как пустая: %v %+v", есть, ref)
+	}
+
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	мёртвый := "http://" + l.Addr().String() + "/"
+	_ = l.Close()
+	addr, _ := Parse(мёртвый)
+	// Раздачи нет вовсе — это НЕ отказ: заведение скоупа опирается ровно на это состояние.
+	if есть, ref := Open(addr, "тайна", 2).Look(context.Background()); ref != nil || есть != PresenceNone {
+		t.Fatalf("отсутствие раздачи прочиталось как поломка: %v %+v", есть, ref)
+	}
+}
+
+// Пароль проверяет САМА РАЗДАЧА (`WORLD2` 3.4, «базово: везде пароль»), и мы обязаны его
+// приносить. Ходить в чужую личность без предъявленного пароля контроллер не должен уметь.
+func TestПарольЕдетКаждымЗапросом(t *testing.T) {
+	var виделиПароль []bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, пароль, есть := r.BasicAuth()
+		виделиПароль = append(виделиПароль, есть && пароль == "тайна")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(личность(t))
+			return
 		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	addr, _ := Parse(srv.URL)
+	sc := Open(addr, "тайна", 5)
+	st, ref := sc.Read(context.Background())
+	if ref != nil {
+		t.Fatal(ref.Why)
 	}
-}
-
-// Скоуп никуда не копируется — ни в файл, ни в память между вызовами: каждое чтение
-// уходит туда, где скоуп лежит (`WORLD2` 1.6).
-func TestУдалённыйСкоупНеКэшируется(t *testing.T) {
-	calls := 0
-	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
-		calls++
-		return run.Result{Out: `{"name":"егор"}`}, nil
-	}}
-	addr, _ := Parse("world@10.8.0.5:/srv/scope")
-	sc := Open(addr, fake, "", 5, fixedNow)
-
-	_, _ = sc.Enter(context.Background())
-	_, _ = sc.Enter(context.Background())
-	if calls != 2 {
-		t.Fatalf("вход сходил до места %d раз(а) вместо 2 — где-то завёлся кэш", calls)
+	if ref := sc.Write(context.Background(), st); ref != nil {
+		t.Fatal(ref.Why)
 	}
-}
-
-func TestПутьСКавычкойНеЛомаетКоманду(t *testing.T) {
-	var got string
-	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
-		got = c.Args[len(c.Args)-1]
-		return run.Result{Code: missingMarker}, nil
-	}}
-	addr, _ := Parse("world@10.8.0.5:/srv/it's")
-	sc := Open(addr, fake, "", 5, fixedNow)
-	_, _ = sc.Enter(context.Background())
-
-	if !strings.Contains(got, `'/srv/it'\''s/identity.json'`) {
-		t.Fatalf("кавычка в пути не экранирована — команда на той стороне разъедется:\n%s", got)
-	}
-}
-
-func TestНетФайлаНаТойСторонеЭтоНеПоломка(t *testing.T) {
-	fake := &run.Fake{Answer: func(run.Command) (run.Result, error) {
-		return run.Result{Code: missingMarker}, nil
-	}}
-	addr, _ := Parse("world@10.8.0.5:/srv/scope")
-	sc := Open(addr, fake, "", 5, fixedNow)
-
-	_, ref := sc.Enter(context.Background())
-	if ref == nil || ref.Code != "no-scope" {
-		t.Fatalf("ждали no-scope (приглашение завести), получили %v", ref)
-	}
-}
-
-// Ступени те же, что у шлюза: дорога · ответ · доступ. Чинят их разные люди, и общий
-// отказ «не дотянулись» отправляет человека чинить наугад.
-func TestСтупениСвязиРазличаются(t *testing.T) {
-	cases := map[string]string{
-		"world@10.8.0.5: Permission denied (publickey).":                       "access-denied",
-		"ssh: connect to host 10.8.0.5 port 22: No route to host":              "no-route",
-		"ssh: connect to host 10.8.0.5 port 22: Connection refused":            "no-answer",
-		"ssh: Could not resolve hostname нет-такой: Name or service not known": "no-route",
-		"что-то, чего мы не знаем":                                             "scope-unreachable",
-	}
-	for stderr, want := range cases {
-		fake := &run.Fake{Answer: func(run.Command) (run.Result, error) {
-			return run.Result{Code: 255, Err: stderr}, nil
-		}}
-		addr, _ := Parse("world@10.8.0.5:/srv/scope")
-		sc := Open(addr, fake, "", 5, fixedNow)
-
-		_, ref := sc.Enter(context.Background())
-		if ref == nil || ref.Code != want {
-			t.Fatalf("%q → %v, а ждали %s", stderr, ref, want)
+	for i, было := range виделиПароль {
+		if !было {
+			t.Fatalf("запрос %d ушёл без пароля", i)
 		}
-		if len(ref.Ways) == 0 {
-			t.Fatalf("%q: отказ без выхода", stderr)
-		}
-	}
-}
-
-func TestЗаписьПоСвязиИдётЧерезВремянку(t *testing.T) {
-	var remote, stdin string
-	fake := &run.Fake{Answer: func(c run.Command) (run.Result, error) {
-		remote, stdin = c.Args[len(c.Args)-1], c.Stdin
-		return run.Result{}, nil
-	}}
-	addr, _ := Parse("world@10.8.0.5:/srv/scope")
-	sc := Open(addr, fake, "", 5, fixedNow)
-
-	if ref := sc.writeJSON(context.Background(), fieldsFile, []Field{{Name: "дом"}}); ref != nil {
-		t.Fatalf("запись не прошла: %v", ref)
-	}
-	for _, want := range []string{"mkdir -p '/srv/scope'", "cat > '/srv/scope/.fields.json.tmp'", "mv '/srv/scope/.fields.json.tmp' '/srv/scope/fields.json'"} {
-		if !strings.Contains(remote, want) {
-			t.Fatalf("в команде записи нет %q:\n%s", want, remote)
-		}
-	}
-	if !strings.Contains(stdin, `"дом"`) {
-		t.Fatalf("тело не доехало: %s", stdin)
-	}
-}
-
-func TestБезSshСкоупНаЧужомРесурсеОтказываетВнятно(t *testing.T) {
-	fake := &run.Fake{Answer: func(run.Command) (run.Result, error) {
-		return run.Result{}, run.ErrNoTool
-	}}
-	addr, _ := Parse("world@10.8.0.5:/srv/scope")
-	sc := Open(addr, fake, "", 5, fixedNow)
-
-	_, ref := sc.Enter(context.Background())
-	if ref == nil || ref.Code != "no-ssh" {
-		t.Fatalf("ждали no-ssh, получили %v", ref)
 	}
 }
