@@ -18,8 +18,12 @@ import { Button, Field, Input, Label, Textarea } from "./ui.jsx";
 
 export type WorldProps = {
   control: Control;
-  /** Вернуться на экран входа. Нужен, когда сессии контроллера не стало: он живёт в памяти. */
-  onLeave: () => void;
+  /**
+   * Вернуться на экран входа. Зовётся из двух разных мест, и это разные события: состоявшийся
+   * ВЫХОД (контроллер снял свои времянки и сказал об этом словами) и «сессии не стало» —
+   * контроллер живёт в памяти процесса и мог перезапуститься.
+   */
+  onLeave: (сказано?: string) => void;
 };
 
 export function World(props: WorldProps) {
@@ -68,10 +72,14 @@ export function World(props: WorldProps) {
                     {(brand) => brand()}
                   </Show>
                 </dd>
+                {/* Скоуп лежит ПО АДРЕСУ и раздаётся оттуда (`WORLD2` 3.4, `WORLD2-132`).
+                    Прежней приписки «на ресурсе контроллера» больше нет и быть не может:
+                    контроллер личности не держит — он времянка (`1.9`), и вопрос «на этом
+                    ли он ресурсе» перестал существовать вместе с ответом «да». */}
                 <dt>скоуп</dt>
-                <dd>
-                  <code>{me().scope.addr}</code>{" "}
-                  {me().scope.here ? "— на ресурсе контроллера" : "— на другом ресурсе, по связи"}
+                <dd data-me-scope>
+                  <code>{me().scope.addr}</code> — раздаётся машиной{" "}
+                  <code data-scope-host>{me().scope.host}</code>
                 </dd>
                 <Show when={me().since}>
                   {(since) => (
@@ -90,6 +98,7 @@ export function World(props: WorldProps) {
         <Show when={who()?.kind === "refusal"}>
           <Button onClick={() => props.onLeave()}>Войти заново</Button>
         </Show>
+        <Выход control={props.control} onLeft={(сказано) => props.onLeave(сказано)} />
       </section>
 
       {/* ── поля ──────────────────────────────────────────────────────────── */}
@@ -117,13 +126,23 @@ export function World(props: WorldProps) {
                 <ul class="pult__list">
                   <For each={list()}>
                     {(field) => (
+                      // Адрес и состояние поля показываются, только когда они есть: пока
+                      // поле лишь записано в скоуп и никуда не поднято, они пусты — и
+                      // пустая строка рядом с именем говорила бы, что что-то отвалилось.
                       <li class="pult__item" data-field={field.name}>
                         <span class="pult__name">{field.name}</span>
-                        <Show when={field.created}>
-                          {(created) => (
-                            <time class="pult__aside" datetime={created()}>
-                              {created()}
-                            </time>
+                        <Show when={field.addr}>
+                          {(addr) => (
+                            <code class="pult__aside" data-field-addr>
+                              {addr()}
+                            </code>
+                          )}
+                        </Show>
+                        <Show when={field.state}>
+                          {(состояние) => (
+                            <span class="pult__aside" data-field-state>
+                              — {состояние()}
+                            </span>
                           )}
                         </Show>
                       </li>
@@ -154,9 +173,27 @@ export function World(props: WorldProps) {
               <h2>
                 Источники ресурса: <span data-count-resources>{list().length}</span>
               </h2>
-              <ul class="pult__list">
-                <For each={list()}>{(res) => <СтрокаРесурса res={res} />}</For>
-              </ul>
+              {/* ПУСТО — ЗАКОННОЕ СОСТОЯНИЕ, и до ступени 2 его тут не бывало: в списке
+                  всегда стоял ресурс «здесь», машина контроллера. Теперь список берётся из
+                  СКОУПА (`WORLD2` 3.4), а машина контроллера юзеру не принадлежит — свежая
+                  личность видит здесь ноль строк, и это не отказ и не недоделка. Пустое
+                  место заставило бы гадать, отвалилось ли что-то, поэтому оно сказано
+                  словами. */}
+              <Show
+                when={list().length > 0}
+                fallback={
+                  <p data-state="empty">
+                    Источников ещё нет — и это законное состояние: свежий скоуп это имя и
+                    пустота. Машина, на которой стоит контроллер, сюда не попадает: она не
+                    твоя, а его, и он времянка. Нужна она как участок — заведи её ниже, как
+                    всякую другую.
+                  </p>
+                }
+              >
+                <ul class="pult__list">
+                  <For each={list()}>{(res) => <СтрокаРесурса res={res} />}</For>
+                </ul>
+              </Show>
               <ДобавлениеРесурса
                 control={props.control}
                 onDone={(answer) => setResources(answer)}
@@ -175,25 +212,20 @@ export function World(props: WorldProps) {
  * Ресурс — МАШИНА, до которой дотянулись, а не «машина с дверью» (`WORLD2-131`): про сам
  * ресурс говорит `reach`, про то, что на нём стоит, — список вещей. Два вопроса, два поля, и
  * второй из первого не выводится.
+ *
+ * Ресурса «здесь» в списке больше нет (`WORLD2-132`): список приезжает из скоупа, а машина
+ * контроллера в него не входит — он времянка, и своё хозяйство в личность юзера не
+ * подмешивает. Вместе с «здесь» ушла и строка «адрес изнутри машины не известен»: у каждого
+ * участка адрес есть, потому что его назвал юзер.
  */
 function СтрокаРесурса(props: { res: Resource }) {
   return (
     <li class="pult__item" data-resource={props.res.name}>
-      <span class="pult__name">
-        {props.res.name}
-        <Show when={props.res.here}>
-          {" "}
-          <span class="pult__aside">— здесь стоит контроллер</span>
-        </Show>
-      </span>
+      <span class="pult__name">{props.res.name}</span>
       <dl class="pult__facts">
         <dt>адрес</dt>
         <dd>
-          {/* Адреса у «здесь» нет намеренно: изнутри машины её собственный адрес неизвестен,
-              а подставленный «localhost» стал бы ложью для того, кто смотрит снаружи. */}
-          <Show when={props.res.addr} fallback={<span>изнутри машины не известен</span>}>
-            {(addr) => <code>{addr()}</code>}
-          </Show>
+          <code>{props.res.addr}</code>
         </dd>
         <dt>ресурс</dt>
         {/* Слова контроллера про САМУ машину — «отвечает» либо «молчит». Своей приписки к ним
@@ -244,6 +276,49 @@ function Вещи(props: { things: Resource["things"] }) {
         )}
       </Match>
     </Switch>
+  );
+}
+
+/**
+ * ВЫХОД — ручка, а не забытая метка (`WORLD2-132`, `DELETE /api/session`).
+ *
+ * Выход не трогает своего состояния: скоуп лежит там, где лежал, и открывается тем же адресом
+ * и паролем. Снимаются ВРЕМЯНКИ КОНТРОЛЛЕРА — контексты докера, ключи, блоки в `config`. Без
+ * этого следующий вошедший увидел бы чужие территории, и «личность» перестала бы что-то
+ * значить: ровно это ступень 2 и убирает.
+ *
+ * Отсюда правило экрана: ОТКАЗ ВЫХОДА ОСТАВЛЯЕТ НА МЕСТЕ. Уйти на экран входа, не сняв
+ * времянок, значило бы показать человеку «вышел» там, где он не вышел, — и передать чужой
+ * личности хозяйство предыдущей.
+ */
+function Выход(props: { control: Control; onLeft: (сказано: string) => void }) {
+  const [busy, setBusy] = createSignal(false);
+  const [refusal, setRefusal] = createSignal<Refusal | undefined>();
+
+  async function выйти() {
+    if (busy()) return;
+    setBusy(true);
+    setRefusal(undefined);
+
+    const answer = await props.control.leave();
+    setBusy(false);
+
+    if (answer.kind === "refusal") {
+      setRefusal(answer.refusal);
+      return;
+    }
+    // Слова контроллера о том, чего выход НЕ тронул, едут с нами на экран входа: человек,
+    // не увидевший их, гадал бы, не стёрлась ли вместе с сессией и личность.
+    props.onLeft(answer.value.note);
+  }
+
+  return (
+    <div class="pult__row" data-action="leave">
+      <Button onClick={() => void выйти()} disabled={busy()} aria-busy={busy() ? "true" : undefined}>
+        {busy() ? "Выхожу…" : "Выйти"}
+      </Button>
+      <Show when={refusal()}>{(said) => <RefusalView refusal={said()} />}</Show>
+    </div>
   );
 }
 
@@ -336,9 +411,11 @@ function ДобавлениеРесурса(props: {
     >
       <h3>Добавить ресурс</h3>
       <p class="pult__hint">
-        На названной машине встанет дверь — этим она и включается в мир. Ресурс добавляется по
-        адресу и кредам: своего хранилища ключей мир не заводит, ключ уходит в связку
-        контроллера рядом с адресом.
+        На названной машине встанет дверь — этим она и включается в мир. Называешь ТРИ вещи:
+        имя участка, адрес и креды. Имя даёшь ты, и в твоём скоупе оно не повторяется — на нём
+        стоит адрес локации; из адреса машины мир его не выводит и молча не подставляет.
+        Ключ уходит в твой скоуп и в связку контроллера рядом с адресом: своего
+        хранилища ключей мир не заводит.
       </p>
       <Field class="pult__field" value={name()} onChange={setName}>
         <Label>Имя</Label>

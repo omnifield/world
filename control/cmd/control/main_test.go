@@ -15,7 +15,7 @@ func TestПодсказкаНазываетВсеРучки(t *testing.T) {
 	var sb strings.Builder
 	usage(&sb)
 	for _, path := range []string{
-		"POST   /api/session", "GET    /api/me",
+		"POST   /api/scope", "POST   /api/session", "DELETE /api/session", "GET    /api/me",
 		"GET    /api/resources", "POST   /api/resources", "DELETE /api/resources/{имя}",
 		"GET    /api/recipes",
 		"GET    /api/fields", "POST   /api/fields",
@@ -32,8 +32,8 @@ func TestПодсказкаНазываетВсеЗначения(t *testing.T) 
 	usage(&sb)
 	for _, name := range []string{
 		"CONTROL_ADDR", "CONTROL_KEYS", "CONTROL_REMOTE_SH",
-		"CONTROL_DOCKER", "CONTROL_DOOR_PORT", "CONTROL_TOOL_TIMEOUT", "CONTROL_SSH_TIMEOUT",
-		"CONTROL_PULT", "CONTROL_RECIPES", "CONTROL_DOOR_RECIPE",
+		"CONTROL_DOCKER", "CONTROL_DOOR_PORT", "CONTROL_TOOL_TIMEOUT", "CONTROL_SCOPE_TIMEOUT",
+		"CONTROL_PULT", "CONTROL_RECIPES", "CONTROL_DOOR_RECIPE", "CONTROL_SHARE_RECIPE",
 	} {
 		if !strings.Contains(sb.String(), name) {
 			t.Fatalf("в подсказке нет значения %s — неназванная настройка равна отсутствующей", name)
@@ -53,8 +53,8 @@ func TestЗначенияБерутсяИзОкруженияИначеУмол�
 	if got := number("CONTROL_НЕТ", 10); got != 10 {
 		t.Fatalf("умолчание числа не сработало: %d", got)
 	}
-	t.Setenv("CONTROL_SSH_TIMEOUT", "30")
-	if got := number("CONTROL_SSH_TIMEOUT", 10); got != 30 {
+	t.Setenv("CONTROL_SCOPE_TIMEOUT", "30")
+	if got := number("CONTROL_SCOPE_TIMEOUT", 10); got != 30 {
 		t.Fatalf("названное число не применилось: %d", got)
 	}
 }
@@ -93,5 +93,25 @@ func TestРецептыВыводятсяИзПутиКПодъёму(t *testing
 	}
 	if got := filepath.Join(dir, "recipes"); got != "../deploy/recipes" {
 		t.Fatalf("каталог рецептов выводится не туда: %q", got)
+	}
+	// Рецепт раздачи скоупа выводится той же формулой, но на ярус выше: зона `share` лежит
+	// рядом с зоной `deploy` — и в репозитории, и в образе.
+	if got := filepath.Join(filepath.Dir(dir), "share", "compose.yaml"); got != "../share/compose.yaml" {
+		t.Fatalf("рецепт раздачи скоупа выводится не туда: %q", got)
+	}
+}
+
+// Личность юзера больше НЕ ЛЕЖИТ НА КОНТРОЛЛЕРЕ (`WORLD2-124`): том под скоупы ушёл из
+// раскладки вместе с путём. Останься он в файле запуска — человек снова решил бы, что
+// снос контроллера уносит личность, и раскладка стала бы врать про устройство.
+func TestТомаПодСкоупыВФайлеЗапускаНет(t *testing.T) {
+	data, err := os.ReadFile("../../compose.yaml")
+	if err != nil {
+		t.Skipf("файла запуска рядом нет: %v", err)
+	}
+	for _, gone := range []string{"world-control-scope", "CONTROL_SCOPE_DIR", ":/scope"} {
+		if strings.Contains(string(data), gone) {
+			t.Fatalf("в файле запуска остался след скоупа на контроллере: %q — скоуп лежит по адресу, а не здесь", gone)
+		}
 	}
 }

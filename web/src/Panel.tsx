@@ -31,6 +31,10 @@ export function Panel(props: PanelProps) {
   // страницы — меняется мир, а не тот, кто о нём рассказывает.
   const control = props.control ?? liveControl();
   const [session, setSession] = createSignal<Session | undefined>();
+  // Слова, которыми контроллер простился: что снято и чего он НЕ трогал. Держим их до
+  // следующего входа — человек, вышедший из мира, должен видеть, что личность осталась на
+  // месте, а не гадать, не стёрлась ли она вместе с сессией.
+  const [прощание, setПрощание] = createSignal("");
 
   return (
     <main class="pult">
@@ -49,24 +53,51 @@ export function Panel(props: PanelProps) {
 
       <Show
         when={session()}
-        fallback={<SignIn control={control} onEntered={(entered) => setSession(entered)} />}
+        fallback={
+          <>
+            <Show when={прощание()}>
+              {(сказано) => (
+                <p class="pult__note" data-state="left">
+                  {сказано()}
+                </p>
+              )}
+            </Show>
+            <SignIn
+              control={control}
+              onEntered={(entered) => {
+                setПрощание("");
+                setSession(entered);
+              }}
+            />
+          </>
+        }
       >
         {(entered) => (
           <>
             <Show when={entered().created}>
+              {/* «Заведён здесь» больше не бывает: хода такого не существует (`WORLD2` 3.7).
+                  Скоуп лежит ПО АДРЕСУ, который назвал юзер, и говорим мы именно адрес — он
+                  же и есть то, чем человек будет входить дальше. */}
               <p class="pult__note" data-state="created">
-                Скоуп заведён здесь, на ресурсе контроллера. Дальше он твой: перенести его на
-                другой ресурс можно будет позже, а входить в него — откуда угодно.
+                Скоуп заведён по адресу <code>{entered().scope.addr}</code> — он твой и лежит
+                там, а не в контроллере. Входить в него можно откуда угодно этим же адресом и
+                паролем; снесёшь контроллер — личность останется на месте.
               </p>
             </Show>
-            <World control={control} onLeave={() => setSession(undefined)} />
+            <World
+              control={control}
+              onLeave={(сказано) => {
+                setПрощание(сказано ?? "");
+                setSession(undefined);
+              }}
+            />
           </>
         )}
       </Show>
 
       <footer class="pult__foot">
-        источник — контроллер: <code>/api/session</code>, <code>/api/me</code>,{" "}
-        <code>/api/resources</code>, <code>/api/fields</code>
+        источник — контроллер: <code>/api/scope</code>, <code>/api/session</code>,{" "}
+        <code>/api/me</code>, <code>/api/resources</code>, <code>/api/fields</code>
       </footer>
     </main>
   );

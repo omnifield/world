@@ -44,8 +44,9 @@ const (
 	// Сколько ждём внешний инструмент. Подъём вещи на чистом ресурсе везёт туда образ —
 	// это минуты, а не секунды.
 	defaultToolTimeout = 300
-	// Сколько ждём ответа ssh при работе со скоупом. Меньше — быстрее краснеет.
-	defaultSSHTimeout = 10
+	// Сколько ждём ответа РАЗДАЧИ СКОУПА. Это обычный HTTP-запрос до машины юзера: меньше
+	// — быстрее краснеет, и «раздача молчит» человек узнаёт сразу, а не через минуту.
+	defaultScopeTimeout = 10
 	// Где лежит СОБРАННЫЙ пульт. Умолчание — результат сборки зоны `web`, как его видит
 	// запуск из `control/`: разработчику `go run` плюс `pnpm dev` рядом должны работать
 	// без единой настройки. Образ кладёт пульт в `/opt/world/pult` и называет путь явно —
@@ -76,17 +77,22 @@ func main() {
 	// независимое умолчание того же самого разъехалось бы с первым молча.
 	doorRecipe := env("CONTROL_DOOR_RECIPE", filepath.Join(filepath.Dir(remoteSh), "compose.yaml"))
 	recipesDir := env("CONTROL_RECIPES", filepath.Join(filepath.Dir(remoteSh), "recipes"))
+	// Рецепт РАЗДАЧИ СКОУПА выводится оттуда же и той же формулой: зона `share` лежит
+	// рядом с зоной `deploy` и в репозитории, и в образе. Второе независимое умолчание
+	// того же самого разъехалось бы с первым молча.
+	shareRecipe := env("CONTROL_SHARE_RECIPE", filepath.Join(filepath.Dir(filepath.Dir(remoteSh)), "share", "compose.yaml"))
 
 	handler := api.New(api.Options{
-		Runner:     run.Exec{Timeout: time.Duration(number("CONTROL_TOOL_TIMEOUT", defaultToolTimeout)) * time.Second},
-		RemoteSh:   remoteSh,
-		RecipesDir: recipesDir,
-		DoorRecipe: doorRecipe,
-		Docker:     env("CONTROL_DOCKER", "docker"),
-		KeysDir:    keys,
-		DoorPort:   number("CONTROL_DOOR_PORT", defaultDoorPort),
-		SSHTimeout: number("CONTROL_SSH_TIMEOUT", defaultSSHTimeout),
-		PultDir:    pultDir,
+		Runner:       run.Exec{Timeout: time.Duration(number("CONTROL_TOOL_TIMEOUT", defaultToolTimeout)) * time.Second},
+		RemoteSh:     remoteSh,
+		RecipesDir:   recipesDir,
+		DoorRecipe:   doorRecipe,
+		ShareRecipe:  shareRecipe,
+		Docker:       env("CONTROL_DOCKER", "docker"),
+		KeysDir:      keys,
+		DoorPort:     number("CONTROL_DOOR_PORT", defaultDoorPort),
+		ScopeTimeout: number("CONTROL_SCOPE_TIMEOUT", defaultScopeTimeout),
+		PultDir:      pultDir,
 	})
 
 	log.Printf("control: руки юзера на %s", addr)
@@ -97,6 +103,10 @@ func main() {
 	// ресурса, а не по отказу `no-such-recipe`.
 	log.Printf("control: рецепт двери — %s; каталог рецептов — %s (%s)",
 		doorRecipe, recipesDir, recipesState(recipesDir))
+	// Рецепт раздачи называется ТАМ ЖЕ и по той же причине: без него «завести скоуп»
+	// откажет кодом `no-share-recipe`, и узнать об этом лучше при подъёме, а не в момент,
+	// когда человек уже назвал имя, бренд и пароль.
+	log.Printf("control: рецепт раздачи скоупа — %s (%s)", shareRecipe, fileState(shareRecipe))
 	// Состояние пульта называется В СТАРТОВОЙ СТРОКЕ, а не только на первом запросе:
 	// образ, уехавший без пульта, обнаруживается иначе тогда, когда человек уже открыл
 	// адрес и увидел отказ. Поднятию это не мешает — ручки работают и без лица.
@@ -124,15 +134,24 @@ func usage(w io.Writer) {
   control help       эта подсказка
 
 Ручки (тело и ответы — в control/README.md):
-  POST   /api/session          вход: адрес скоупа и креды; create=true — завести здесь
+  POST   /api/scope            завести скоуп: машина (адрес, креды, имя участка) + скоуп
+                               (адрес раздачи и пароль) + личность (имя, бренд)
+  POST   /api/session          вход: АДРЕС скоупа и ПАРОЛЬ, и больше ничего
+  DELETE /api/session          выход: времянки контроллера снимаются, скоуп не тронут
   GET    /api/me               кто я сейчас
-  GET    /api/resources        источники ресурса: имя, адрес, отвечает ли, что на нём стоит
-  POST   /api/resources        добавить ресурс — на нём встаёт вещь, названная рецептом
-  DELETE /api/resources/{имя}  снять ресурс; в ответе — что осталось на той машине
+  GET    /api/resources        территории юзера: имя, адрес, отвечает ли, что на ней стоит
+  POST   /api/resources        завести территорию — на ней встаёт вещь по рецепту
+  DELETE /api/resources/{имя}  снять территорию; в ответе — что осталось на той машине
   GET    /api/recipes          чем контроллер умеет поднимать: каталог рецептов
   GET    /api/fields           поля юзера
   POST   /api/fields           завести поле
   GET    /                     пульт — лицо для человека, собранное зоной web
+
+СКОУП ЛЕЖИТ ПО АДРЕСУ, А НЕ ЗДЕСЬ. Личность юзера раздаётся раздачей на его машине, и
+контроллер до неё дотягивается: адрес и пароль называет юзер. Хода «завести здесь, ничего
+не спрашивая» НЕ СУЩЕСТВУЕТ (WORLD2 3.7) — контроллер это времянка, и держателем чужой
+личности он быть не должен. Снёс контроллер, поднял на другой машине, вошёл тем же адресом
+— всё на месте.
 
 ЧТО ПОДНИМАЕТСЯ — говорит РЕЦЕПТ (файл запуска), а не контроллер: перечня вещей в нём нет
 вовсе. Не назвал рецепт — ставится дверь; назвал — то, что назвал. Свои вещи хозяин машины
@@ -140,15 +159,17 @@ func usage(w io.Writer) {
 
 Значения:
   CONTROL_ADDR=:8090                 где слушать
-  CONTROL_KEYS=~/.ssh                связка контроллера: ключи ресурсов и config
+  CONTROL_KEYS=~/.ssh                связка контроллера: ключи территорий и config.
+                                     ВРЕМЯНКА: раскладывается из скоупа при входе
   CONTROL_REMOTE_SH=../deploy/remote.sh   готовый подъём вещи — его контроллер зовёт
   CONTROL_RECIPES=<рядом с подъёмом>/recipes  каталог рецептов (в образе /opt/world/recipes)
   CONTROL_DOOR_RECIPE=<рядом с подъёмом>/compose.yaml   рецепт двери — умолчание подъёма
+  CONTROL_SHARE_RECIPE=<рядом с зоной deploy>/share/compose.yaml  рецепт раздачи скоупа
   CONTROL_PULT=../web/dist           где лежит СОБРАННЫЙ пульт (в образе /opt/world/pult)
   CONTROL_DOCKER=docker              чем говорим с докером
-  CONTROL_DOOR_PORT=8080             хост-порт двери на добавляемом ресурсе
+  CONTROL_DOOR_PORT=8080             хост-порт двери на добавляемой территории
   CONTROL_TOOL_TIMEOUT=300           сколько секунд ждём внешний инструмент
-  CONTROL_SSH_TIMEOUT=10             сколько секунд ждём ответа ssh при работе со скоупом
+  CONTROL_SCOPE_TIMEOUT=10           сколько секунд ждём ответа раздачи скоупа
 
 Отказ приходит тройкой: code (машине), why (причина человеку), ways[] (выходы).
 Контроллеру нужен сокет докера — его даёт хозяин при подъёме (./control/up.sh).
@@ -180,6 +201,20 @@ func recipesState(dir string) string {
 		return "пуст — кроме двери поднимать нечего"
 	}
 	return "рецептов: " + strings.Join(names, ", ")
+}
+
+// fileState — есть ли файл, названный при подъёме. «Нет» и «не прочитать» — разные
+// состояния, и чинят их разные люди: первое — раскладка образа, второе — права.
+func fileState(path string) string {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil && info.Mode().IsRegular():
+		return "на месте"
+	case os.IsNotExist(err):
+		return "файла нет — «завести скоуп» откажет кодом no-share-recipe; назови свой: CONTROL_SHARE_RECIPE"
+	default:
+		return "не прочитать: " + err.Error()
+	}
 }
 
 func env(name, def string) string {

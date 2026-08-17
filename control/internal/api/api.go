@@ -5,17 +5,28 @@
 // │ и она говорит с контроллером, а не с дверью (`WORLD2` 3.7).                          │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
-//	POST   /api/session            вход: адрес скоупа и креды (или create — завести здесь)
+//	POST   /api/scope              завести скоуп: две пары — машина и скоуп — плюс личность
+//	POST   /api/session            вход: АДРЕС и ПАРОЛЬ, и больше ничего
+//	DELETE /api/session            выход: времянки контроллера снимаются
 //	GET    /api/me                 кто я сейчас
-//	GET    /api/resources          источники ресурса: имя, адрес, отвечает ли, что на нём стоит
-//	POST   /api/resources          добавить ресурс — на нём встаёт вещь, названная рецептом
-//	DELETE /api/resources/{имя}    снять ресурс; в ответе — что осталось на той машине
+//	GET    /api/resources          территории юзера: имя, адрес, отвечает ли, что на ней стоит
+//	POST   /api/resources          завести территорию — на ней встаёт вещь, названная рецептом
+//	DELETE /api/resources/{имя}    снять территорию; в ответе — что осталось на той машине
 //	GET    /api/recipes            чем контроллер умеет поднимать: каталог рецептов
 //	GET    /api/fields             поля юзера
 //	POST   /api/fields             завести поле
 //
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ХОДА «ЗАВЕСТИ ЗДЕСЬ» НЕ СУЩЕСТВУЕТ (`WORLD2` 3.7, решение user 2026-08-16).          │
+// │                                                                                      │
+// │ Вход — это всегда адрес и пароль. Скоупа по адресу нет — юзер называет ТО ЖЕ САМОЕ,   │
+// │ разница только в исходе: контроллер либо застаёт состояние, либо заводит его ТАМ.     │
+// │ Заведи он личность у себя — стал бы держателем чужого состояния, а держать его вправе │
+// │ только владелец (`1.9`); и в чужое состояние можно было бы попасть, ничего не         │
+// │ предъявив. Защита состояния лежит в устройстве, а не в сетевой настройке.             │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
 // Отказ у всех ручек один и тот же — тройка `code` · `why` · `ways[]` (`WORLD2` 2.3).
-// Форма ответа держится одинаковой с зоной `web` по таблице из `WORLD2-101`.
 //
 // Сессия одна. Второй юзер в эту итерацию не входит (`WORLD2-75`), и заводить под него
 // хранилище сессий заранее значило бы городить на пустоту. Живёт она в памяти процесса:
@@ -24,6 +35,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -33,7 +45,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +55,7 @@ import (
 	"github.com/omnifield/world/control/internal/resource"
 	"github.com/omnifield/world/control/internal/run"
 	"github.com/omnifield/world/control/internal/scope"
+	"github.com/omnifield/world/control/internal/state"
 )
 
 // cookieName — имя печенья с токеном сессии. Токен возвращается и телом: пульт берёт
@@ -51,9 +63,15 @@ import (
 // можно, иначе проверять его придётся только глазами через пульт.
 const cookieName = "control-session"
 
+// sharePasswordEnv — имя, которым пароль скоупа уезжает подъёму РАЗДАЧИ. Это ШОВ с зоной
+// `share`: значение принадлежит её рецепту (`share/compose.yaml`), а не нам, и повтор
+// стережётся пробой. Знать про раздачу контроллеру приходится ровно здесь и ровно одно:
+// заведение скоупа — это подъём раздачи, а пароль называет тот, кто её поднимает.
+const sharePasswordEnv = "SHARE_PASSWORD"
+
 // Options — всё, что контроллеру дают снаружи. Ни одного значения ручки не выдумывают
 // сами: подменяемость — то, чем проба проверяет поведение там, где нет ни докера, ни
-// второго ресурса.
+// второй машины.
 type Options struct {
 	Runner   run.Runner
 	RemoteSh string
@@ -62,10 +80,15 @@ type Options struct {
 	RecipesDir string
 	// DoorRecipe — файл запуска двери, приехавший в образе рядом с подъёмом.
 	DoorRecipe string
-	Docker     string
-	KeysDir    string
-	DoorPort   int
-	SSHTimeout int
+	// ShareRecipe — файл запуска РАЗДАЧИ СКОУПА. Им контроллер поднимает личность юзера на
+	// названной машине. Рецепт, а не код: раздача — обычная вещь мира, и поднимается она
+	// тем же путём, что все прочие (`WORLD2` 3.7, «залил-поднял»).
+	ShareRecipe string
+	Docker      string
+	KeysDir     string
+	DoorPort    int
+	// ScopeTimeout — сколько секунд ждём ответа раздачи скоупа.
+	ScopeTimeout int
 	// PultDir — где лежит СОБРАННЫЙ пульт. Пусто — раздавать нечего, и контроллер
 	// скажет об этом кодом `no-pult`, а не пустой страницей.
 	PultDir string
@@ -88,9 +111,9 @@ type Handler struct {
 	sess *session
 }
 
-// session — активный вход. Хранит открытый скоуп, а не копию личности: личность читается
-// из скоупа при каждом вопросе, потому что скоуп мог измениться с другой машины, а мы
-// обещали связь, а не копию (`WORLD2` 1.6).
+// session — активный вход. Хранит открытый скоуп, а не копию состояния: состояние
+// читается по адресу при каждом вопросе, потому что оно могло измениться с другой машины,
+// а мы обещали связь, а не копию (`WORLD2` 1.6).
 type session struct {
 	token string
 	sc    *scope.Scope
@@ -127,7 +150,9 @@ func New(opt Options) *Handler {
 		mux:     http.NewServeMux(),
 	}
 
+	h.mux.HandleFunc("POST /api/scope", h.wrap("scope-create", h.postScope))
 	h.mux.HandleFunc("POST /api/session", h.wrap("session", h.postSession))
+	h.mux.HandleFunc("DELETE /api/session", h.wrap("session-out", h.deleteSession))
 	h.mux.HandleFunc("GET /api/me", h.wrap("me", h.getMe))
 	h.mux.HandleFunc("GET /api/resources", h.wrap("resources", h.getResources))
 	h.mux.HandleFunc("POST /api/resources", h.wrap("resource-add", h.postResource))
@@ -138,7 +163,7 @@ func New(opt Options) *Handler {
 
 	// Тот же путь другим методом — это не «нет такой ручки», а «не тем глаголом», и
 	// сказать об этом надо разными словами: иначе человек ищет опечатку в пути.
-	for _, p := range []string{"/api/session", "/api/me", "/api/resources", "/api/resources/{name}", "/api/recipes", "/api/fields"} {
+	for _, p := range []string{"/api/scope", "/api/session", "/api/me", "/api/resources", "/api/resources/{name}", "/api/recipes", "/api/fields"} {
 		h.mux.HandleFunc(p, h.wrap("wrong-method", wrongMethod))
 	}
 
@@ -200,17 +225,182 @@ func (rc *recorder) WriteHeader(code int) {
 	rc.ResponseWriter.WriteHeader(code)
 }
 
-// ── вход ─────────────────────────────────────────────────────────────────────
+// ── завести скоуп ────────────────────────────────────────────────────────────
 
+// scopeBody — ДВЕ ПАРЫ, названные раздельно, и это не украшение формы (`WORLD2` 3.4, «Два
+// адреса, и путать их дорого»):
+//
+//	машина  адрес и креды РЕСУРСА — по ним контроллер туда дотянется и поднимет раздачу;
+//	скоуп   адрес, по которому состояние будет раздаваться, и пароль — по ним потом входят.
+//
+// Креды машины юзер даёт РУКАМИ, а не берёт из скоупа: скоупа в этот момент ещё нет.
+// После создания они записываются В НЕГО, в раздел `территории`, и дальше берутся оттуда.
+// На слиянии этих двух пар в одну выросла мёртвая `WORLD2-77`.
+type scopeBody struct {
+	Scope struct {
+		Addr     string `json:"addr"`
+		Password string `json:"password"`
+	} `json:"scope"`
+	Identity struct {
+		Name  string `json:"name"`
+		Brand string `json:"brand"`
+	} `json:"identity"`
+	// Machine — где поднять раздачу. Не назвали — значит раздача по адресу уже стоит
+	// (юзер поднял её сам: это его вилка, и мир в неё не смотрит — `0.3`).
+	Machine *struct {
+		Name  string `json:"name"`
+		Addr  string `json:"addr"`
+		Creds string `json:"creds"`
+	} `json:"machine"`
+}
+
+func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	var body scopeBody
+	if ref := decode(r, &body); ref != nil {
+		return ref
+	}
+
+	addr, ref := scope.Parse(body.Scope.Addr)
+	if ref != nil {
+		return ref
+	}
+	if body.Scope.Password == "" {
+		return noPassword()
+	}
+	if strings.TrimSpace(body.Identity.Name) == "" {
+		return refusal.New(http.StatusBadRequest, "no-name",
+			"личность заводится с именем, а имя не названо",
+			"назови его: identity.name = «егор»")
+	}
+	// Пустой бренд — ЗАКОННОЕ состояние, а не поломка (`WORLD2-135`): свежесозданный
+	// скоуп это имя и пустота. Проверки на него здесь нет намеренно.
+
+	sc := scope.Open(addr, body.Scope.Password, h.opt.ScopeTimeout)
+	presence, ref := sc.Look(r.Context())
+	if ref != nil {
+		return ref
+	}
+	if presence == scope.PresenceState {
+		return refusal.New(http.StatusConflict, "scope-exists",
+			fmt.Sprintf("по адресу %s состояние уже раздаётся — заводить поверх него значит стереть личность", addr),
+			"войди в него: POST /api/session с этим адресом и паролем",
+			"или назови другой адрес: две раздачи — два скоупа (`WORLD2` 3.4)")
+	}
+	if presence == scope.PresenceEmpty && body.Machine != nil {
+		return refusal.New(http.StatusConflict, "share-already",
+			fmt.Sprintf("по адресу %s раздача уже отвечает, а её просят поднять на машине %s", addr, body.Machine.Addr),
+			"убери machine: состояние ляжет в ту раздачу, что уже стоит",
+			"или назови адрес, по которому раздачи ещё нет")
+	}
+	if presence == scope.PresenceNone && body.Machine == nil {
+		return refusal.New(http.StatusBadGateway, "no-share",
+			fmt.Sprintf("по адресу %s раздачи нет — состояние класть некуда", addr),
+			"назови машину, и контроллер поднимет раздачу там: machine = {name, addr, creds}",
+			"либо подними раздачу сам и повтори: форма стыковки — `WORLD2` 3.4 и share/PROTOCOL.md",
+			"проверь адрес и порт: наша раздача по умолчанию слушает 8070")
+	}
+
+	st := state.New(strings.TrimSpace(body.Identity.Name), body.Identity.Brand)
+	raised := ""
+	if m := body.Machine; m != nil {
+		if ref := resource.ValidName(m.Name); ref != nil {
+			return ref
+		}
+		if _, _, ref := resource.CheckAddr(m.Addr); ref != nil {
+			return ref
+		}
+		if m.Creds == "" {
+			return noCreds()
+		}
+		shareRecipe, ref := h.shareRecipe()
+		if ref != nil {
+			return ref
+		}
+
+		// Ключ кладётся ДО подъёма: докер пойдёт по ssh сам и возьмёт его из связки.
+		if ref := h.res.PutKey(m.Name, m.Addr, m.Creds); ref != nil {
+			return ref
+		}
+		// Пароль скоупа уезжает подъёму раздачи её же именем: им закрыта раздача, и
+		// внутри файла состояния его нет — запирать ключ внутри замка нельзя (`3.4`).
+		if ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, []string{sharePasswordEnv + "=" + body.Scope.Password}); ref != nil {
+			h.res.DropKey(m.Name)
+			return ref
+		}
+		raised = m.Name
+
+		if ref := st.AddTerritory(
+			state.Territory{Name: m.Name, Addr: m.Addr},
+			state.Key{Name: m.Name, Kind: state.KindSSH, Value: m.Creds},
+		); ref != nil {
+			return ref
+		}
+	}
+
+	if ref := sc.Write(r.Context(), st); ref != nil {
+		// Отказ не вправе ничего оставлять за собой (`WORLD2` 2.3 п. 5): раздачу, в
+		// которую состояние не легло, снимаем вместе с ключом. Не снять её значило бы
+		// оставить на чужой машине вещь, о которой в скоупе не написано ничего.
+		if raised != "" {
+			h.lowerQuietly(r.Context(), raised)
+		}
+		return ref
+	}
+
+	if ref := h.res.Bind(r.Context(), st); ref != nil {
+		return ref
+	}
+	token, ref := h.remember(w, sc)
+	if ref != nil {
+		return ref
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"name":    st.Identity.Name,
+		"brand":   st.Identity.Brand,
+		"scope":   scopeView(addr),
+		"created": true,
+		"token":   token,
+	})
+	return nil
+}
+
+// shareRecipe — рецепт раздачи скоупа. Своего перечня вещей у зоны нет и здесь тоже: это
+// путь, названный при подъёме контроллера, а не знание о том, как раздача устроена.
+func (h *Handler) shareRecipe() (string, *refusal.Refusal) {
+	if h.opt.ShareRecipe == "" {
+		return "", refusal.New(http.StatusInternalServerError, "no-share-recipe",
+			"контроллеру не назвали рецепт раздачи скоупа — поднимать личность нечем",
+			"это дефект подъёма контроллера: путь называется CONTROL_SHARE_RECIPE",
+			"см. control/README.md, раздел «завести скоуп»")
+	}
+	if _, err := os.Stat(h.opt.ShareRecipe); err != nil {
+		return "", refusal.New(http.StatusInternalServerError, "no-share-recipe",
+			fmt.Sprintf("рецепта раздачи по пути %s нет: %v", h.opt.ShareRecipe, err),
+			"это дефект образа контроллера — рецепт раздачи едет в нём рядом с подъёмом",
+			"назови свой: CONTROL_SHARE_RECIPE=/путь/к/compose.yaml")
+	}
+	return h.opt.ShareRecipe, nil
+}
+
+// lowerQuietly — убрать за собой то, что мы только что подняли. Отказ уже собран и уедет
+// человеку; вторым отказом поверх первого его перебивать нельзя — причина у неудачи одна.
+func (h *Handler) lowerQuietly(ctx context.Context, name string) {
+	if recipePath, ref := h.shareRecipe(); ref == nil {
+		if _, ref := h.res.Lower(ctx, name, recipePath, "", false, false); ref != nil {
+			h.opt.Logf("control: раздачу %s снять за собой не вышло: %s", name, ref.Why)
+		}
+	}
+	h.res.DropKey(name)
+}
+
+// ── вход и выход ─────────────────────────────────────────────────────────────
+
+// sessionBody — вход. АДРЕС И ПАРОЛЬ, и больше ничего: ни `create`, ни имени, ни бренда.
+// Разница между «состояние есть» и «состояния нет» — только в исходе, а спрашивается одно
+// и то же (`WORLD2` 3.7). Поля «завести здесь» тут нет и не появится.
 type sessionBody struct {
-	Addr  string `json:"addr"`
-	Creds string `json:"creds"`
-	// Create — «скоупа по этому адресу ещё нет, заведи». Отдельным полем, а не
-	// догадкой по отсутствию файла: завести личность молча, потому что «ничего не
-	// нашлось», значит однажды завести её на опечатке в пути.
-	Create bool   `json:"create"`
-	Name   string `json:"name"`
-	Brand  string `json:"brand"`
+	Addr     string `json:"addr"`
+	Password string `json:"password"`
 }
 
 func (h *Handler) postSession(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
@@ -218,51 +408,93 @@ func (h *Handler) postSession(w http.ResponseWriter, r *http.Request) *refusal.R
 	if ref := decode(r, &body); ref != nil {
 		return ref
 	}
-
 	addr, ref := scope.Parse(body.Addr)
 	if ref != nil {
 		return ref
 	}
-
-	key := ""
-	if body.Creds != "" {
-		if addr.Here {
-			// Молча проглотить креды нельзя: человек их назвал и вправе знать, что они
-			// никуда не пошли.
-			return refusal.New(http.StatusBadRequest, "creds-here",
-				"скоуп лежит на ресурсе контроллера — до него он дотягивается своими правами, кредам тут некуда приложиться",
-				"убери creds",
-				"или назови адрес на другом ресурсе: user@10.8.0.5:/srv/scope")
-		}
-		var ref *refusal.Refusal
-		if key, ref = h.writeScopeKey(body.Creds); ref != nil {
-			return ref
-		}
+	if body.Password == "" {
+		return noPassword()
 	}
 
-	sc := scope.Open(addr, h.opt.Runner, key, h.opt.SSHTimeout, h.opt.Now)
-
-	var id *scope.Identity
-	created := false
-	if body.Create {
-		if id, ref = sc.Create(r.Context(), body.Name, body.Brand); ref != nil {
-			return ref
-		}
-		created = true
-	} else {
-		if id, ref = sc.Enter(r.Context()); ref != nil {
-			return ref
-		}
+	sc := scope.Open(addr, body.Password, h.opt.ScopeTimeout)
+	st, ref := sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	// Времянки контроллера поднимаются ИЗ СКОУПА и только из него: сначала снимается всё
+	// своё, потом раскладывается то, что лежит в состоянии. Вошёл под другой личностью —
+	// видишь её территории, а не чужие.
+	if ref := h.res.Bind(r.Context(), st); ref != nil {
+		return ref
 	}
 
+	token, ref := h.remember(w, sc)
+	if ref != nil {
+		return ref
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":    st.Identity.Name,
+		"brand":   st.Identity.Brand,
+		"scope":   scopeView(addr),
+		"created": false,
+		"token":   token,
+	})
+	return nil
+}
+
+// deleteSession — выход. Своего состояния он не трогает: скоуп лежит там, где лежал.
+// Снимаются только ВРЕМЯНКИ контроллера — контексты, ключи и блоки в `config`. Без этого
+// следующий вошедший увидел бы чужие территории, и «личность» ничего бы не значила.
+func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	if _, ref := h.current(r); ref != nil {
+		return ref
+	}
+	if ref := h.res.Unbind(r.Context()); ref != nil {
+		return ref
+	}
+	h.mu.Lock()
+	h.sess = nil
+	h.mu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"out": true,
+		"note": "вышли: контексты докера, ключи и блоки в config сняты. Скоуп не тронут — " +
+			"он лежит там, где лежал, и открывается тем же адресом и паролем",
+	})
+	return nil
+}
+
+func (h *Handler) getMe(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	sess, ref := h.current(r)
+	if ref != nil {
+		return ref
+	}
+	// Личность перечитывается из скоупа, а не отдаётся из памяти: состояние могло
+	// измениться с другой машины, а мы обещали связь, а не снимок.
+	st, ref := sess.sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":  st.Identity.Name,
+		"brand": st.Identity.Brand,
+		"scope": scopeView(sess.sc.Addr),
+		"since": sess.since.UTC().Format(time.RFC3339),
+	})
+	return nil
+}
+
+// remember — выдать метку сессии. Метка приезжает печеньем И телом: пульт берёт печенье,
+// человек курлом — заголовок `Authorization: Bearer`.
+func (h *Handler) remember(w http.ResponseWriter, sc *scope.Scope) (string, *refusal.Refusal) {
 	token, err := h.opt.NewToken()
 	if err != nil {
-		return refusal.New(http.StatusInternalServerError, "no-token",
+		return "", refusal.New(http.StatusInternalServerError, "no-token",
 			"вход состоялся, а метку сессии выдать не вышло: "+err.Error(),
 			"попробуй ещё раз",
 			"если повторяется — это дефект контроллера, заведи задачу зоне control")
 	}
-
 	h.mu.Lock()
 	h.sess = &session{token: token, sc: sc, since: h.opt.Now()}
 	h.mu.Unlock()
@@ -274,105 +506,167 @@ func (h *Handler) postSession(w http.ResponseWriter, r *http.Request) *refusal.R
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
-	writeJSON(w, status, map[string]any{
-		"name":    id.Name,
-		"brand":   id.Brand,
-		"scope":   scopeView(addr),
-		"created": created,
-		"token":   token,
-	})
-	return nil
+	return token, nil
 }
 
-func (h *Handler) getMe(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+// ── территории ───────────────────────────────────────────────────────────────
+
+func (h *Handler) getResources(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
 	sess, ref := h.current(r)
 	if ref != nil {
 		return ref
 	}
-	// Личность перечитывается из скоупа, а не отдаётся из памяти: скоуп мог измениться с
-	// другой машины, а мы обещали связь, а не снимок.
-	id, ref := sess.sc.Enter(r.Context())
+	st, ref := sess.sc.Read(r.Context())
 	if ref != nil {
 		return ref
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name":  id.Name,
-		"brand": id.Brand,
-		"scope": scopeView(sess.sc.Addr),
-		"since": sess.since.UTC().Format(time.RFC3339),
-	})
-	return nil
-}
-
-// ── источники ресурса ────────────────────────────────────────────────────────
-
-func (h *Handler) getResources(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
-	if _, ref := h.current(r); ref != nil {
-		return ref
-	}
-	list, ref := h.res.List(r.Context())
-	if ref != nil {
-		return ref
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"resources": list})
+	writeJSON(w, http.StatusOK, map[string]any{"resources": h.res.List(r.Context(), st.Territories)})
 	return nil
 }
 
 type resourceBody struct {
+	// Name — ИМЯ УЧАСТКА, и его называет юзер (`WORLD2` 2.5 п. 11). Мир его не выдумывает
+	// и из адреса машины не выводит: на имени стоит адрес локации.
 	Name  string `json:"name"`
 	Addr  string `json:"addr"`
 	Creds string `json:"creds"`
-	// Recipe — ЧТО поднять на этом ресурсе: имя рецепта из каталога либо путь (в названии
-	// с косой чертой контроллер видит путь). Не назван — дверь: прежний запрос работает
-	// как работал, без единого лишнего поля.
+	// Recipe — ЧТО поднять на этой территории: имя рецепта из каталога либо путь (в
+	// названии с косой чертой контроллер видит путь). Не назван — дверь.
 	Recipe string `json:"recipe"`
 }
 
 func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
-	if _, ref := h.current(r); ref != nil {
+	sess, ref := h.current(r)
+	if ref != nil {
 		return ref
 	}
 	var body resourceBody
 	if ref := decode(r, &body); ref != nil {
 		return ref
 	}
+	if ref := resource.ValidName(body.Name); ref != nil {
+		return ref
+	}
+	if _, _, ref := resource.CheckAddr(body.Addr); ref != nil {
+		return ref
+	}
+	if body.Creds == "" {
+		return noCreds()
+	}
 
-	added, ref := h.res.Add(r.Context(), body.Name, body.Addr, body.Creds, body.Recipe)
+	st, ref := sess.sc.Read(r.Context())
 	if ref != nil {
 		return ref
+	}
+	// ИМЯ ЗАНЯТО — ЭТО ОТКАЗ МЕХАНИКИ, а не ответ ресурса (`WORLD2` 2.3, три рода «нет»):
+	// проверяем мы, по содержимому скоупа, ДО всякого докера. Молчаливая перезапись строки
+	// в файле означала бы потерянный участок и столкнувшиеся адреса локаций.
+	if _, busy := st.Territory(body.Name); busy {
+		return refusal.New(http.StatusConflict, "name-taken",
+			fmt.Sprintf("участок с именем «%s» в твоём скоупе уже есть, а на имени стоит адрес локации", body.Name),
+			"назови другое имя",
+			"посмотри, какие уже есть: GET /api/resources",
+			"это тот же участок и ты хочешь его пересобрать — сними его сначала: DELETE /api/resources/"+body.Name)
+	}
+	// Рецепт находим ДО того, как тронули связку и машину: неизвестное имя обязано
+	// отказать, не оставив за собой ни ключа, ни контекста (`WORLD2` 2.3).
+	recipePath, ref := h.recipes.Find(body.Recipe)
+	if ref != nil {
+		return ref
+	}
+
+	if ref := h.res.PutKey(body.Name, body.Addr, body.Creds); ref != nil {
+		return ref
+	}
+	if ref := h.res.Raise(r.Context(), body.Name, body.Addr, recipePath, nil); ref != nil {
+		// Подъём не удался — свой след убираем за собой. Оставленный ключ означал бы, что
+		// вторая попытка пойдёт кредами, которых юзер уже не называет.
+		h.res.DropKey(body.Name)
+		return ref
+	}
+
+	if ref := st.AddTerritory(
+		state.Territory{Name: body.Name, Addr: body.Addr},
+		state.Key{Name: body.Name, Kind: state.KindSSH, Value: body.Creds},
+	); ref != nil {
+		return ref
+	}
+	if ref := sess.sc.Write(r.Context(), st); ref != nil {
+		if _, low := h.res.Lower(r.Context(), body.Name, recipePath, body.Recipe, false, false); low != nil {
+			h.opt.Logf("control: вещь %s снять за собой не вышло: %s", body.Name, low.Why)
+		}
+		h.res.DropKey(body.Name)
+		return ref
+	}
+
+	added := resource.Resource{Name: body.Name, Addr: body.Addr}
+	list := h.res.List(r.Context(), st.Territories)
+	for _, cur := range list {
+		if cur.Name == added.Name {
+			added = cur
+		}
 	}
 	// Список отдаётся тем же ответом: главное, что должен увидеть человек, — что
-	// источников стало два (`WORLD2-80`), и ради этого не надо спрашивать второй раз.
-	list, ref := h.res.List(r.Context())
-	if ref != nil {
-		return ref
-	}
+	// территорий стало две (`WORLD2-80`), и ради этого не надо спрашивать второй раз.
 	writeJSON(w, http.StatusCreated, map[string]any{"resource": added, "resources": list})
 	return nil
 }
 
 func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
-	if _, ref := h.current(r); ref != nil {
+	sess, ref := h.current(r)
+	if ref != nil {
 		return ref
 	}
+	name := r.PathValue("name")
+	if ref := resource.ValidName(name); ref != nil {
+		return ref
+	}
+	st, ref := sess.sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	t, found := st.Territory(name)
+	if !found {
+		return refusal.New(http.StatusNotFound, "no-such-resource",
+			fmt.Sprintf("участка «%s» в твоём скоупе нет — снимать нечего", name),
+			"посмотри, какие есть: GET /api/resources")
+	}
+	// НА ЭТОМ УЧАСТКЕ МОЖЕТ СТОЯТЬ РАЗДАЧА ТВОЕЙ ЖЕ ЛИЧНОСТИ. Сняв её молча, контроллер
+	// оборвал бы юзеру доступ к самому себе — и обнаружилось бы это при следующем входе, а
+	// не сейчас. Отказ механики с причиной и выходом (`WORLD2` 2.3).
+	if host, _, ref := resource.CheckAddr(t.Addr); ref == nil && host == sess.sc.Addr.Host {
+		return refusal.New(http.StatusConflict, "drop-scope-home",
+			fmt.Sprintf("на участке «%s» стоит раздача твоего скоупа (%s) — сняв его, ты потеряешь доступ к своей личности", name, sess.sc.Addr),
+			"перенеси личность на другой участок и войди по новому адресу",
+			"если правда этого хочешь — сними раздачу руками на той машине: ./deploy/remote.sh drop "+name+" --recipe <рецепт раздачи>")
+	}
+
 	q := r.URL.Query()
 	// Рецепт называется и при снятии: снимаем ТО ЖЕ, что ставили, а своего реестра вещей
-	// зона не заводит — второй список того же самого разъехался бы с контекстами докера.
-	dropped, ref := h.res.Drop(r.Context(), r.PathValue("name"),
-		flag(q.Get("with-state")), flag(q.Get("with-image")), q.Get("recipe"))
+	// зона не заводит — второй список того же самого разъехался бы со скоупом.
+	recipeName := q.Get("recipe")
+	recipePath, ref := h.recipes.Find(recipeName)
 	if ref != nil {
 		return ref
 	}
-	list, ref := h.res.List(r.Context())
+
+	dropped, ref := h.res.Lower(r.Context(), name, recipePath, recipeName,
+		flag(q.Get("with-state")), flag(q.Get("with-image")))
 	if ref != nil {
 		return ref
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"dropped": dropped, "resources": list})
+	if ref := st.DropTerritory(name); ref != nil {
+		return ref
+	}
+	if ref := sess.sc.Write(r.Context(), st); ref != nil {
+		return ref
+	}
+	h.res.DropKey(name)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dropped":   dropped,
+		"resources": h.res.List(r.Context(), st.Territories),
+	})
 	return nil
 }
 
@@ -380,7 +674,6 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 
 // getRecipes — что контроллер умеет поднимать прямо сейчас. Список ЧИТАЕТСЯ из каталога,
 // а не перечисляется в коде: список вещей мира механикой не является (`WORLD2` 3.7).
-// Положили файл в каталог — вещь появилась здесь, без правки кода и без пересборки образа.
 func (h *Handler) getRecipes(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
 	if _, ref := h.current(r); ref != nil {
 		return ref
@@ -403,11 +696,11 @@ func (h *Handler) getFields(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	if ref != nil {
 		return ref
 	}
-	fields, ref := sess.sc.Fields(r.Context())
+	st, ref := sess.sc.Read(r.Context())
 	if ref != nil {
 		return ref
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"fields": fields})
+	writeJSON(w, http.StatusOK, map[string]any{"fields": fieldsView(st.Fields)})
 	return nil
 }
 
@@ -422,19 +715,36 @@ func (h *Handler) postField(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	if ref := decode(r, &body); ref != nil {
 		return ref
 	}
-	field, fields, ref := sess.sc.AddField(r.Context(), body.Name)
+	st, ref := sess.sc.Read(r.Context())
 	if ref != nil {
 		return ref
 	}
+	if ref := st.AddField(body.Name); ref != nil {
+		return ref
+	}
+	if ref := sess.sc.Write(r.Context(), st); ref != nil {
+		return ref
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"field":  field,
-		"fields": fields,
-		// Говорим вслух, чего НЕ произошло: поле записано в список, но нигде не поднято.
+		"field":  map[string]any{"name": strings.TrimSpace(body.Name)},
+		"fields": fieldsView(st.Fields),
+		// Говорим вслух, чего НЕ произошло: поле записано в скоуп, но нигде не поднято.
 		// Человек, не увидевший этой строки, ждал бы поднятого поля и не получил бы ни
 		// его, ни отказа — а это молчание, которое мир себе не позволяет.
-		"note": "поле записано в твой список; само поле пока не поднимается — это следующая итерация",
+		"note": "поле записано в твой скоуп; само поле пока не поднимается — это следующая итерация",
 	})
 	return nil
+}
+
+// fieldsView — поля наружу. Внутри скоупа они лежат формой мира (`имя` · `адрес` ·
+// `состояние`), а ручки говорят с пультом по-своему: формат состояния принадлежит канону,
+// и подгонять его под ручки нельзя, как и наоборот.
+func fieldsView(fields []state.Field) []map[string]any {
+	out := make([]map[string]any, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, map[string]any{"name": f.Name, "addr": f.Addr, "state": f.State})
+	}
+	return out
 }
 
 // ── общее ────────────────────────────────────────────────────────────────────
@@ -446,9 +756,9 @@ func (h *Handler) current(r *http.Request) (*session, *refusal.Refusal) {
 	h.mu.Unlock()
 
 	notSignedIn := refusal.New(http.StatusUnauthorized, "not-signed-in",
-		"в скоуп ещё не входили — до входа ни ресурсов, ни полей не существует",
-		"войди: POST /api/session с полями addr и creds",
-		"скоупа нет вовсе — заведи здесь: POST /api/session с create=true, name и brand")
+		"в скоуп ещё не входили — до входа ни территорий, ни полей не существует",
+		"войди: POST /api/session с адресом скоупа и паролем",
+		"скоупа нет вовсе — заведи его ТАМ, где он будет лежать: POST /api/scope")
 
 	if sess == nil {
 		return nil, notSignedIn
@@ -469,33 +779,22 @@ func token(r *http.Request) string {
 	return ""
 }
 
-// writeScopeKey кладёт ключ к скоупу в связку контроллера. Файлом, а не переменной, потому
-// что ключ берёт ssh, а он читает его с диска. Один ключ на активный вход: сессия одна.
-func (h *Handler) writeScopeKey(creds string) (string, *refusal.Refusal) {
-	if h.opt.KeysDir == "" {
-		return "", refusal.New(http.StatusInternalServerError, "no-keyring",
-			"контроллеру некуда положить ключ: связка не названа",
-			"это дефект подъёма контроллера — см. control/README.md, CONTROL_KEYS")
-	}
-	if err := os.MkdirAll(h.opt.KeysDir, 0o700); err != nil {
-		return "", refusal.New(http.StatusInternalServerError, "no-keyring",
-			"связка контроллера не завелась: "+err.Error(),
-			"проверь том, смонтированный под связку: control/README.md")
-	}
-	if !strings.HasSuffix(creds, "\n") {
-		creds += "\n"
-	}
-	path := filepath.Join(h.opt.KeysDir, "scope-key")
-	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
-		return "", refusal.New(http.StatusInternalServerError, "no-keyring",
-			"ключ к скоупу не записался: "+err.Error(),
-			"проверь права на связку контроллера")
-	}
-	return path, nil
+func noPassword() *refusal.Refusal {
+	return refusal.New(http.StatusBadRequest, "no-password",
+		"пароль скоупа не назван, а без него раздача не отдаст состояние: доступ к личности доказывается кредами (`WORLD2` 3.4)",
+		"пришли его полем password",
+		"пароль называют при подъёме раздачи, и внутри файла состояния его нет")
+}
+
+func noCreds() *refusal.Refusal {
+	return refusal.New(http.StatusBadRequest, "no-creds",
+		"креды машины не названы, а без них до неё не дотянуться — мир кред не заводит и не выдаёт",
+		"пришли ключ полем creds: он ляжет в скоуп, в раздел «ключи», и дальше берётся оттуда",
+		"креды машины юзер даёт руками — из скоупа их взять неоткуда, пока скоупа нет (`WORLD2` 3.4)")
 }
 
 func scopeView(a scope.Address) map[string]any {
-	return map[string]any{"addr": a.Raw, "here": a.Here, "path": a.Path}
+	return map[string]any{"addr": a.Raw, "host": a.Host}
 }
 
 func decode(r *http.Request, v any) *refusal.Refusal {
@@ -520,12 +819,14 @@ func decode(r *http.Request, v any) *refusal.Refusal {
 	}
 	dec := json.NewDecoder(strings.NewReader(string(body)))
 	// Лишнее поле — это опечатка либо чужой контракт. И то и другое лучше назвать, чем
-	// принять и промолчать: молча проглоченное поле выглядит как сработавшее.
+	// принять и промолчать: молча проглоченное поле выглядит как сработавшее. Ход
+	// «завести здесь» (`create`) отсюда и краснеет: он не игнорируется, а отказывает.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return refusal.New(http.StatusBadRequest, "bad-body",
 			"тело запроса разобрать не вышло: "+err.Error(),
-			"пришли объект JSON — состав полей в control/README.md")
+			"пришли объект JSON — состав полей в control/README.md",
+			"хода «завести здесь» у контроллера нет: вход это адрес и пароль, а завести скоуп — POST /api/scope (`WORLD2` 3.7)")
 	}
 	return nil
 }
@@ -548,17 +849,12 @@ func unknownEndpoint(_ http.ResponseWriter, r *http.Request) *refusal.Refusal {
 	return refusal.New(http.StatusNotFound, "unknown-endpoint",
 		"такой ручки у контроллера нет: "+r.URL.Path,
 		"список ручек — в control/README.md",
-		"их восемь: /api/session, /api/me, /api/resources, /api/recipes, /api/fields")
+		"их шесть путей: /api/scope, /api/session, /api/me, /api/resources, /api/recipes, /api/fields")
 }
 
 // writeRefusal печатает отказ ОДИН И ТОТ ЖЕ, но подаёт его двумя способами: машине —
 // JSON, человеку в браузере — читаемый текст. Источник у обоих один (`*refusal.Refusal`),
 // поэтому разъехаться им нечем: второго текста отказа здесь не пишется.
-//
-// Зачем это вообще понадобилось. Контроллер теперь отдаёт страницу, и человек приходит на
-// него адресной строкой. Пульта в сборке нет — он увидел бы `{"code":"no-pult",…}` и решал
-// бы, что сломался сам контроллер. Пульт же ходит сюда `fetch`, а тот шлёт `Accept: */*` и
-// получает JSON, как и раньше.
 //
 // HTML здесь НЕ рисуется намеренно: лицо для человека — зона `web`, и рисовать своё
 // «красивое» рядом с ним значит завести второе лицо мира. Текст отказа — наше дело,

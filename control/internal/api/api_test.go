@@ -3,56 +3,171 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/omnifield/world/control/internal/run"
+	"github.com/omnifield/world/control/internal/state"
 )
 
 // Ручки проверяются ЦЕЛИКОМ, вместе с формой ответа: пульт (`web`) делается по этой же
 // таблице, и разъехавшаяся форма — это не косметика, а неработающий вход.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ГЛАВНОЕ, ЧТО СТЕРЕЖЁТСЯ ЗДЕСЬ (`WORLD2-132`, ступень 2):                             │
+// │                                                                                      │
+// │   1. вход — это АДРЕС и ПАРОЛЬ, и больше ничего; хода «завести здесь» не существует;  │
+// │   2. личность лежит В РАЗДАЧЕ по адресу, а не на контроллере;                         │
+// │   3. территории и ключи живут в скоупе, а контексты докера — производные от него;     │
+// │   4. выход снимает времянки, и вошедший другой личностью видит СВОИ территории.       │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+
+// ── подставная раздача: чужая вилка, а не наша ───────────────────────────────
+
+// раздача — подставная вилка скоупа (`WORLD2` 3.4, `0.3`). Две ручки, пароль, и больше
+// ничего: ни одного своего знака, по которому её можно узнать.
+type раздача struct {
+	адрес  string
+	URL    string
+	пароль string
+
+	mu        sync.Mutex
+	состояние []byte
+	принято   []byte
+	сервер    *httptest.Server
+}
+
+// новаяРаздача занимает адрес, но НЕ поднимается: так выглядит машина, на которой раздачи
+// ещё нет, — а именно с неё начинается заведение скоупа.
+func новаяРаздача(t *testing.T, пароль string) *раздача {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	адрес := l.Addr().String()
+	_ = l.Close()
+	ш := &раздача{адрес: адрес, URL: "http://" + адрес + "/", пароль: пароль}
+	t.Cleanup(func() {
+		ш.mu.Lock()
+		defer ш.mu.Unlock()
+		if ш.сервер != nil {
+			ш.сервер.Close()
+		}
+	})
+	return ш
+}
+
+// поднять — раздача встала на своём адресе. Ровно это и делает подъём рецептом на машине
+// юзера; здесь оно делается руками теста в тот же момент.
+func (ш *раздача) поднять(t *testing.T, состояние []byte) {
+	t.Helper()
+	ш.mu.Lock()
+	defer ш.mu.Unlock()
+	if ш.сервер != nil {
+		ш.состояние = состояние
+		return
+	}
+	ш.состояние = состояние
+	l, err := net.Listen("tcp", ш.адрес)
+	if err != nil {
+		t.Fatalf("раздача не встала на %s: %v", ш.адрес, err)
+	}
+	ш.сервер = &httptest.Server{Listener: l, Config: &http.Server{Handler: http.HandlerFunc(ш.ручки)}}
+	ш.сервер.Start()
+}
+
+func (ш *раздача) ручки(w http.ResponseWriter, r *http.Request) {
+	_, пароль, есть := r.BasicAuth()
+	if !есть || пароль != ш.пароль {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	ш.mu.Lock()
+	defer ш.mu.Unlock()
+	switch r.Method {
+	case http.MethodGet:
+		if ш.состояние == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(ш.состояние)
+	case http.MethodPut:
+		data, _ := io.ReadAll(r.Body)
+		ш.принято = data
+		ш.состояние = data
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, PUT")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// файл — что сейчас лежит в раздаче. Смотрим НА НЕЁ, а не на ответ контроллера: скоуп
+// обязан лежать там, куда его положили, а не в памяти процесса.
+func (ш *раздача) файл(t *testing.T) *state.State {
+	t.Helper()
+	ш.mu.Lock()
+	data := append([]byte(nil), ш.состояние...)
+	ш.mu.Unlock()
+	st, ref := state.Parse(data)
+	if ref != nil {
+		t.Fatalf("в раздаче лежит не состояние: %s — %s\n%s", ref.Code, ref.Why, data)
+	}
+	return st
+}
+
+// ── стенд ────────────────────────────────────────────────────────────────────
 
 type стенд struct {
 	*httptest.Server
-	fake    *run.Fake
-	keys    string
-	scope   string
-	pult    string
-	recipes string
-	log     []string
+	fake        *run.Fake
+	keys        string
+	pult        string
+	recipes     string
+	shareRecipe string
+	log         []string
 }
 
 func поднять(t *testing.T, answer func(run.Command) (run.Result, error)) *стенд {
 	t.Helper()
 	dir := t.TempDir()
 	st := &стенд{
-		fake:    &run.Fake{Answer: answer},
-		keys:    filepath.Join(dir, "keys"),
-		scope:   filepath.Join(dir, "scope"),
-		pult:    filepath.Join(dir, "pult"),
-		recipes: filepath.Join(dir, "recipes"),
+		fake:        &run.Fake{Answer: answer},
+		keys:        filepath.Join(dir, "keys"),
+		pult:        filepath.Join(dir, "pult"),
+		recipes:     filepath.Join(dir, "recipes"),
+		shareRecipe: filepath.Join(dir, "share-compose.yaml"),
 	}
 	if err := os.MkdirAll(st.recipes, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Рецепт раздачи — обычный файл рядом с подъёмом. Содержимое здесь неважно: читает его
+	// подъём, а не контроллер (`WORLD2` 3.7, «вещь описывается своим рецептом»).
+	if err := os.WriteFile(st.shareRecipe, []byte("name: world-share\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	h := New(Options{
-		Runner:     st.fake,
-		RemoteSh:   "/opt/world/deploy/remote.sh",
-		RecipesDir: st.recipes,
-		DoorRecipe: дверьРецепт,
-		Docker:     "docker",
-		KeysDir:    st.keys,
-		PultDir:    st.pult,
-		DoorPort:   8080,
-		SSHTimeout: 5,
-		Now:        func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) },
-		NewToken:   func() (string, error) { return "метка", nil },
-		Logf:       func(f string, a ...any) { st.log = append(st.log, f) },
+		Runner:       st.fake,
+		RemoteSh:     "/opt/world/deploy/remote.sh",
+		RecipesDir:   st.recipes,
+		DoorRecipe:   дверьРецепт,
+		ShareRecipe:  st.shareRecipe,
+		Docker:       "docker",
+		KeysDir:      st.keys,
+		PultDir:      st.pult,
+		DoorPort:     8080,
+		ScopeTimeout: 2,
+		Now:          func() time.Time { return time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC) },
+		NewToken:     func() (string, error) { return "metka", nil },
+		Logf:         func(f string, a ...any) { st.log = append(st.log, f) },
 	})
 	st.Server = httptest.NewServer(h)
 	t.Cleanup(st.Close)
@@ -91,8 +206,7 @@ func (s *стенд) зовБраузером(t *testing.T, path string) (int, s
 
 func (s *стенд) зов(t *testing.T, method, path, body, token string) (int, map[string]any) {
 	t.Helper()
-	var rd *strings.Reader = strings.NewReader(body)
-	req, err := http.NewRequest(method, s.URL+path, rd)
+	req, err := http.NewRequest(method, s.URL+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +224,34 @@ func (s *стенд) зов(t *testing.T, method, path, body, token string) (int
 		t.Fatalf("%s %s: ответ не разобрался: %v", method, path, err)
 	}
 	return resp.StatusCode, out
+}
+
+// войти — вход в готовый скоуп: АДРЕС и ПАРОЛЬ, и больше ничего.
+func (s *стенд) войти(t *testing.T, ш *раздача) map[string]any {
+	t.Helper()
+	status, body := s.зов(t, "POST", "/api/session",
+		`{"addr":"`+ш.URL+`","password":"`+ш.пароль+`"}`, "")
+	if status != http.StatusOK {
+		t.Fatalf("вход отдал %d: %v", status, body)
+	}
+	return body
+}
+
+// личность — файл состояния с названными территориями. Тем же файлом отвечала бы чужая
+// вилка: форма мира одна на всех.
+func личность(t *testing.T, имя, бренд string, участки ...state.Territory) []byte {
+	t.Helper()
+	st := state.New(имя, бренд)
+	for _, у := range участки {
+		if ref := st.AddTerritory(у, state.Key{Name: у.Name, Kind: state.KindSSH, Value: "-----ключ " + у.Name + "-----"}); ref != nil {
+			t.Fatal(ref.Why)
+		}
+	}
+	data, err := st.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 // отказ проверяет, что «нет» сказано ТРОЙКОЙ. Пустое «не получилось» — провал мира.
@@ -132,14 +274,15 @@ func отказ(t *testing.T, body map[string]any, want string) {
 // Рецепт двери — там же, где его складывает подъём контроллера: рядом с готовым подъёмом.
 const дверьРецепт = "/opt/world/deploy/compose.yaml"
 
-// докерОтвечает — подставной докер, у которого на ресурсе стоит одна здоровая вещь. Он не
-// притворяется докером: отвечает ровно те поля, которые контроллер спросил.
+// докерОтвечает — подставной докер, у которого на территории стоит одна здоровая вещь.
 func докерОтвечает(c run.Command) (run.Result, error) {
 	switch {
 	case strings.HasSuffix(c.Name, "remote.sh"):
 		return run.Result{}, nil
-	case содержит(c.Args, "context"):
-		return run.Result{Out: "world-vps\tssh://world@10.8.0.5\n"}, nil
+	case содержит(c.Args, "context") && содержит(c.Args, "inspect"):
+		return run.Result{Code: 1, Err: "context not found"}, nil
+	case содержит(c.Args, "context") && содержит(c.Args, "ls"):
+		return run.Result{Out: "default\n"}, nil
 	case содержит(c.Args, "ps"):
 		return run.Result{Out: "aaa111\n"}, nil
 	case содержит(c.Args, "inspect"):
@@ -157,36 +300,70 @@ func содержит(args []string, want string) bool {
 	return false
 }
 
-// ── вход ─────────────────────────────────────────────────────────────────────
+// ── вход: адрес и пароль, и больше ничего ────────────────────────────────────
 
-func TestПервыйВходЗаводитЛичностьЗдесь(t *testing.T) {
+func TestВходЭтоАдресИПароль(t *testing.T) {
 	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", "омнифилд"))
 
-	status, body := st.зов(t, "POST", "/api/session",
-		`{"addr":"`+st.scope+`","create":true,"name":"егор","brand":"омнифилд"}`, "")
-	if status != http.StatusCreated {
-		t.Fatalf("вход отдал %d: %v", status, body)
-	}
-	if body["name"] != "егор" || body["brand"] != "омнифилд" || body["created"] != true {
+	body := st.войти(t, ш)
+	if body["name"] != "егор" || body["brand"] != "омнифилд" || body["created"] != false {
 		t.Fatalf("ответ входа собрался не так: %v", body)
 	}
-	if body["token"] != "метка" {
+	if body["token"] != "metka" {
 		t.Fatalf("метка сессии не отдана — курлом в контроллер не походишь: %v", body)
 	}
 
-	status, body = st.зов(t, "GET", "/api/me", "", "метка")
+	status, body := st.зов(t, "GET", "/api/me", "", "metka")
 	if status != http.StatusOK || body["name"] != "егор" {
 		t.Fatalf("«кто я» отдал %d: %v", status, body)
 	}
 	scope, _ := body["scope"].(map[string]any)
-	if scope["here"] != true {
-		t.Fatalf("скоуп назвался не тем местом: %v", scope)
+	if scope["addr"] != ш.URL {
+		t.Fatalf("скоуп назвался не тем адресом: %v", scope)
 	}
 }
 
-func TestБезВходаНиРесурсовНиПолей(t *testing.T) {
+// ХОД «ЗАВЕСТИ ЗДЕСЬ» ОБЯЗАН КРАСНЕТЬ (`WORLD2` 3.7, `WORLD2-129`). Он не игнорируется
+// молча — молча проглоченное поле выглядит как сработавшее, — а отказывает.
+func TestХодаЗавестиЗдесьНеСуществует(t *testing.T) {
 	st := поднять(t, докерОтвечает)
-	for _, path := range []string{"/api/me", "/api/resources", "/api/fields"} {
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+
+	status, body := st.зов(t, "POST", "/api/session",
+		`{"addr":"`+ш.URL+`","create":true,"name":"я"}`, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("«завести здесь» прошло как %d: %v", status, body)
+	}
+	отказ(t, body, "bad-body")
+	if !strings.Contains(strings.Join(waysOf(t, body), " "), "/api/scope") {
+		t.Fatalf("отказ не сказал, где скоуп заводится на самом деле: %v", body)
+	}
+}
+
+func TestВходБезПароляОтказывает(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+
+	_, body := st.зов(t, "POST", "/api/session", `{"addr":"`+ш.URL+`"}`, "")
+	отказ(t, body, "no-password")
+}
+
+func TestНеверныйПарольЭтоОтказАНеПустота(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+
+	_, body := st.зов(t, "POST", "/api/session", `{"addr":"`+ш.URL+`","password":"не-та"}`, "")
+	отказ(t, body, "bad-password")
+}
+
+func TestБезВходаНиТерриторийНиПолей(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	for _, path := range []string{"/api/me", "/api/resources", "/api/fields", "/api/recipes"} {
 		status, body := st.зов(t, "GET", path, "", "")
 		if status != http.StatusUnauthorized {
 			t.Fatalf("%s без входа отдал %d: %v", path, status, body)
@@ -200,7 +377,9 @@ func TestБезВходаНиРесурсовНиПолей(t *testing.T) {
 
 func TestЧужаяМеткаНеПускает(t *testing.T) {
 	st := поднять(t, докерОтвечает)
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
 	status, body := st.зов(t, "GET", "/api/me", "", "не-та-метка")
 	if status != http.StatusUnauthorized {
@@ -209,87 +388,299 @@ func TestЧужаяМеткаНеПускает(t *testing.T) {
 	отказ(t, body, "not-signed-in")
 }
 
-func TestВходБезСкоупаПредлагаетЗавестиЕго(t *testing.T) {
-	st := поднять(t, докерОтвечает)
-	status, body := st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`"}`, "")
-	if status != http.StatusNotFound {
-		t.Fatalf("ждали «скоупа нет», получили %d: %v", status, body)
-	}
-	отказ(t, body, "no-scope")
-}
+// ── заведение скоупа: две пары, и путать их дорого ───────────────────────────
 
-func TestКредыКСкоупуЗдесьНеПроглатываютсяМолча(t *testing.T) {
-	st := поднять(t, докерОтвечает)
-	status, body := st.зов(t, "POST", "/api/session",
-		`{"addr":"`+st.scope+`","creds":"ключ","create":true,"name":"егор"}`, "")
-	if status != http.StatusBadRequest {
-		t.Fatalf("креды к местному скоупу приняты молча: %d %v", status, body)
-	}
-	отказ(t, body, "creds-here")
-}
-
-func TestКредыКЧужомуСкоупуЛожатсяВСвязку(t *testing.T) {
-	st := поднять(t, func(c run.Command) (run.Result, error) {
-		if c.Name == "ssh" {
-			return run.Result{Out: `{"name":"егор","brand":"омнифилд"}`}, nil
+func TestЗаведениеПоднимаетРаздачуНаНазваннойМашине(t *testing.T) {
+	ш := новаяРаздача(t, "тайна")
+	var st *стенд
+	st = поднять(t, func(c run.Command) (run.Result, error) {
+		// Подъём рецептом — это и есть появление раздачи на той машине. Подставной подъём
+		// делает ровно то же: раздача встаёт по названному адресу.
+		if strings.HasSuffix(c.Name, "remote.sh") && содержит(c.Args, "add") {
+			ш.поднять(t, nil)
+			return run.Result{}, nil
 		}
 		return докерОтвечает(c)
 	})
 
-	status, body := st.зов(t, "POST", "/api/session",
-		`{"addr":"world@10.8.0.5:/srv/scope","creds":"-----ключ-----"}`, "")
-	if status != http.StatusOK {
-		t.Fatalf("вход по связи отдал %d: %v", status, body)
+	status, body := st.зов(t, "POST", "/api/scope", `{
+		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
+		"identity":{"name":"егор","brand":""},
+		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":"-----ключ-----"}}`, "")
+	if status != http.StatusCreated {
+		t.Fatalf("скоуп не завёлся: %d %v", status, body)
 	}
-	if !st.fake.Called("ssh", "-i "+filepath.Join(st.keys, "scope-key")) {
-		t.Fatalf("ssh пошёл не тем ключом: %s", st.fake.Line(0))
+	if body["name"] != "егор" || body["created"] != true {
+		t.Fatalf("ответ собрался не так: %v", body)
+	}
+
+	// Раздача поднята РЕЦЕПТОМ, а не кодом контроллера, и пароль скоупа уехал ей её же
+	// именем: им закрыта раздача, и внутри файла состояния его нет.
+	if !st.fake.Called("remote.sh", "add", "vps", "--addr", "world@10.8.0.5", "--recipe", st.shareRecipe) {
+		t.Fatalf("раздача поднята не рецептом: %s", st.fake.Line(0))
+	}
+	var env []string
+	for i := range st.fake.Calls() {
+		if strings.Contains(st.fake.Line(i), "remote.sh add") {
+			env = st.fake.Calls()[i].Env
+		}
+	}
+	if !содержит(env, "SHARE_PASSWORD=тайна") {
+		t.Fatalf("пароль скоупа не доехал до подъёма раздачи: %v", env)
+	}
+
+	// Личность легла В РАЗДАЧУ, а не на контроллер, и креды машины уехали в скоуп — в
+	// раздел `территории` и в связку ключей (`WORLD2` 3.4, «Два адреса»).
+	файл := ш.файл(t)
+	if файл.Identity.Name != "егор" || файл.Format != state.Version {
+		t.Fatalf("в раздаче лежит не та личность: %+v", файл)
+	}
+	if len(файл.Territories) != 1 || файл.Territories[0].Name != "vps" || файл.Territories[0].Addr != "world@10.8.0.5" {
+		t.Fatalf("машина не записалась участком: %+v", файл.Territories)
+	}
+	ключ, есть := файл.Key(файл.Territories[0].Key)
+	if !есть || ключ.Value != "-----ключ-----" || ключ.Kind != state.KindSSH {
+		t.Fatalf("креды машины не легли в связку скоупа: %+v", файл.Keys)
+	}
+	// Пустой бренд — законное состояние (`WORLD2-135`), и заведение на нём не спотыкается.
+	if файл.Identity.Brand != "" {
+		t.Fatalf("бренд выдумался сам: %q", файл.Identity.Brand)
 	}
 }
 
-// ── источники ресурса ────────────────────────────────────────────────────────
-
-func TestИсточниковСтановитсяДва(t *testing.T) {
+func TestЗаведениеПоверхЧужойЛичностиОтказывает(t *testing.T) {
 	st := поднять(t, докерОтвечает)
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "чужой", ""))
+
+	status, body := st.зов(t, "POST", "/api/scope", `{
+		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
+		"identity":{"name":"егор","brand":""},
+		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":"к"}}`, "")
+	if status != http.StatusConflict {
+		t.Fatalf("заведение поверх личности отдало %d: %v", status, body)
+	}
+	отказ(t, body, "scope-exists")
+	if st.fake.Called("remote.sh") {
+		t.Fatalf("отказ уже тронул чужую машину: %s", st.fake.Line(0))
+	}
+	if ш.файл(t).Identity.Name != "чужой" {
+		t.Fatal("чужая личность перезаписана")
+	}
+}
+
+func TestЗаведениеБезМашиныТамГдеРаздачиНет(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна") // адрес занят, но никто не отвечает
+
+	status, body := st.зов(t, "POST", "/api/scope", `{
+		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
+		"identity":{"name":"егор","brand":""}}`, "")
+	if status != http.StatusBadGateway {
+		t.Fatalf("ждали «раздачи нет», получили %d: %v", status, body)
+	}
+	отказ(t, body, "no-share")
+}
+
+// Раздачу юзер вправе поднять сам — это его вилка, и мир в неё не смотрит (`0.3`). Тогда
+// заведение это просто запись состояния по адресу, и машину называть не надо.
+func TestВСвоюРаздачуЛичностьПишетсяБезМашины(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, nil)
+
+	status, body := st.зов(t, "POST", "/api/scope", `{
+		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
+		"identity":{"name":"егор","brand":"омнифилд"}}`, "")
+	if status != http.StatusCreated {
+		t.Fatalf("личность не легла в готовую раздачу: %d %v", status, body)
+	}
+	if st.fake.Called("remote.sh") {
+		t.Fatalf("контроллер полез поднимать раздачу, которая уже стоит: %s", st.fake.Line(0))
+	}
+	файл := ш.файл(t)
+	if файл.Identity.Name != "егор" || len(файл.Territories) != 0 {
+		t.Fatalf("свежий скоуп собрался не как имя и пустота: %+v", файл)
+	}
+}
+
+func TestЗаведениеБезПароляИБезИмени(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, nil)
+
+	_, body := st.зов(t, "POST", "/api/scope",
+		`{"scope":{"addr":"`+ш.URL+`","password":""},"identity":{"name":"егор"}}`, "")
+	отказ(t, body, "no-password")
+
+	_, body = st.зов(t, "POST", "/api/scope",
+		`{"scope":{"addr":"`+ш.URL+`","password":"тайна"},"identity":{"name":""}}`, "")
+	отказ(t, body, "no-name")
+}
+
+// ── территории живут в скоупе ────────────────────────────────────────────────
+
+func TestТерриторияЗаписываетсяВСкоуп(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.5","creds":"ключ"}`, "метка")
+		`{"name":"vps","addr":"world@10.8.0.5","creds":"-----ключ-----"}`, "metka")
 	if status != http.StatusCreated {
-		t.Fatalf("ресурс не добавился: %d %v", status, body)
+		t.Fatalf("территория не завелась: %d %v", status, body)
 	}
+	if !st.fake.Called("remote.sh", "add", "vps", "--recipe", дверьРецепт) {
+		t.Fatalf("подъём позван не готовый или без рецепта: %s", st.fake.Line(0))
+	}
+
+	файл := ш.файл(t)
+	if len(файл.Territories) != 1 || файл.Territories[0].Name != "vps" {
+		t.Fatalf("участок не уехал в скоуп: %+v", файл.Territories)
+	}
+	if ключ, есть := файл.Key("vps"); !есть || ключ.Value != "-----ключ-----" {
+		t.Fatalf("креды не легли в связку скоупа: %+v", файл.Keys)
+	}
+	// Ключ ложится и в связку контроллера — но это ВРЕМЯНКА, производная от скоупа.
+	if _, err := os.Stat(filepath.Join(st.keys, "world-vps")); err != nil {
+		t.Fatalf("ключ не лёг в связку контроллера — ssh его не возьмёт: %v", err)
+	}
+
+	status, body = st.зов(t, "GET", "/api/resources", "", "metka")
 	list, _ := body["resources"].([]any)
-	if len(list) != 2 {
-		t.Fatalf("источников %d, а человек обязан увидеть два: %v", len(list), body)
+	if status != http.StatusOK || len(list) != 1 {
+		t.Fatalf("список территорий: %d %v", status, body)
 	}
-	first, _ := list[0].(map[string]any)
-	if first["here"] != true {
-		t.Fatalf("первым обязан идти ресурс контроллера: %v", first)
-	}
-	if !st.fake.Called("remote.sh", "add", "vps") {
-		t.Fatal("подъём вещи написан заново вместо готового")
-	}
-	// Ресурс — МАШИНА, а что на ней стоит — отдельное поле: список вещей, а не одна дверь
-	// (`WORLD2-131`). Пульт делается по этой же таблице.
-	второй, _ := list[1].(map[string]any)
-	if второй["reach"] != "отвечает" {
-		t.Fatalf("ресурс не сказал, отвечает ли он сам: %v", второй)
-	}
-	things, _ := второй["things"].([]any)
-	if len(things) != 1 {
-		t.Fatalf("список вещей на ресурсе не собрался: %v", второй)
-	}
-	вещь, _ := things[0].(map[string]any)
-	if вещь["name"] != "world" || вещь["alive"] != true || вещь["state"] == "" {
-		t.Fatalf("вещь описана не так: %v", вещь)
+	первая, _ := list[0].(map[string]any)
+	if первая["name"] != "vps" || первая["reach"] != "отвечает" {
+		t.Fatalf("территория описана не так: %v", первая)
 	}
 }
 
-// Рецепт — то, ЧТО поднимается. Он доезжает до подъёма ключом, а не подразумевается его
-// умолчанием: умолчание принадлежит команде соседа, и опора на него однажды подняла бы
-// не ту вещь.
+// ВТОРОЙ УЧАСТОК С ЗАНЯТЫМ ИМЕНЕМ — отказ МЕХАНИКИ (`WORLD2` 2.3), а не ответ ресурса:
+// проверяем мы, по содержимому скоупа, ДО всякого докера.
+func TestВторойУчастокСЗанятымИменемОтказывает(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", "", state.Territory{Name: "vps", Addr: "world@10.8.0.5"}))
+	st.войти(t, ш)
+
+	status, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.9","creds":"другой"}`, "metka")
+	if status != http.StatusConflict {
+		t.Fatalf("занятое имя принято как %d: %v", status, body)
+	}
+	отказ(t, body, "name-taken")
+	if st.fake.Called("remote.sh") {
+		t.Fatalf("до отказа успели тронуть машину: %s", st.fake.Line(0))
+	}
+	файл := ш.файл(t)
+	if len(файл.Territories) != 1 || файл.Territories[0].Addr != "world@10.8.0.5" {
+		t.Fatalf("строка в файле молча перезаписана: %+v", файл.Territories)
+	}
+}
+
+func TestСнятиеУбираетУчастокИзСкоупа(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", "",
+		state.Territory{Name: "vps", Addr: "world@10.8.0.5"},
+		state.Territory{Name: "home", Addr: "world@10.8.0.6"}))
+	st.войти(t, ш)
+
+	status, body := st.зов(t, "DELETE", "/api/resources/vps", "", "metka")
+	if status != http.StatusOK {
+		t.Fatalf("снятие отдало %d: %v", status, body)
+	}
+	dropped, _ := body["dropped"].(map[string]any)
+	if left, _ := dropped["left"].([]any); len(left) == 0 {
+		t.Fatalf("сказали «сняли», не назвав оставленного: %v", dropped)
+	}
+	файл := ш.файл(t)
+	if len(файл.Territories) != 1 || файл.Territories[0].Name != "home" {
+		t.Fatalf("участок не убрался из скоупа: %+v", файл.Territories)
+	}
+	if _, есть := файл.Key("vps"); есть {
+		t.Fatal("ключ пережил свой участок — это след, переживший вещь")
+	}
+	if _, err := os.Stat(filepath.Join(st.keys, "world-vps")); !os.IsNotExist(err) {
+		t.Fatal("ключ снятого участка остался в связке контроллера")
+	}
+}
+
+// На участке может стоять раздача СВОЕЙ ЖЕ личности: сняв её молча, контроллер оборвал бы
+// юзеру доступ к себе, и обнаружилось бы это при следующем входе.
+func TestУчастокСРаздачейСвоегоСкоупаНеСнимаетсяМолча(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	host, _, _ := net.SplitHostPort(ш.адрес)
+	ш.поднять(t, личность(t, "егор", "", state.Territory{Name: "home", Addr: "world@" + host}))
+	st.войти(t, ш)
+
+	status, body := st.зов(t, "DELETE", "/api/resources/home", "", "metka")
+	if status != http.StatusConflict {
+		t.Fatalf("раздача своего скоупа снялась как %d: %v", status, body)
+	}
+	отказ(t, body, "drop-scope-home")
+	if st.fake.Called("remote.sh", "drop") {
+		t.Fatalf("до отказа успели снять вещь: %s", st.fake.Line(0))
+	}
+}
+
+// ── выход и другая личность ──────────────────────────────────────────────────
+
+func TestВыходСнимаетВремянкиИДругаяЛичностьВидитСвоё(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	первый := новаяРаздача(t, "п1")
+	первый.поднять(t, личность(t, "егор", "", state.Territory{Name: "vps", Addr: "world@10.8.0.5"}))
+	второй := новаяРаздача(t, "п2")
+	второй.поднять(t, личность(t, "маша", "", state.Territory{Name: "home", Addr: "world@10.8.0.6"}))
+
+	st.войти(t, первый)
+	if _, err := os.Stat(filepath.Join(st.keys, "world-vps")); err != nil {
+		t.Fatalf("ключ первой личности не разложился: %v", err)
+	}
+
+	status, body := st.зов(t, "DELETE", "/api/session", "", "metka")
+	if status != http.StatusOK {
+		t.Fatalf("выход отдал %d: %v", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(st.keys, "world-vps")); !os.IsNotExist(err) {
+		t.Fatal("ключ прежней личности пережил выход")
+	}
+	// Выход НЕ трогает своего состояния: скоуп лежит там, где лежал.
+	if первый.файл(t).Identity.Name != "егор" {
+		t.Fatal("выход тронул скоуп, а не должен был")
+	}
+	if status, body := st.зов(t, "GET", "/api/me", "", "metka"); status != http.StatusUnauthorized {
+		t.Fatalf("после выхода метка ещё пускает: %d %v", status, body)
+	}
+
+	// Вход под ДРУГОЙ личностью — её территории, а не чужие. Это то, ради чего ступень и
+	// делалась: если видно чужое, значит состояние осело в контроллере.
+	st.войти(t, второй)
+	_, body = st.зов(t, "GET", "/api/resources", "", "metka")
+	list, _ := body["resources"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("вошедший увидел не свой список: %v", body)
+	}
+	если, _ := list[0].(map[string]any)
+	if если["name"] != "home" {
+		t.Fatalf("вошедший увидел ЧУЖУЮ территорию: %v", если)
+	}
+	if _, err := os.Stat(filepath.Join(st.keys, "world-home")); err != nil {
+		t.Fatalf("ключ своей личности не разложился: %v", err)
+	}
+}
+
+// ── рецепты ──────────────────────────────────────────────────────────────────
+
 func TestРецептДоезжаетДоПодъёма(t *testing.T) {
 	st := поднять(t, докерОтвечает)
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
 	весы := filepath.Join(st.recipes, "весы.yaml")
 	if err := os.WriteFile(весы, []byte("name: весы\n"), 0o644); err != nil {
@@ -297,7 +688,7 @@ func TestРецептДоезжаетДоПодъёма(t *testing.T) {
 	}
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.5","recipe":"весы"}`, "метка")
+		`{"name":"vps","addr":"world@10.8.0.5","creds":"к","recipe":"весы"}`, "metka")
 	if status != http.StatusCreated {
 		t.Fatalf("вторая вещь не поднялась: %d %v", status, body)
 	}
@@ -305,8 +696,7 @@ func TestРецептДоезжаетДоПодъёма(t *testing.T) {
 		t.Fatalf("подъём позван не тем рецептом: %s", st.fake.Line(0))
 	}
 
-	// Снятие называет рецепт тем же способом — своего реестра вещей зона не заводит.
-	if status, body = st.зов(t, "DELETE", "/api/resources/vps?recipe=весы", "", "метка"); status != http.StatusOK {
+	if status, body = st.зов(t, "DELETE", "/api/resources/vps?recipe=весы", "", "metka"); status != http.StatusOK {
 		t.Fatalf("снятие отдало %d: %v", status, body)
 	}
 	if !st.fake.Called("remote.sh", "drop", "vps", "--recipe", весы) {
@@ -314,18 +704,13 @@ func TestРецептДоезжаетДоПодъёма(t *testing.T) {
 	}
 }
 
-// Список того, чем контроллер умеет поднимать, ЧИТАЕТСЯ из каталога: положили файл — вещь
-// появилась, без правки кода и без пересборки образа (`WORLD2` 3.7).
 func TestСписокРецептовЧитаетсяИзКаталога(t *testing.T) {
 	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
-	status, body := st.зов(t, "GET", "/api/recipes", "", "")
-	if status != http.StatusUnauthorized {
-		t.Fatalf("до входа рецепты видны: %d %v", status, body)
-	}
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
-
-	status, body = st.зов(t, "GET", "/api/recipes", "", "метка")
+	status, body := st.зов(t, "GET", "/api/recipes", "", "metka")
 	list, _ := body["recipes"].([]any)
 	if status != http.StatusOK || len(list) != 1 {
 		t.Fatalf("в пустом ландшафте обязана быть одна дверь: %d %v", status, body)
@@ -338,42 +723,27 @@ func TestСписокРецептовЧитаетсяИзКаталога(t *tes
 	if err := os.WriteFile(filepath.Join(st.recipes, "весы.yaml"), []byte("name: весы\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, body = st.зов(t, "GET", "/api/recipes", "", "метка")
+	_, body = st.зов(t, "GET", "/api/recipes", "", "metka")
 	list, _ = body["recipes"].([]any)
 	if len(list) != 2 {
 		t.Fatalf("положенный рецепт не появился, а обязан был: %v", body)
 	}
 }
 
-// Рецепт, которого нет, — наш отказ и наш код: имя рецепта это наше знание, и спрашивать
-// за него соседа не за что. До ресурса при этом дело не доходит.
 func TestНеизвестныйРецептОтказываетСвоимКодом(t *testing.T) {
 	st := поднять(t, докерОтвечает)
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.5","recipe":"часы"}`, "метка")
+		`{"name":"vps","addr":"world@10.8.0.5","creds":"к","recipe":"часы"}`, "metka")
 	if status != http.StatusNotFound {
 		t.Fatalf("неизвестный рецепт отдан как %d: %v", status, body)
 	}
 	отказ(t, body, "no-such-recipe")
 	if st.fake.Called("remote.sh") {
 		t.Fatalf("подъём позвали на рецепте, которого нет: %s", st.fake.Line(0))
-	}
-}
-
-func TestСнятиеГоворитЧтоОсталосьНаМашине(t *testing.T) {
-	st := поднять(t, докерОтвечает)
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
-
-	status, body := st.зов(t, "DELETE", "/api/resources/vps", "", "метка")
-	if status != http.StatusOK {
-		t.Fatalf("снятие отдало %d: %v", status, body)
-	}
-	dropped, _ := body["dropped"].(map[string]any)
-	left, _ := dropped["left"].([]any)
-	if len(left) == 0 {
-		t.Fatalf("сказали «сняли», не назвав оставленного: %v", dropped)
 	}
 }
 
@@ -388,9 +758,11 @@ func TestОтказПодъёмаДоезжаетДоПульта(t *testing.T) 
 		}
 		return докерОтвечает(c)
 	})
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
-	status, body := st.зов(t, "POST", "/api/resources", `{"name":"vps","addr":"world@10.8.0.5"}`, "метка")
+	status, body := st.зов(t, "POST", "/api/resources", `{"name":"vps","addr":"world@10.8.0.5","creds":"к"}`, "metka")
 	if status != http.StatusBadGateway {
 		t.Fatalf("отказ подъёма отдан как %d: %v", status, body)
 	}
@@ -398,27 +770,39 @@ func TestОтказПодъёмаДоезжаетДоПульта(t *testing.T) 
 	if body["from"] != "deploy/remote.sh" {
 		t.Fatalf("не названо, чей отказ: %v", body)
 	}
+	// Неудачный подъём не оставляет следов: ни ключа в связке, ни записи в скоупе.
+	if _, err := os.Stat(filepath.Join(st.keys, "world-vps")); !os.IsNotExist(err) {
+		t.Fatal("ключ пережил неудачный подъём — вторая попытка пошла бы ключом-призраком")
+	}
+	if len(ш.файл(t).Territories) != 0 {
+		t.Fatalf("в скоуп записался участок, которого нет: %+v", ш.файл(t).Territories)
+	}
 }
 
 // ── поля ─────────────────────────────────────────────────────────────────────
 
-func TestПоляПустыИЗаводятся(t *testing.T) {
+func TestПоляЛожатсяВСкоуп(t *testing.T) {
 	st := поднять(t, докерОтвечает)
-	st.зов(t, "POST", "/api/session", `{"addr":"`+st.scope+`","create":true,"name":"егор"}`, "")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
 
-	status, body := st.зов(t, "GET", "/api/fields", "", "метка")
+	status, body := st.зов(t, "GET", "/api/fields", "", "metka")
 	fields, _ := body["fields"].([]any)
 	if status != http.StatusOK || len(fields) != 0 {
 		t.Fatalf("список полей: %d %v", status, body)
 	}
 
-	status, body = st.зов(t, "POST", "/api/fields", `{"name":"дом"}`, "метка")
+	status, body = st.зов(t, "POST", "/api/fields", `{"name":"дом"}`, "metka")
 	if status != http.StatusCreated {
 		t.Fatalf("поле не завелось: %d %v", status, body)
 	}
-	// Говорим вслух, что поле не поднято: молчание тут выглядело бы как «подняли».
 	if note, _ := body["note"].(string); !strings.Contains(note, "не поднимается") {
 		t.Fatalf("не сказано, чего не произошло: %v", body)
+	}
+	файл := ш.файл(t)
+	if len(файл.Fields) != 1 || файл.Fields[0].Name != "дом" {
+		t.Fatalf("поле не уехало в скоуп: %+v", файл.Fields)
 	}
 }
 
@@ -451,7 +835,7 @@ func TestКривоеТелоНазываетсяОтдельно(t *testing.T) 
 
 	// Лишнее поле — опечатка либо чужой контракт. Принять и промолчать нельзя: молча
 	// проглоченное поле выглядит как сработавшее.
-	_, body = st.зов(t, "POST", "/api/session", `{"addr":"/x","адрес":"/y"}`, "")
+	_, body = st.зов(t, "POST", "/api/session", `{"addr":"http://x:8070/","адрес":"y"}`, "")
 	отказ(t, body, "bad-body")
 }
 
@@ -487,28 +871,24 @@ func TestРучкиИПультНеПерехватываютДругДруга(
 	st := поднять(t, докерОтвечает)
 	st.положитьПульт(t)
 
-	// ручка на месте, хотя пульт лежит рядом
 	status, body := st.зов(t, "GET", "/api/me", "", "")
 	if status != http.StatusUnauthorized {
 		t.Fatalf("ручка перехвачена пультом: %d %v", status, body)
 	}
 	отказ(t, body, "not-signed-in")
 
-	// опечатка в ИМЕНИ РУЧКИ остаётся промахом машины, а не «страницы нет»
 	status, body = st.зов(t, "GET", "/api/мее", "", "")
 	if status != http.StatusNotFound {
 		t.Fatalf("неизвестная ручка отдала %d: %v", status, body)
 	}
 	отказ(t, body, "unknown-endpoint")
 
-	// `/api` без косой черты — тоже отказ, а не перенаправление
 	status, body = st.зов(t, "GET", "/api", "", "")
 	if status != http.StatusNotFound {
 		t.Fatalf("/api отдал %d (перенаправление вместо отказа?): %v", status, body)
 	}
 	отказ(t, body, "unknown-endpoint")
 
-	// а вот путь мимо ручек — это уже пульт, и он отвечает страницей
 	if status, page, _ := st.зовБраузером(t, "/"); status != http.StatusOK || !strings.Contains(page, "пульт") {
 		t.Fatalf("корень перестал быть пультом: %d %q", status, page)
 	}
@@ -523,7 +903,6 @@ func TestПультаНетГоворитсяВслух(t *testing.T) {
 	}
 	отказ(t, body, "no-pult")
 
-	// Ручки при этом работают — и отказ обязан об этом говорить.
 	if !strings.Contains(strings.Join(waysOf(t, body), " "), "/api/me") {
 		t.Fatalf("отказ не сказал, что ручки живы: %v", body)
 	}
@@ -550,7 +929,6 @@ func TestОтказЧеловекуЧитаемыйАМашинеJSON(t *testing
 		t.Fatalf("машинный код не уехал заголовком: %q", code)
 	}
 
-	// А `fetch` пульта (Accept: */*) обязан по-прежнему получать JSON.
 	_, body := st.зов(t, "GET", "/", "", "")
 	отказ(t, body, "no-pult")
 }

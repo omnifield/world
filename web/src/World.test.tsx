@@ -6,7 +6,16 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { World } from "./World.jsx";
-import type { Answer, Control, Field, Identity, Resource, Session } from "./control.js";
+import type {
+  Answer,
+  Control,
+  Field,
+  Identity,
+  Leaving,
+  Refusal,
+  Resource,
+  Session,
+} from "./control.js";
 import { изКонтракта } from "./probe-contract.js";
 import { ввести, дождаться, нажать, осесть, смонтировать } from "./probe-dom.jsx";
 
@@ -31,9 +40,13 @@ const Я: Identity = {
   since: "2026-08-14T19:00:00Z",
 };
 
-const [ЗДЕСЬ, ВТОРОЙ] = изКонтракта<{ resources: Resource[] }>("resources").resources;
+// Территории юзера — из его скоупа. Ресурса «здесь» среди них нет и быть не может
+// (`WORLD2-132`): машина контроллера юзеру не принадлежит.
+const [УЧАСТОК, МОЛЧУН] = изКонтракта<{ resources: Resource[] }>("resources").resources;
 
 const ok = <T,>(value: T): Answer<T> => ({ kind: "ok", value });
+
+const ПРОЩАНИЕ = "вышли: контексты докера, ключи и блоки в config сняты. Скоуп не тронут";
 
 type Ответы = {
   me?: Answer<Identity>;
@@ -41,6 +54,7 @@ type Ответы = {
   fields?: Answer<Field[]>;
   addResource?: Answer<{ added: Resource; resources: Resource[] }>;
   addField?: Answer<{ added: Field; fields: Field[]; note: string }>;
+  leave?: Answer<Leaving>;
 };
 
 /** Контроллер для пробы: отвечает тем, что велели, и помнит, чем его позвали. */
@@ -50,17 +64,24 @@ function контроллер(ответы: Ответы) {
     async enter() {
       throw new Error("экран мира входом не занимается");
     },
+    async createScope() {
+      throw new Error("экран мира заведением не занимается");
+    },
+    async leave() {
+      звонки.push({ ручка: "leave", чем: undefined });
+      return ответы.leave ?? ok({ note: ПРОЩАНИЕ });
+    },
     async me() {
       звонки.push({ ручка: "me", чем: undefined });
       return ответы.me ?? ok(Я);
     },
     async resources() {
       звонки.push({ ручка: "resources", чем: undefined });
-      return ответы.resources ?? ok([ЗДЕСЬ]);
+      return ответы.resources ?? ok([УЧАСТОК]);
     },
     async addResource(req) {
       звонки.push({ ручка: "addResource", чем: req });
-      return ответы.addResource ?? ok({ added: ВТОРОЙ, resources: [ЗДЕСЬ, ВТОРОЙ] });
+      return ответы.addResource ?? ok({ added: МОЛЧУН, resources: [УЧАСТОК, МОЛЧУН] });
     },
     async fields() {
       звонки.push({ ручка: "fields", чем: undefined });
@@ -71,9 +92,9 @@ function контроллер(ответы: Ответы) {
       return (
         ответы.addField ??
         ok({
-          added: { name, created: "2026-08-14T19:00:00Z" },
-          fields: [{ name, created: "2026-08-14T19:00:00Z" }],
-          note: "поле записано в твой список; само поле пока не поднимается",
+          added: { name, addr: "", state: "" },
+          fields: [{ name, addr: "", state: "" }],
+          note: "поле записано в твой скоуп; само поле пока не поднимается",
         })
       );
     },
@@ -82,9 +103,9 @@ function контроллер(ответы: Ответы) {
 }
 
 /** Монтирует экран и ждёт, пока приедут все три блока. */
-async function показать(ответы: Ответы = {}) {
+async function показать(ответы: Ответы = {}, onLeave: (сказано?: string) => void = () => {}) {
   const { control, звонки } = контроллер(ответы);
-  проба = смонтировать(() => <World control={control} onLeave={() => {}} />);
+  проба = смонтировать(() => <World control={control} onLeave={onLeave} />);
   await дождаться(
     () => (проба?.корень.querySelectorAll("[data-state='loading']").length === 0 ? true : null),
     "три блока экрана мира",
@@ -96,9 +117,19 @@ describe("кто я", () => {
   it("показывает имя и бренд — то, что канон называет личностью", async () => {
     const { корень } = await показать();
 
-    expect(корень.querySelector("[data-me-name]")?.textContent).toBe("егор");
-    expect(корень.querySelector("[data-me-brand]")?.textContent).toBe("омнифилд");
-    expect(корень.textContent).toContain("/scope/егор");
+    expect(корень.querySelector("[data-me-name]")?.textContent).toBe(Я.name);
+    expect(корень.querySelector("[data-me-brand]")?.textContent).toBe(Я.brand);
+  });
+
+  it("скоуп показан АДРЕСОМ и машиной, на которой он раздаётся", async () => {
+    // `WORLD2-132`: личность лежит по адресу и раздаётся оттуда. Прежней приписки «на ресурсе
+    // контроллера» больше нет — вопрос «на этом ли он ресурсе» исчез вместе с ответом «да».
+    const { корень } = await показать();
+    const скоуп = корень.querySelector<HTMLElement>("[data-me-scope]")!;
+
+    expect(скоуп.textContent).toContain(Я.scope.addr);
+    expect(корень.querySelector("[data-scope-host]")?.textContent).toBe(Я.scope.host);
+    expect(скоуп.textContent).not.toContain("на ресурсе контроллера");
   });
 
   it("пустой бренд показан СЛОВАМИ, а не пустым местом", async () => {
@@ -129,6 +160,51 @@ describe("кто я", () => {
   });
 });
 
+describe("выход", () => {
+  it("зовёт РУЧКУ выхода, а не забывает метку у себя", async () => {
+    // Выход снимает времянки контроллера — контексты, ключи, блоки в config (`WORLD2-132`).
+    // Забытая метка оставила бы их лежать, и следующий вошедший увидел бы чужие территории.
+    let сказано: string | undefined;
+    const { корень, звонки } = await показать({}, (слова) => (сказано = слова));
+
+    нажать(корень, "Выйти");
+    await осесть();
+
+    expect(звонки.filter((з) => з.ручка === "leave")).toHaveLength(1);
+    expect(сказано).toBe(ПРОЩАНИЕ);
+  });
+
+  it("выход ОТКАЗАЛ — остаёмся на экране мира, а причина названа", async () => {
+    // Уйти на экран входа, не сняв времянок, значило бы показать «вышел» тому, кто не вышел,
+    // и передать чужой личности хозяйство предыдущей.
+    let ушли = false;
+    const { корень } = await показать(
+      {
+        leave: {
+          kind: "refusal",
+          refusal: {
+            code: "no-daemon",
+            why: "докер на этой машине не отвечает, а времянки снимает он",
+            ways: ["проверь, что сокет докера отдан контроллеру при подъёме"],
+            said: "control",
+          },
+        },
+      },
+      () => (ушли = true),
+    );
+
+    нажать(корень, "Выйти");
+    const блок = await дождаться(
+      () => корень.querySelector<HTMLElement>("[data-action='leave'] [data-refusal='no-daemon']"),
+      "отказ выхода",
+    );
+
+    expect(ушли).toBe(false);
+    expect(блок.textContent).toContain("времянки снимает он");
+    expect(корень.querySelector("[data-me-name]")).not.toBeNull();
+  });
+});
+
 describe("поля", () => {
   it("пустой список — законное состояние, а не отказ", async () => {
     const { корень } = await показать({ fields: ok([]) });
@@ -153,29 +229,58 @@ describe("поля", () => {
     expect(корень.querySelector("[data-count-fields]")?.textContent).toBe("1");
     expect(корень.textContent).toContain("пока не поднимается");
   });
+
+  it("у записанного поля не показывается ни адреса, ни состояния — их пока нет", async () => {
+    // Поле лежит в скоупе формой мира (`имя` · `адрес` · `состояние`), и пока оно только
+    // записано, две последние пусты. Пустая строка рядом с именем говорила бы, что что-то
+    // отвалилось, — поэтому её нет вовсе, а появятся значения — появится и строка.
+    const { корень } = await показать({ fields: ok([{ name: "дом", addr: "", state: "" }]) });
+    const строка = корень.querySelector<HTMLElement>("[data-field='дом']")!;
+
+    expect(строка.querySelector("[data-field-addr]")).toBeNull();
+    expect(строка.querySelector("[data-field-state]")).toBeNull();
+    expect(строка.textContent?.trim()).toBe("дом");
+  });
 });
 
 describe("источники ресурса", () => {
-  it("«здесь» показан без выдуманного адреса", async () => {
-    // Изнутри машины её собственный адрес неизвестен, а подставленный «localhost» стал бы
-    // ложью для того, кто смотрит снаружи.
-    const { корень } = await показать({ resources: ok([ЗДЕСЬ]) });
-    const строка = корень.querySelector<HTMLElement>("[data-resource='here']")!;
+  it("пусто — законное состояние, и сказано словами", async () => {
+    // До ступени 2 список пустым не бывал: в нём всегда стоял ресурс «здесь». Теперь он
+    // берётся из СКОУПА, и у свежей личности территорий ноль (`WORLD2-132`).
+    const { корень } = await показать({ resources: ok([]) });
+    const блок = корень.querySelector<HTMLElement>("[data-block='resources']")!;
 
-    expect(строка.textContent).toContain("здесь стоит контроллер");
-    expect(строка.textContent).toContain("изнутри машины не известен");
-    expect(строка.textContent).not.toContain("localhost");
+    expect(блок.querySelector("[data-state='empty']")).not.toBeNull();
+    expect(блок.querySelector("[data-refusal]")).toBeNull();
+    expect(блок.textContent).toContain("законное состояние");
+  });
+
+  it("машины контроллера в списке нет — и своего «здесь» экран не рисует", async () => {
+    // Контроллер времянка (`WORLD2` 1.9), и своё хозяйство в личность юзера он не
+    // подмешивает. Вернётся сюда строка «здесь стоит контроллер» — проба покраснеет.
+    const { корень } = await показать({ resources: ok([УЧАСТОК, МОЛЧУН]) });
+
+    expect(корень.textContent).not.toContain("здесь стоит контроллер");
+    expect(корень.querySelector("[data-resource='here']")).toBeNull();
+    expect(корень.textContent).not.toContain("изнутри машины не известен");
+  });
+
+  it("у участка показан адрес, который назвал юзер", async () => {
+    const { корень } = await показать({ resources: ok([УЧАСТОК]) });
+    const строка = корень.querySelector<HTMLElement>(`[data-resource='${УЧАСТОК.name}']`)!;
+
+    expect(строка.textContent).toContain(УЧАСТОК.addr);
   });
 
   it("про САМ ресурс сказано отдельно от того, что на нём стоит", async () => {
     // Ресурс — машина, до которой дотянулись, а не «машина с дверью» (`WORLD2-131`). Вопросов
     // два, и на экране их тоже два: «отвечает ли машина» и «что на ней поднято».
-    const { корень } = await показать({ resources: ok([ЗДЕСЬ]) });
-    const строка = корень.querySelector<HTMLElement>(`[data-resource='${ЗДЕСЬ.name}']`)!;
+    const { корень } = await показать({ resources: ok([УЧАСТОК]) });
+    const строка = корень.querySelector<HTMLElement>(`[data-resource='${УЧАСТОК.name}']`)!;
 
-    expect(строка.querySelector("[data-reach]")?.textContent).toBe(ЗДЕСЬ.reach);
+    expect(строка.querySelector("[data-reach]")?.textContent).toBe(УЧАСТОК.reach);
     expect(строка.querySelector("[data-things]")?.getAttribute("data-things")).toBe("list");
-    expect(строка.querySelector(`[data-thing='${ЗДЕСЬ.things![0]!.name}']`)).not.toBeNull();
+    expect(строка.querySelector(`[data-thing='${УЧАСТОК.things![0]!.name}']`)).not.toBeNull();
   });
 
   it("«не спросили» и «спросили, там пусто» показаны РАЗНЫМИ ответами", async () => {
@@ -183,8 +288,8 @@ describe("источники ресурса", () => {
     // недоступной машине ничего не стоит, — а этого мы не знаем (`WORLD2` 4.2).
     const { корень } = await показать({
       resources: ok([
-        { ...ВТОРОЙ, name: "молчит", things: null },
-        { ...ВТОРОЙ, name: "пусто", reach: "отвечает", things: [] },
+        { ...МОЛЧУН, name: "молчит", things: null },
+        { ...МОЛЧУН, name: "пусто", reach: "отвечает", things: [] },
       ]),
     });
     const молчит = корень.querySelector<HTMLElement>("[data-resource='молчит'] [data-things]")!;
@@ -205,7 +310,7 @@ describe("источники ресурса", () => {
     const { корень } = await показать({
       resources: ok([
         {
-          ...ЗДЕСЬ,
+          ...УЧАСТОК,
           things: [{ name: "весы", state: "запущена, здоровья не спросить", alive: false }],
         },
       ]),
@@ -219,35 +324,79 @@ describe("источники ресурса", () => {
   it("ресурса в цифрах на экране нет: только адрес, сам ресурс и вещи на нём", async () => {
     // `WORLD2` 2.5: память и ядра даёт отдельный инструмент осмотра, и он отложен сознательно.
     // Появится здесь выдуманная цифра — проба покраснеет.
-    const { корень } = await показать({ resources: ok([ЗДЕСЬ, ВТОРОЙ]) });
-    const строка = корень.querySelector<HTMLElement>(`[data-resource='${ВТОРОЙ.name}']`)!;
+    const { корень } = await показать({ resources: ok([УЧАСТОК, МОЛЧУН]) });
+    const строка = корень.querySelector<HTMLElement>(`[data-resource='${МОЛЧУН.name}']`)!;
     const факты = [...строка.querySelectorAll("dt")].map((dt) => dt.textContent);
 
     expect(факты).toEqual(["адрес", "ресурс", "вещи"]);
   });
 
-  it("после добавления источников видно два — это главное, что должно быть видно глазами", async () => {
-    const { корень, звонки } = await показать({ resources: ok([ЗДЕСЬ]) });
+  it("человек называет ТРИ вещи: имя участка, адрес и креды", async () => {
+    // Имя участка называет юзер, и мир его не выдумывает и из адреса не выводит
+    // (`WORLD2` 2.5 п. 11): на нём стоит адрес локации. Креды теперь обязательны — без них
+    // контроллер отказывает (`no-creds`).
+    const { корень, звонки } = await показать({ resources: ok([УЧАСТОК]) });
     expect(корень.querySelector("[data-count-resources]")?.textContent).toBe("1");
 
-    ввести(корень, "Имя", "vps");
-    ввести(корень, "Адрес", "world@10.8.0.5");
+    ввести(корень, "Имя", "home");
+    ввести(корень, "Адрес", "world@10.8.0.6");
     ввести(корень, "Креды", "ключ целиком");
     нажать(корень, "Добавить ресурс");
     await осесть();
 
     expect(звонки.filter((з) => з.ручка === "addResource")).toEqual([
-      { ручка: "addResource", чем: { name: "vps", addr: "world@10.8.0.5", creds: "ключ целиком" } },
+      { ручка: "addResource", чем: { name: "home", addr: "world@10.8.0.6", creds: "ключ целиком" } },
     ]);
+  });
+
+  it("после добавления источников видно два — это главное, что должно быть видно глазами", async () => {
+    const { корень, звонки } = await показать({ resources: ok([УЧАСТОК]) });
+
+    ввести(корень, "Имя", "home");
+    ввести(корень, "Адрес", "world@10.8.0.6");
+    ввести(корень, "Креды", "ключ целиком");
+    нажать(корень, "Добавить ресурс");
+    await осесть();
+
     expect(корень.querySelector("[data-count-resources]")?.textContent).toBe("2");
-    expect(корень.querySelector("[data-resource='vps']")).not.toBeNull();
+    expect(корень.querySelector(`[data-resource='${МОЛЧУН.name}']`)).not.toBeNull();
     // Список берётся из ответа на добавление — второй раз контроллер не спрашивается.
     expect(звонки.filter((з) => з.ручка === "resources")).toHaveLength(1);
   });
 
+  it("занятое имя участка — отказ рядом с формой, а не молчаливая перезапись", async () => {
+    // Отказ МЕХАНИКИ, а не ответ ресурса (`WORLD2` 2.3, три рода «нет»): контроллер проверяет
+    // его по содержимому скоупа, до всякого докера. Пульт показывает причину и выходы как
+    // есть — своих не дописывает.
+    const { корень } = await показать({
+      resources: ok([УЧАСТОК]),
+      addResource: {
+        kind: "refusal",
+        refusal: {
+          code: "name-taken",
+          why: `участок с именем «${УЧАСТОК.name}» в твоём скоупе уже есть`,
+          ways: ["назови другое имя", "посмотри, какие уже есть: GET /api/resources"],
+          said: "control",
+        },
+      },
+    });
+
+    ввести(корень, "Имя", УЧАСТОК.name);
+    ввести(корень, "Адрес", "world@10.8.0.9");
+    ввести(корень, "Креды", "ключ");
+    нажать(корень, "Добавить ресурс");
+    const блок = await дождаться(
+      () => корень.querySelector<HTMLElement>("[data-refusal='name-taken']"),
+      "отказ занятого имени",
+    );
+
+    expect([...блок.querySelectorAll(".pult__ways li")]).toHaveLength(2);
+    expect(корень.querySelector("[data-count-resources]")?.textContent).toBe("1");
+  });
+
   it("отказ добавления показан рядом с формой, а экран мира остаётся на месте", async () => {
     const { корень } = await показать({
-      resources: ok([ЗДЕСЬ]),
+      resources: ok([УЧАСТОК]),
       addResource: {
         kind: "refusal",
         refusal: {
@@ -260,8 +409,9 @@ describe("источники ресурса", () => {
       },
     });
 
-    ввести(корень, "Имя", "vps");
-    ввести(корень, "Адрес", "world@10.8.0.5");
+    ввести(корень, "Имя", "home");
+    ввести(корень, "Адрес", "world@10.8.0.6");
+    ввести(корень, "Креды", "ключ");
     нажать(корень, "Добавить ресурс");
     const блок = await дождаться(
       () => корень.querySelector<HTMLElement>("[data-refusal='no-docker']"),
@@ -271,28 +421,24 @@ describe("источники ресурса", () => {
     // Чужой код оставлен как есть и назван вместе с тем, от кого пришёл.
     expect(блок.textContent).toContain("deploy/remote.sh");
     // Экран не пропал: имя и список источников на месте.
-    expect(корень.querySelector("[data-me-name]")?.textContent).toBe("егор");
-    expect(корень.querySelector("[data-resource='here']")).not.toBeNull();
+    expect(корень.querySelector("[data-me-name]")?.textContent).toBe(Я.name);
+    expect(корень.querySelector(`[data-resource='${УЧАСТОК.name}']`)).not.toBeNull();
   });
 });
 
 describe("отказ одного блока не уносит остальные", () => {
   it("ресурсы отказали — имя и поля видны, у отказа есть выход", async () => {
-    const { корень } = await показать({
-      resources: {
-        kind: "refusal",
-        refusal: {
-          code: "no-daemon",
-          why: "докер на этой машине не отвечает, а список ресурсов — это его контексты",
-          ways: ["проверь, что сокет докера отдан контроллеру при подъёме"],
-          said: "control",
-        },
-      },
-    });
+    const отказ: Refusal = {
+      code: "scope-silent",
+      why: "раздача скоупа по адресу не ответила, а список территорий лежит в нём",
+      ways: ["проверь, что раздача на той машине поднята и отвечает"],
+      said: "control",
+    };
+    const { корень } = await показать({ resources: { kind: "refusal", refusal: отказ } });
 
     expect(корень.querySelector("[data-block='resources'] [data-refusal]")).not.toBeNull();
-    expect(корень.querySelector("[data-me-name]")?.textContent).toBe("егор");
+    expect(корень.querySelector("[data-me-name]")?.textContent).toBe(Я.name);
     expect(корень.querySelector("[data-block='fields'] [data-state='empty']")).not.toBeNull();
-    expect(корень.textContent).toContain("сокет докера");
+    expect(корень.textContent).toContain("раздача на той машине поднята");
   });
 });
