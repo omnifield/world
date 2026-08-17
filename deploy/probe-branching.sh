@@ -128,6 +128,20 @@ case "$1" in
     network) exit 0 ;;
     pull) [ -n "${STUB_PULL_OK:-}" ] && exit 0 || exit 1 ;;
     image)
+        # `image inspect --format …{{range .Config.Env}}…` — вопрос выпуска и подъёма: что
+        # образ говорит о себе САМ (`WORLD_VERSION`, `WORLD2-130`). Умолчание сценария —
+        # штатный ход: штамп совпадает с версией подставного гита. Крутится он `STUB_STAMP`:
+        # пусто — штампа в образе нет вовсе, другое значение — штамп разъехался с тегом.
+        # Двоеточия в `${STUB_STAMP-…}` нет намеренно: пустое значение это состояние, а не
+        # просьба взять умолчание.
+        case "$ALL" in
+            *Config.Env*)
+                if [ -n "${STUB_STAMP-sha-abc1234}" ]; then
+                    printf 'WORLD_ADDR=:8080\n'
+                    printf 'WORLD_VERSION=%s\n' "${STUB_STAMP-sha-abc1234}"
+                fi
+                exit 0 ;;
+        esac
         # `image inspect --format …{{RepoDigests}}…` — вопрос выпуска: под каким digest'ом
         # образ лёг в реестр. Отвечаем подставным: проверяется, что его СПРАШИВАЮТ и
         # печатают, а не то, чему он равен.
@@ -225,6 +239,15 @@ case "$1" in
                 exit 0 ;;
             *)  exit 0 ;;
         esac ;;
+    build)
+        # ШТАМП ВЕРСИИ ставится поверх готового образа: `docker build -f -`, сборочный файл
+        # приходит ПОТОКОМ. В аргументах значения штампа нет вовсе — оно в потоке; поэтому
+        # заглушка поток вычитывает и кладёт в журнал построчно. Иначе проверить, ЧТО именно
+        # вписано в образ, было бы нечем — а это и есть предмет проверки.
+        while IFS= read -r stroka; do
+            printf 'STDIN %s\n' "$stroka" >> "${STUB_LOG:-/dev/null}"
+        done
+        exit "${STUB_STAMP_FAIL:-0}" ;;
     run)
         case "$*" in
             *"${STUB_NODE_IMAGE:?}"*)
@@ -269,7 +292,10 @@ case "$1" in
     rev-parse)
         case "$*" in
             *--git-dir*) [ -n "${STUB_GIT_REPO-1}" ] && { echo .git; exit 0; }; exit 128 ;;
-            *HEAD*)      printf '%s\n' "${STUB_GIT_SHA:-abc1234}"; exit 0 ;;
+            # `${STUB_GIT_SHA-abc1234}` БЕЗ двоеточия: пустое значение сценария означает
+            # «коммитов нет вовсе», а не «возьми умолчание». Это отдельное состояние, и
+            # `version.sh` отвечает на него своим кодом (`no-commit`).
+            *HEAD*)      printf '%s\n' "${STUB_GIT_SHA-abc1234}"; exit 0 ;;
         esac ;;
     status) [ -n "${STUB_GIT_DIRTY:-}" ] && printf ' M deploy/probe.sh\n'; exit 0 ;;
 esac
@@ -1133,7 +1159,9 @@ not_called "compose -f $HERE/compose.yaml build"
 part "29c. выпуск не из репозитория → отказ, метить нечем"
 STUB_GIT_REPO= STUB_HAVE_PROBE=1 \
     run_case 1 "$HERE/release.sh"
-said "не из репозитория"
+# Причину называет `version.sh` — единственное место, где версия выводится из гита, — и
+# выпуск передаёт её ДОСЛОВНО (`WORLD2` 2.3), а свой выход дописывает рядом.
+said "не репозиторий"
 not_called "push"
 
 # Штатный ход. Здесь же — ЧИСЛО образов, порядок шести push'ей и один `sha` на всю тройку.
@@ -1682,6 +1710,29 @@ grep -qF "в общей сети меня по имени не видно" "$STU
     && bad "сказано «в поле не видно» там, где сеть не спрашивали" \
     || good "про сеть не выдумано ничего — сказано, что адрес не собрать"
 
+# Версию дверь берёт У СЕБЯ — из своего окружения, куда её вписала сборка (`WORLD2-130`).
+# Сокета у двери нет и не будет (`WORLD2` 3.7), спросить «под каким я digest'ом» ей нечем — и
+# это законная разница с контроллером. Зато на вопрос «какой я сборки» она отвечать обязана:
+# `latest` подвижен, и юзер, поднявший его, иначе не узнает, что получил.
+part "30o. дверь называет сборку, которой поднята"
+entry_case 0 WORLD_VERSION=sha-abc1234 STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+ne_otkaz
+said "версия образа sha-abc1234"
+said "sha-abc1234"                     # и в итоговом баннере тоже — его читают чаще журнала
+
+part "30p. штампа в образе нет → «версии не знаю», а не выдуманное значение"
+entry_case 0 STUB_KNOCK_LOCAL=0 STUB_KNOCK_FIELD=0
+ne_otkaz
+said "версии не знаю"
+grep -qi 'unknown' "$STUB_DIR/out" \
+    && { bad "дверь выдумала версию вместо «не знаю»"; grep -i 'unknown' "$STUB_DIR/out" >&2; } \
+    || good "выдуманной версии дверь не произносит"
+# Молчание тут — тот самый дефект, который здесь и чинится: проверяем, что про версию сказано
+# хоть что-то в ОБОИХ случаях.
+grep -qF 'версия' "$STUB_DIR/out" \
+    && good "про версию сказано вслух даже тогда, когда её нет" \
+    || bad "дверь про версию промолчала — ровно то, из-за чего узел и заведён"
+
 # ================================================================== 31. КОМАНДА ЮЗЕРА
 # Команда `docker run` напечатана в `deploy/README.md` и должна работать КОПИРОВАНИЕМ, а не
 # пересказом. Проверяем не текст вокруг, а саму команду: имя образа, тома, и — главное —
@@ -1732,6 +1783,157 @@ case "$imya_v_faile" in
     ghcr.io/*|*.*/*|localhost/*) good "имя образа несёт реестр — юзер тянет оттуда, куда мы публикуем" ;;
     *) bad "имя образа короткое: $imya_v_faile" "докер достроит его до Docker Hub — это чужое пространство имён" ;;
 esac
+
+# ================================================================== 32. ШТАМП ВЕРСИИ
+# `WORLD2-130`. Образ обязан знать, КАКОЙ ОН ВЕРСИИ. Раньше не знал: версию считал выпуск и
+# тратил её только на тег снаружи, а внутри образа про себя не было ни слова — поэтому
+# контроллер, поднятый пином, ставил юзеру дверь подвижным `latest`: ему нечем было себя
+# назвать. Живой прогон на этом и встал.
+#
+# Стережём здесь всю цепочку, а не «вписалось ли»:
+#
+#   · ОДНО МЕСТО вычисления. Два `rev-parse` в зоне — и тег со штампом разъедутся, а снаружи
+#     это не отличить: оба выглядят правдой;
+#   · ЧЕСТНОЕ «версии нет». Нет гита, нет коммита, грязное дерево — штампа НЕТ ВОВСЕ. Ни
+#     `unknown`, ни пустого значения: приблизительная запись не отличима от измеренной и
+#     однажды уедет в тег (`WORLD2` 4.2 п. 5);
+#   · СВЕРКА ШТАМПА С ТЕГОМ до первой отдачи. Один источник — это хорошо, но проверять надо
+#     то, что получилось: цена расхождения — необратимая публикация.
+
+part "32. версия считается в ОДНОМ месте — deploy/version.sh, и больше нигде в зоне"
+# Ищем не «есть ли version.sh», а не завёлся ли ВТОРОЙ счёт. Проба себя из поиска исключает:
+# в ней подставной гит, и `rev-parse` в нём — часть заглушки, а не второй источник.
+istochniki=$(grep -rl 'rev-parse' "$HERE" --include='*.sh' 2>/dev/null \
+             | grep -v 'probe-branching.sh' | sort || true)
+[ "$istochniki" = "$HERE/version.sh" ] \
+    && good "версию из гита выводит ровно один файл зоны — deploy/version.sh" \
+    || { bad "версия выводится из гита не в одном месте — тег и штамп разъедутся:"
+         printf '%s\n' "$istochniki" >&2; }
+
+# vers_case ОЖИДАЕМЫЙ-КОД ОЖИДАЕМОЕ-СОСТОЯНИЕ ЧТО-НА-STDOUT ПЕРЕМЕННЫЕ… — прогон version.sh.
+# Стережём КОД СОСТОЯНИЯ, а не формулировку: проба, привязанная к буквам, зеленеет на верной
+# правке и учит не трогать текст (`WORLD2` 4.2).
+VERR="$STUB_DIR/verr"
+vers_case() {
+    local want_code="$1" want_state="$2" want_out="$3"; shift 3
+    local out code state
+    out="$(env "$@" "$HERE/version.sh" 2>"$VERR")"
+    code=$?
+    state="$(sed -n 's/^VERSION-STATE: //p' "$VERR" | head -n1)"
+    [ "$code" = "$want_code" ] && good "код возврата $code" \
+                              || bad "код возврата $code, ждали $want_code"
+    if [ -n "$want_state" ]; then
+        [ "$state" = "$want_state" ] && good "состояние $state" \
+                                    || bad "состояние «${state:-нет вовсе}», ждали $want_state"
+        # У причины обязаны быть СЛОВА рядом с кодом: код читает машина, строку — человек.
+        [ "$(grep -vc '^VERSION-STATE:' "$VERR")" -ge 1 ] \
+            && good "причина названа словами, а не только кодом" \
+            || bad "рядом с кодом $state нет причины словами"
+    fi
+    [ "$out" = "$want_out" ] && good "на stdout «${out:-ничего}»" \
+                             || bad "на stdout «$out», ждали «${want_out:-ничего}»"
+}
+
+part "32a. дерево чисто → версия есть, и это единственный случай, когда она печатается"
+vers_case 0 "" "sha-abc1234"
+
+part "32b. дерево грязное → версии НЕТ: коммит на месте, а собрано будет не из него"
+vers_case 1 dirty "" STUB_GIT_DIRTY=1
+
+part "32c. не репозиторий · нет коммитов · нет гита — три разных состояния, три кода"
+vers_case 1 not-a-repo "" STUB_GIT_REPO=
+vers_case 1 no-commit  "" STUB_GIT_SHA=
+# Гита нет ВОВСЕ: прогоняем с пустым `PATH`. Файл обязан дойти до ответа и на такой машине —
+# поэтому в нём нет ни одной внешней команды, кроме самого гита. Зовём своим bash: у
+# `#!/usr/bin/env bash` без PATH не нашлось бы даже интерпретатора.
+env PATH=/nonexistent "$BASH" "$HERE/version.sh" >"$STUB_DIR/vout" 2>"$VERR"
+vers_nogit=$?
+if [ "$vers_nogit" = 1 ] \
+   && [ "$(sed -n 's/^VERSION-STATE: //p' "$VERR" | head -n1)" = no-git ] \
+   && [ ! -s "$STUB_DIR/vout" ]; then
+    good "без гита в PATH — код 1, состояние no-git, на stdout ничего"
+else
+    bad "без гита ответ не тот (код $vers_nogit):"; tail -n 3 "$VERR" >&2
+fi
+
+part "32d. штатная сборка вписывает версию в образ — ту же, что уедет в тег"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh"
+said "версия сборки sha-abc1234"
+said "версия вписана в образ"
+# Штамп ставится ПОВЕРХ готового образа, и значение приходит потоком — заглушка кладёт поток
+# в журнал. Смотрим и на то, ЧТО вписано, и на то, ВО ЧТО вписано.
+called "STDIN FROM ghcr.io/omnifield/world:latest"
+called "STDIN ENV WORLD_VERSION=sha-abc1234"
+
+part "32e. --share и --control штампуют СВОИ образы, чужих не трогают"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --share
+called "STDIN FROM ghcr.io/omnifield/world-share:latest"
+called "STDIN ENV WORLD_VERSION=sha-abc1234"
+not_called "STDIN FROM ghcr.io/omnifield/world:latest"
+
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --control
+called "STDIN FROM omnifield/world-control:dev"
+not_called "STDIN FROM ghcr.io/omnifield/world:latest"
+
+# Пульт образом не является — штамповать там нечего, и лишний вызов означал бы, что сборка
+# метит не то, что сложила.
+part "32f. --only-web образа не складывает → и штампа не ставит вовсе"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --only-web
+not_called "STDIN ENV WORLD_VERSION"
+
+part "32g. гита нет → сборка говорит «версии нет» и НЕ вписывает ничего"
+STUB_GIT_REPO= STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh"
+said "версии нет"
+said "БЕЗ штампа"
+said "не репозиторий"                      # причина названа дословно, а не пересказана
+not_called "STDIN ENV WORLD_VERSION"
+# И главное: выдуманного значения нет НИГДЕ. Ни `unknown`, ни пустого — оба потом сошли бы
+# за тег, а `:unknown` у юзера выглядел бы как «образа нет».
+grep -qiE 'unknown|WORLD_VERSION=$' "$STUB_LOG" \
+    && { bad "в журнале завелась выдуманная версия:"; grep -iE 'unknown|WORLD_VERSION=$' "$STUB_LOG" >&2; } \
+    || good "выдуманной версии в вызовах нет — ни unknown, ни пустой"
+grep -qi 'unknown' "$STUB_DIR/out" \
+    && { bad "сборка сказала «unknown» вместо «версии нет»"; grep -i 'unknown' "$STUB_DIR/out" >&2; } \
+    || good "и вслух сборка «unknown» не произносит"
+
+part "32h. дерево грязное → тот же ответ: честной версии нет, штампа нет"
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh"
+said "версии нет"
+said "не чисто"
+not_called "STDIN ENV WORLD_VERSION"
+
+part "32i. выпуск сверяет штамп с тегом — разъехались → отказ, в реестр НЕ ушло ничего"
+STUB_STAMP=sha-9999999 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "разъехались"
+said "sha-9999999"                         # названы ОБА значения, а не «что-то не сошлось»
+said "sha-abc1234"
+not_called "push"
+not_called "tag "
+
+part "32j. образ без штампа → выпуск отказывает: тег утверждал бы больше, чем правда"
+STUB_STAMP= STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh"
+said "не знает своей версии"
+not_called "push"
+not_called "tag "
+
+part "32k. штатный выпуск: сверка была, и спрошено у ВСЕХ ТРЁХ образов"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh"
+called "image inspect --format .*Config.Env.* ghcr.io/omnifield/world:latest"
+called "image inspect --format .*Config.Env.* ghcr.io/omnifield/world-share:latest"
+called "image inspect --format .*Config.Env.* omnifield/world-control:dev"
+# Сверка стоит ДО первой отдачи: отказ на ней не должен оставлять в реестре часть набора.
+n_sverka=$(grep -n 'image inspect --format .*Config.Env' "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_push=$(grep -n '^push ' "$STUB_LOG" | head -n1 | cut -d: -f1)
+ranshe "штамп сверен раньше первой отдачи" "$n_sverka" "$n_push"
 
 # ================================================================== итог
 part "── итог"

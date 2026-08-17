@@ -87,6 +87,12 @@ type Options struct {
 	Docker      string
 	KeysDir     string
 	DoorPort    int
+	// Version — своя версия сборки (`WORLD_VERSION`): ею контроллер пинит вещи, которые
+	// ставит (`WORLD2-130`). Пусто — версии нет, и подъём говорит об этом вслух.
+	Version string
+	// Named — подстановки имени образа, названные хозяином снаружи. Явное слово юзера
+	// старше нашего пина (`WORLD2` 0.1).
+	Named map[string]string
 	// ScopeTimeout — сколько секунд ждём ответа раздачи скоупа.
 	ScopeTimeout int
 	// PultDir — где лежит СОБРАННЫЙ пульт. Пусто — раздавать нечего, и контроллер
@@ -144,6 +150,9 @@ func New(opt Options) *Handler {
 			Docker:   opt.Docker,
 			KeysDir:  opt.KeysDir,
 			Port:     opt.DoorPort,
+			Version:  opt.Version,
+			Named:    opt.Named,
+			Logf:     opt.Logf,
 		},
 		recipes: recipes,
 		pult:    pult.New(opt.PultDir),

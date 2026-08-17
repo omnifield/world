@@ -101,6 +101,27 @@ type Manager struct {
 	// Port — хост-порт двери на той машине; едет `deploy/remote.sh` тем же именем, каким
 	// тот его ждёт. Рецепт, который его не читает, о нём и не узнает.
 	Port int
+	// Version — СВОЯ версия сборки: штамп `WORLD_VERSION`, который выпуск вписал в образ
+	// (`WORLD2-130`). Ею контроллер пинит вещи, которые ставит. Пусто — версии нет, и это
+	// законное состояние: собран не выпуском, а на месте.
+	Version string
+	// Named — подстановки имени образа, названные ХОЗЯИНОМ снаружи (`WORLD_IMAGE=…` в
+	// команде подъёма). Явное слово юзера старше нашего пина (`WORLD2` 0.1), поэтому мы их
+	// не переписываем, а говорим о них вслух.
+	Named map[string]string
+	// Logf — журнал. Подъём обязан называть, ЧЕМ поднято, и называть это КАЖДЫЙ раз, а не
+	// один раз на старте: тег `latest` подвижен, и «поднял старое и не заметил» — ровно тот
+	// ложный результат, ради которого узел и заведён.
+	Logf func(string, ...any)
+}
+
+// say — строка в журнал. Молчащий подъём это `WORLD2-130` целиком, поэтому канал сюда
+// заведён полем, а не выведен из глобального журнала: подменяемость — то, чем проба
+// проверяет, что подъём и правда говорит.
+func (m *Manager) say(format string, args ...any) {
+	if m.Logf != nil {
+		m.Logf(format, args...)
+	}
 }
 
 // ── список ───────────────────────────────────────────────────────────────────
@@ -234,6 +255,14 @@ func (t *tally) verdict() (string, bool) {
 // `env` — значения, которые читает сам рецепт. Контроллер их не толкует: что вещи нужно,
 // знает вещь, а не он.
 func (m *Manager) Raise(ctx context.Context, name, addr, recipePath string, env []string) *refusal.Refusal {
+	// ЧЕМ ПОДНИМАЕМ — решается здесь и НАЗЫВАЕТСЯ ВСЛУХ (`WORLD2-130`). Строка пишется при
+	// каждом подъёме: и когда пин сработал, и когда версии нет, и когда имя названо
+	// снаружи. Молчание тут и есть тот дефект, ради которого узел заведён.
+	env = append(append([]string{}, env...), m.remoteEnv()...)
+	p := m.pinFor(ctx, recipePath, env)
+	m.say("control: вещь по рецепту %s на территории %s — %s", recipePath, name, p.say)
+	env = append(env, p.env...)
+
 	// Рецепт называется ВСЕГДА, даже когда он тот же самый, что у соседа по умолчанию.
 	// Умолчание принадлежит ЕГО команде, а не нашему вызову: положись мы на него, смена
 	// умолчания у соседа молча сменила бы вещь, которую поднимает контроллер.
@@ -241,7 +270,7 @@ func (m *Manager) Raise(ctx context.Context, name, addr, recipePath string, env 
 	res, err := m.Runner.Run(ctx, run.Command{
 		Name: m.RemoteSh,
 		Args: args,
-		Env:  append(m.remoteEnv(), env...),
+		Env:  env,
 	})
 	if err != nil || res.Code != 0 {
 		return m.toolFailure(err, res, "поставить вещь по рецепту "+recipePath+" на "+addr+" не вышло")
@@ -273,7 +302,15 @@ func (m *Manager) Lower(ctx context.Context, name, recipePath, recipeName string
 	if withImage {
 		args = append(args, "--with-image")
 	}
-	res, err := m.Runner.Run(ctx, run.Command{Name: m.RemoteSh, Args: args, Env: m.remoteEnv()})
+	// Снимаем ТЕМ ЖЕ, чем ставили. Без пина `--with-image` унёс бы образ `latest` — не тот,
+	// которым вещь поднята, — и человек получил бы «снял», не сняв. Строка в журнале здесь
+	// по той же причине, что и при подъёме: чем действуем, говорится вслух.
+	env := m.remoteEnv()
+	p := m.pinFor(ctx, recipePath, env)
+	m.say("control: снимаю вещь по рецепту %s с территории %s — %s", recipePath, name, p.say)
+	env = append(env, p.env...)
+
+	res, err := m.Runner.Run(ctx, run.Command{Name: m.RemoteSh, Args: args, Env: env})
 
 	out := Dropped{
 		Name:    name,
