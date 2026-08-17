@@ -29,6 +29,7 @@ import (
 
 	"github.com/omnifield/world/control/internal/api"
 	"github.com/omnifield/world/control/internal/pult"
+	"github.com/omnifield/world/control/internal/resource"
 	"github.com/omnifield/world/control/internal/run"
 )
 
@@ -82,6 +83,20 @@ func main() {
 	// того же самого разъехалось бы с первым молча.
 	shareRecipe := env("CONTROL_SHARE_RECIPE", filepath.Join(filepath.Dir(filepath.Dir(remoteSh)), "share", "compose.yaml"))
 
+	// СВОЯ ВЕРСИЯ СБОРКИ. Штамп в образ вписывает выпуск (`deploy/build.sh`), и значение
+	// его РАВНО неподвижному тегу: `sha-<7>`. Читаем как есть и собирать второй раз не
+	// беремся — префикс разъехался бы с тем, что ставит выпуск (`WORLD2-130`).
+	version := strings.TrimSpace(os.Getenv("WORLD_VERSION"))
+	// Имя образа, названное ХОЗЯИНОМ снаружи, старше нашего пина (`WORLD2` 0.1): мир не
+	// решает за юзера. Собираем то, что он назвал, чтобы сказать об этом вслух, а не молча
+	// переписать его слово своим.
+	named := map[string]string{}
+	for _, name := range resource.ImageVars {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			named[name] = value
+		}
+	}
+
 	handler := api.New(api.Options{
 		Runner:       run.Exec{Timeout: time.Duration(number("CONTROL_TOOL_TIMEOUT", defaultToolTimeout)) * time.Second},
 		RemoteSh:     remoteSh,
@@ -93,9 +108,15 @@ func main() {
 		DoorPort:     number("CONTROL_DOOR_PORT", defaultDoorPort),
 		ScopeTimeout: number("CONTROL_SCOPE_TIMEOUT", defaultScopeTimeout),
 		PultDir:      pultDir,
+		Version:      version,
+		Named:        named,
 	})
 
 	log.Printf("control: руки юзера на %s", addr)
+	// ЧЕМ ПОДНЯТ САМ КОНТРОЛЛЕР — первой же строкой. Спрашивать для этого некого: версия
+	// лежит в его собственном окружении, штампом выпуска. Нет штампа — так и сказано, а
+	// `unknown` не выдумывается (`WORLD2` 4.2 п. 5, `WORLD2-130`).
+	log.Printf("control: %s", versionState(version, named))
 	log.Printf("control: подъём вещи — %s; докер — %s; связка — %s",
 		remoteSh, env("CONTROL_DOCKER", "docker"), keys)
 	// Ландшафт рецептов называется В СТАРТОВОЙ СТРОКЕ: контроллер не знает, какие бывают
@@ -153,6 +174,10 @@ func usage(w io.Writer) {
 личности он быть не должен. Снёс контроллер, поднял на другой машине, вошёл тем же адресом
 — всё на месте.
 
+ЧЕМ ПОДНИМАЕТСЯ — своей сборкой: контроллер читает свой штамп WORLD_VERSION и подставляет
+его тегом в имя образа рецепта. Что пин сработал, он ПРОВЕРЯЕТ, спрашивая рецепт заново, и
+при каждом подъёме пишет в журнал, чем поднято. Молчания тут нет ни в одном исходе.
+
 ЧТО ПОДНИМАЕТСЯ — говорит РЕЦЕПТ (файл запуска), а не контроллер: перечня вещей в нём нет
 вовсе. Не назвал рецепт — ставится дверь; назвал — то, что назвал. Свои вещи хозяин машины
 кладёт в каталог рецептов, и для этого не нужны ни правка кода, ни пересборка образа.
@@ -170,6 +195,15 @@ func usage(w io.Writer) {
   CONTROL_DOOR_PORT=8080             хост-порт двери на добавляемой территории
   CONTROL_TOOL_TIMEOUT=300           сколько секунд ждём внешний инструмент
   CONTROL_SCOPE_TIMEOUT=10           сколько секунд ждём ответа раздачи скоупа
+
+Значения не наши, но контроллер их читает:
+  WORLD_VERSION=sha-<7>              ШТАМП, вписанный в образ выпуском: своя версия сборки.
+                                     Ею контроллер пинит вещи, которые ставит: контроллер
+                                     sha-X ставит дверь и раздачу sha-X. Штампа нет —
+                                     версии нет, вещи идут тем, что назовёт рецепт (latest),
+                                     и подъём говорит это вслух
+  WORLD_IMAGE=…  SHARE_IMAGE=…       явное имя образа от хозяина. Оно СТАРШЕ пина: мир не
+                                     решает за юзера, и переписывать его слово нельзя
 
 Отказ приходит тройкой: code (машине), why (причина человеку), ways[] (выходы).
 Контроллеру нужен сокет докера — его даёт хозяин при подъёме (./control/up.sh).
@@ -214,6 +248,27 @@ func fileState(path string) string {
 		return "файла нет — «завести скоуп» откажет кодом no-share-recipe; назови свой: CONTROL_SHARE_RECIPE"
 	default:
 		return "не прочитать: " + err.Error()
+	}
+}
+
+// versionState — чем поднят контроллер и чем он будет поднимать вещи, одной строкой.
+// Три состояния, и они разные: имя названо хозяином · версия есть · версии нет.
+func versionState(version string, named map[string]string) string {
+	var chosen []string
+	for _, name := range resource.ImageVars {
+		if value, ok := named[name]; ok {
+			chosen = append(chosen, name+"="+value)
+		}
+	}
+	switch {
+	case len(chosen) > 0:
+		return "имя образа названо снаружи (" + strings.Join(chosen, ", ") +
+			") — оно старше пина: вещи поднимутся тем, что назвал хозяин"
+	case version != "":
+		return "версия сборки " + version + " — ею и поднимаются вещи: дверь и раздача той же сборки"
+	default:
+		return "версии своей не знаю: штампа WORLD_VERSION в образе нет — значит собран не выпуском, а на месте; " +
+			"вещи поднимутся тем, что назовёт рецепт (обычно подвижный latest)"
 	}
 }
 

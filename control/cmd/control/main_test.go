@@ -34,6 +34,10 @@ func TestПодсказкаНазываетВсеЗначения(t *testing.T) 
 		"CONTROL_ADDR", "CONTROL_KEYS", "CONTROL_REMOTE_SH",
 		"CONTROL_DOCKER", "CONTROL_DOOR_PORT", "CONTROL_TOOL_TIMEOUT", "CONTROL_SCOPE_TIMEOUT",
 		"CONTROL_PULT", "CONTROL_RECIPES", "CONTROL_DOOR_RECIPE", "CONTROL_SHARE_RECIPE",
+		// Не наши, но контроллер их читает: штамп своей сборки и явное имя от хозяина
+		// (`WORLD2-130`). Неназванная настройка равна отсутствующей — и эти две тем более:
+		// человек, не знающий про пин, будет искать, почему поднялось не то.
+		"WORLD_VERSION", "WORLD_IMAGE", "SHARE_IMAGE",
 	} {
 		if !strings.Contains(sb.String(), name) {
 			t.Fatalf("в подсказке нет значения %s — неназванная настройка равна отсутствующей", name)
