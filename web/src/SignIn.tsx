@@ -1,30 +1,35 @@
-// Экран 1 — ВХОД. Два поля: где лежит твой скоуп и пароль к нему.
+// Экран 1 — ВХОД и ЗАВЕДЕНИЕ. ДВЕ ДВЕРИ, видные сразу, а не переключатель внизу формы.
 //
-// Больше на нём нет ничего — ни ресурсов, ни полей, ни имени: до входа их не существует
-// (`WORLD2-102`). Это не аскетизм оформления, а честность: показать список чего-нибудь до
-// того, как мир узнал, кто спрашивает, значило бы показать чужое или выдуманное.
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ НАЙДЕНО ЖИВЫМ ПРОГОНОМ (`WORLD2-142`): первый юзер мира не нашёл, как завести        │
+// │ личность. Он открыл пульт, заполнил единственную видимую форму — форму ВХОДА — и     │
+// │ получил `no-address`. Отказ был верный, а человек даже не знал, что он не в той      │
+// │ форме: заведение пряталось строкой-переключателем ВНИЗУ.                             │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
 //
-// **Отдельной пары «личность плюс пароль» нет** (`WORLD2-77`, решение user): пароль — это ключ
-// к АДРЕСУ, а не к личности. Дотянулся до скоупа — значит твой.
+// Довод не вкусовой, он из канона. `WORLD2` 3.4, «Два адреса, и путать их дорого»: при
+// заведении юзер называет ДВЕ разные пары, при входе — ОДНУ. Это разные разговоры разной
+// длины, и одна форма с переключателем подталкивает считать их одним. Живой прогон это и
+// показал: человек заполнил поля машины там, где спрашивали адрес скоупа. На слиянии этих
+// двух пар выросла мёртвая `WORLD2-77` — канон предупреждал заранее.
 //
-// **АДРЕС — ЭТО АДРЕС РАЗДАЧИ** (`WORLD2` 3.4, `WORLD2-132`): обычный HTTP-адрес, и состояние
-// лежит в её корне. Пути на машине контроллера (`/scope/егор`) больше нет: он и означал
-// личность, лежащую томом контроллера — снёс контроллер, потерял себя (`WORLD2-124`).
+// Поэтому здесь вкладки, и выбор виден ДО заполнения:
 //
-// **ХОДА «ЗАВЕСТИ ЗДЕСЬ» НЕ СУЩЕСТВУЕТ** (`WORLD2` 3.7, решение user 2026-08-16). Контроллер
-// держателем чужой личности не становится — он времянка (`1.9`). Заведение это отдельная
-// ручка и отдельный разговор: юзер называет АДРЕС, по которому его состояние будет лежать, и
-// машину, на которой контроллер поднимет раздачу.
+//	«Войти»        — одна пара: адрес раздачи и пароль. И больше ничего;
+//	«Завести скоуп» — две пары плюс личность: скоуп (адрес и пароль) · машина (имя, адрес, креды).
 //
-// **Пар при заведении ДВЕ, и путать их дорого** (`WORLD2` 3.4, «Два адреса»): машина — куда
-// дотянуться и что поднять; скоуп — по какому адресу потом входить. Креды машины юзер даёт
-// руками ровно один раз, потому что скоупа в этот момент ещё нет; дальше они лежат в нём. На
-// слиянии этих двух пар выросла мёртвая `WORLD2-77`.
+// **Хода «завести здесь» не существует** (`WORLD2` 3.7): контроллер держателем чужой личности
+// не становится — он времянка (`1.9`). Заведение называет АДРЕС, по которому состояние будет
+// лежать, и — если раздачи там ещё нет — машину, где контроллер её поднимет.
+//
+// **Отдельной пары «личность плюс пароль» нет** (`WORLD2-77`): пароль — ключ к АДРЕСУ, а не к
+// личности. Дотянулся до скоупа — значит твой.
 import { Show, createSignal } from "solid-js";
 
-import type { Control, CreateScopeRequest, Refusal, Session } from "./control.js";
+import type { Control, Creds, CreateScopeRequest, Refusal, Session } from "./control.js";
+import { CredsField, пустыеКреды } from "./Creds.jsx";
 import { RefusalView } from "./Refusal.jsx";
-import { Button, Field, Input, Label, Textarea } from "./ui.jsx";
+import { Button, Field, Input, Label } from "./ui.jsx";
 
 export type SignInProps = {
   control: Control;
@@ -32,23 +37,34 @@ export type SignInProps = {
   onEntered: (session: Session) => void;
 };
 
+/** Какая дверь открыта. Не «режим формы», а именно дверь: разговоры за ними разные. */
+type Дверь = "enter" | "create";
+
 export function SignIn(props: SignInProps) {
+  // Пара СКОУПА — общая у обеих дверей, и это не экономия полей: адрес и пароль там и там
+  // значат одно и то же, а набирать их дважды человек не должен (`WORLD2-142`).
   const [addr, setAddr] = createSignal("");
   const [password, setPassword] = createSignal("");
   const [name, setName] = createSignal("");
   const [brand, setBrand] = createSignal("");
+  // Пара МАШИНЫ — только у заведения, и ни одно её поле не живёт в форме входа. Именно их
+  // человек однажды и заполнил не там.
   const [участок, setУчасток] = createSignal("");
   const [машина, setМашина] = createSignal("");
-  const [креды, setКреды] = createSignal("");
-  // Заведение — отдельный режим формы, а не догадка по пустому ответу: завести личность
-  // молча, потому что «ничего не нашлось», значит однажды завести её на опечатке в адресе.
-  const [creating, setCreating] = createSignal(false);
+  const [creds, setCreds] = createSignal<Creds>(пустыеКреды());
+  const [дверь, setДверь] = createSignal<Дверь>("enter");
   // Поднимать ли раздачу. Юзер вправе поднять её сам — это его вилка, и мир в неё не смотрит
   // (`WORLD2` 0.3). Выбор человек делает ЯВНО: пустые поля машины — это не «машины нет», и
   // решать за него по пустоте значило бы снова угадывать.
   const [поднять, setПоднять] = createSignal(true);
   const [busy, setBusy] = createSignal(false);
   const [refusal, setRefusal] = createSignal<Refusal | undefined>();
+
+  /** Переход между дверями руками: новый разговор — чистый отказ. */
+  function открыть(куда: Дверь) {
+    setДверь(куда);
+    setRefusal(undefined);
+  }
 
   async function войти() {
     if (busy()) return;
@@ -80,7 +96,7 @@ export function SignIn(props: SignInProps) {
       // Машина называется ЦЕЛИКОМ — три вещи (`WORLD2` 2.5 п. 11): имя участка, адрес и
       // креды. Имя не выводится из адреса и не подставляется молча: на нём стоит адрес
       // локации, и мир за юзера его не выдумывает (`WORLD2` 3.7).
-      заявка.machine = { name: участок(), addr: машина(), creds: креды() };
+      заявка.machine = { name: участок(), addr: машина(), creds: creds() };
     }
     const answer = await props.control.createScope(заявка);
 
@@ -96,22 +112,28 @@ export function SignIn(props: SignInProps) {
   const noScope = () => refusal()?.code === "no-scope";
 
   /**
-   * Выход из отказа `no-scope`: та же форма, тот же адрес и тот же пароль — набирать их
-   * дважды человек не должен.
+   * ВЫХОД, ИСПОЛНИМЫЙ ТАМ, ГДЕ ОТКАЗ УВИДЕН (`WORLD2-142`).
    *
-   * Раздачу при этом НЕ поднимаем, и это не догадка пульта: `no-scope` значит ровно то, что
-   * раздача по адресу ОТВЕЧАЕТ, а состояния в ней нет, — так сказал контроллер, и просить
-   * его поднять её ещё раз он отказал бы кодом `share-already`. Выбор остаётся видимым и
-   * переключаемым: сказанное показано, а не решено за человека.
+   * Контроллер называет выходом `POST /api/scope` — и это правильный ответ машине, но человеку
+   * в браузере он говорит языком консоли. Причину и выходы его мы оставляем ДОСЛОВНО (`2.3`),
+   * а рядом даём кнопку, которая делает РОВНО НАЗВАННОЕ: открывает дверь заведения с тем же
+   * адресом и паролем. Это не второй ответ человеку, а тот же самый, исполнимый.
+   *
+   * Раздачу при этом не поднимаем, и это не догадка: `no-scope` значит, что раздача по адресу
+   * ОТВЕЧАЕТ, а состояния в ней нет, — так сказал контроллер, и просьбу поднять её ещё раз он
+   * отказал бы кодом `share-already`. Выбор остаётся видимым и переключаемым.
+   *
+   * Отказ при этом НЕ гасится: человек перешёл не сам, а по выходу, и причина должна остаться
+   * у него перед глазами.
    */
   function заводитьПоТомуЖеАдресу() {
     setПоднять(false);
-    setCreating(true);
+    setДверь("create");
   }
 
   return (
     <section class="pult__block" data-screen="sign-in">
-      <h2>Вход в свой скоуп</h2>
+      <h2>Твой скоуп</h2>
       <p>
         Скоуп — это твоя личность: имя, бренд, ключи, территории и поля. Он лежит ПО АДРЕСУ,
         там, где ты его положил, и раздаётся оттуда; контроллер до него дотягивается и ничего
@@ -119,29 +141,80 @@ export function SignIn(props: SignInProps) {
         этот вход один из них.
       </p>
 
-      <form
-        class="pult__form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void (creating() ? завести() : войти());
-        }}
+      {/* ДВЕ ДВЕРИ, и обе видны до заполнения. Пряталась вторая — человек не находил её
+          вовсе (`WORLD2-142`), а находил отказ. */}
+      <div class="pult__doors" role="tablist" aria-label="вход и заведение">
+        <Button
+          role="tab"
+          data-door="enter"
+          aria-selected={дверь() === "enter" ? "true" : "false"}
+          onClick={() => открыть("enter")}
+        >
+          Войти
+        </Button>
+        <Button
+          role="tab"
+          data-door="create"
+          aria-selected={дверь() === "create" ? "true" : "false"}
+          onClick={() => открыть("create")}
+        >
+          Завести скоуп
+        </Button>
+      </div>
+
+      <Show
+        when={дверь() === "create"}
+        fallback={
+          <form
+            class="pult__form"
+            role="tabpanel"
+            data-panel="enter"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void войти();
+            }}
+          >
+            <p class="pult__hint">Одна пара: где лежит скоуп и пароль к нему.</p>
+            <ПараСкоупа
+              addr={addr()}
+              password={password()}
+              onAddr={setAddr}
+              onPassword={setPassword}
+            />
+            <Button type="submit" disabled={busy()} aria-busy={busy() ? "true" : undefined}>
+              Войти
+            </Button>
+          </form>
+        }
       >
-        <Field class="pult__field" value={addr()} onChange={setAddr}>
-          <Label>Где лежит твой скоуп</Label>
-          <Input placeholder="http://10.8.0.5:8070/" autocomplete="off" />
-        </Field>
+        <form
+          class="pult__form"
+          role="tabpanel"
+          data-panel="create"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void завести();
+          }}
+        >
+          <p class="pult__hint">
+            Две пары, и путать их дорого. Первая — САМ СКОУП: адрес, по которому он будет
+            лежать, и пароль, которым ты потом входишь. Вторая — МАШИНА, до которой контроллер
+            дотянется, чтобы поднять там раздачу.
+          </p>
 
-        <Field class="pult__field" value={password()} onChange={setPassword}>
-          <Label>Пароль скоупа</Label>
-          <Input type="password" autocomplete="off" />
-        </Field>
+          <h3>Скоуп</h3>
+          <ПараСкоупа
+            addr={addr()}
+            password={password()}
+            onAddr={setAddr}
+            onPassword={setPassword}
+          />
 
-        <Show when={creating()}>
+          <h3>Личность</h3>
           <Field class="pult__field" value={name()} onChange={setName}>
             <Label>Имя</Label>
             <Input placeholder="егор" autocomplete="off" />
           </Field>
-
           {/* Бренда может не быть, и это законное состояние (`WORLD2-135`): свежесозданный
               скоуп — это имя и пустота. Поле пустым и остаётся, и заведение на этом не
               спотыкается. */}
@@ -150,6 +223,7 @@ export function SignIn(props: SignInProps) {
             <Input placeholder="можно не называть" autocomplete="off" />
           </Field>
 
+          <h3>Машина</h3>
           <div class="pult__row">
             <Button onClick={() => setПоднять(!поднять())}>
               {поднять()
@@ -169,10 +243,8 @@ export function SignIn(props: SignInProps) {
           >
             <div data-machine="raise">
               <p class="pult__hint">
-                Контроллер дотянется до этой машины и поднимет на ней раздачу. Это ВТОРАЯ
-                пара, и с первой её путать дорого: адрес скоупа — то, чем ты потом входишь, а
-                это — где он будет лежать. Креды нужны руками ровно сейчас, потому что скоупа
-                ещё нет; дальше они будут лежать в нём.
+                Контроллер дотянется до этой машины и поднимет на ней раздачу. Креды нужны
+                руками ровно сейчас, потому что скоупа ещё нет; дальше они будут лежать в нём.
               </p>
               <Field class="pult__field" value={участок()} onChange={setУчасток}>
                 <Label>Имя участка</Label>
@@ -182,28 +254,15 @@ export function SignIn(props: SignInProps) {
                 <Label>Адрес машины</Label>
                 <Input placeholder="world@10.8.0.5" autocomplete="off" />
               </Field>
-              <Field class="pult__field" value={креды()} onChange={setКреды}>
-                <Label>Креды к машине</Label>
-                <Textarea rows={3} placeholder="ключ целиком" />
-              </Field>
+              <CredsField creds={creds()} onChange={setCreds} />
             </div>
           </Show>
-        </Show>
 
-        <div class="pult__row">
           <Button type="submit" disabled={busy()} aria-busy={busy() ? "true" : undefined}>
-            {creating() ? "Завести скоуп" : "Войти"}
+            Завести скоуп
           </Button>
-          <Button
-            onClick={() => {
-              setCreating(!creating());
-              setRefusal(undefined);
-            }}
-          >
-            {creating() ? "У меня уже есть скоуп" : "Скоупа ещё нет — завести по адресу"}
-          </Button>
-        </div>
-      </form>
+        </form>
+      </Show>
 
       <p class="pult__hint">
         Скоуп заводится ТАМ, где ты его назвал, — «завести здесь», на машине контроллера, мир
@@ -215,11 +274,35 @@ export function SignIn(props: SignInProps) {
         {(said) => (
           <RefusalView
             refusal={said()}
-            onWay={noScope() && !creating() ? заводитьПоТомуЖеАдресу : undefined}
+            onWay={noScope() && дверь() === "enter" ? заводитьПоТомуЖеАдресу : undefined}
             wayLabel="Завести скоуп по этому адресу"
           />
         )}
       </Show>
     </section>
+  );
+}
+
+/**
+ * Пара скоупа — адрес и пароль. Одним куском на обе двери: слова у них там и там одни, и
+ * разъехавшись, они начали бы означать разное.
+ */
+function ПараСкоупа(props: {
+  addr: string;
+  password: string;
+  onAddr: (v: string) => void;
+  onPassword: (v: string) => void;
+}) {
+  return (
+    <>
+      <Field class="pult__field" value={props.addr} onChange={props.onAddr}>
+        <Label>Где лежит твой скоуп</Label>
+        <Input placeholder="http://10.8.0.5:8070/" autocomplete="off" />
+      </Field>
+      <Field class="pult__field" value={props.password} onChange={props.onPassword}>
+        <Label>Пароль скоупа</Label>
+        <Input type="password" autocomplete="off" />
+      </Field>
+    </>
   );
 }

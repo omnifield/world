@@ -12,9 +12,10 @@
 //     необратимое действие на чужой машине тихой кнопкой рядом со списком не заводят.
 import { For, Show, Switch, Match, createResource, createSignal } from "solid-js";
 
-import type { Answer, Control, Field as WorldField, Refusal, Resource } from "./control.js";
+import type { Answer, Control, Creds, Field as WorldField, Refusal, Resource } from "./control.js";
+import { CredsField, пустыеКреды } from "./Creds.jsx";
 import { RefusalView } from "./Refusal.jsx";
-import { Button, Field, Input, Label, Textarea } from "./ui.jsx";
+import { Button, Field, Input, Label } from "./ui.jsx";
 
 export type WorldProps = {
   control: Control;
@@ -377,9 +378,10 @@ function ДобавлениеРесурса(props: {
 }) {
   const [name, setName] = createSignal("");
   const [addr, setAddr] = createSignal("");
-  const [creds, setCreds] = createSignal("");
+  const [creds, setCreds] = createSignal<Creds>(пустыеКреды());
   const [busy, setBusy] = createSignal(false);
   const [refusal, setRefusal] = createSignal<Refusal | undefined>();
+  const [note, setNote] = createSignal("");
 
   async function добавить() {
     if (busy()) return;
@@ -395,7 +397,10 @@ function ДобавлениеРесурса(props: {
     }
     setName("");
     setAddr("");
-    setCreds("");
+    setCreds(пустыеКреды());
+    // Что контроллер изменил на ЧУЖОЙ машине, он говорит словами (`WORLD2-141`). Цену человек
+    // прочитал до кнопки, а это — подтверждение сделанного, и оно его же словами, дословно.
+    setNote(answer.value.note);
     // Список берём из ТОГО ЖЕ ответа: главное, ради чего человек жал кнопку, — увидеть, что
     // источников стало два (`WORLD2-80`).
     props.onDone({ kind: "ok", value: answer.value.resources });
@@ -425,13 +430,19 @@ function ДобавлениеРесурса(props: {
         <Label>Адрес</Label>
         <Input placeholder="world@10.8.0.5" autocomplete="off" />
       </Field>
-      <Field class="pult__field" value={creds()} onChange={setCreds}>
-        <Label>Креды</Label>
-        <Textarea rows={3} placeholder="ключ целиком" />
-      </Field>
+      {/* Креды — двух видов, и вид называет человек (`WORLD2-141`). Цена пути с паролем
+          сказана ЗДЕСЬ ЖЕ, до кнопки: жмут её тут, и меняется от неё чужая машина. */}
+      <CredsField creds={creds()} onChange={setCreds} />
       <Button type="submit" disabled={busy()} aria-busy={busy() ? "true" : undefined}>
         {busy() ? "Ставлю дверь…" : "Добавить ресурс"}
       </Button>
+      <Show when={note()}>
+        {(said) => (
+          <p class="pult__note" data-note="machine">
+            {said()}
+          </p>
+        )}
+      </Show>
       <Show when={refusal()}>{(said) => <RefusalView refusal={said()} />}</Show>
     </form>
   );
