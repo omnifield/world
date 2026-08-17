@@ -6,7 +6,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { Panel } from "./Panel.jsx";
-import type { Answer, Control, Field, Identity, Resource, Session } from "./control.js";
+import type { Answer, Control, Fetcher, Field, Identity, Resource, Session } from "./control.js";
+import { liveControl } from "./control.js";
+import { СВЕЖИЙ_СКОУП, изКонтракта } from "./probe-contract.js";
 import { дождаться, нажать, осесть, смонтировать } from "./probe-dom.jsx";
 
 let проба: { корень: HTMLElement; снять: () => void } | undefined;
@@ -16,14 +18,8 @@ afterEach(() => {
   проба = undefined;
 });
 
-const ВОШЁЛ: Session = {
-  name: "егор",
-  brand: "омнифилд",
-  scope: { addr: "/scope/егор", here: true, path: "/scope/егор" },
-  since: "",
-  created: false,
-  token: "метка-1",
-};
+// Образцы — из контракта соседа (`probe-contract.ts`), а не написанные рукой.
+const ВОШЁЛ: Session = { ...изКонтракта<Omit<Session, "since">>("token"), since: "" };
 
 const Я: Identity = { ...ВОШЁЛ, since: "2026-08-14T19:00:00Z" };
 
@@ -109,6 +105,47 @@ describe("после входа", () => {
     );
 
     expect(сказано.textContent).toContain("заведён здесь");
+  });
+});
+
+describe("первый вход в мир — свежесозданный скоуп", () => {
+  /**
+   * Контроллер для сквозной пробы: отвечает НАСТОЯЩИМИ телами по путям, а разбирает их сам
+   * пульт (`liveControl`). Именно этой связки не хватало — фальшивый `Control` подсовывал уже
+   * разобранное значение и проскакивал мимо разбора, где и жил дефект (`WORLD2-135`).
+   */
+  const отвечает = (по: Record<string, unknown>): Fetcher => async (path) => {
+    const тело = JSON.stringify(по[path] ?? {});
+    return { ok: true, status: 200, statusText: "", text: async () => тело } as unknown as Response;
+  };
+
+  it("вход на свежем скоупе доходит до экрана мира, а бренд назван словами", async () => {
+    // Приёмка `WORLD2-135` целиком, насколько её берёт jsdom: живой ответ свежего скоупа →
+    // разбор пульта → экран мира. Живьём, на настоящем контроллере, это по-прежнему отдельная
+    // проверка — здесь нет ни браузера, ни докера.
+    const { token: _, ...личность } = СВЕЖИЙ_СКОУП;
+    const control = liveControl(
+      отвечает({
+        "/api/session": СВЕЖИЙ_СКОУП,
+        "/api/me": личность,
+        "/api/resources": { resources: [] },
+        "/api/fields": { fields: [] },
+      }),
+      () => {},
+    );
+    проба = смонтировать(() => <Panel control={control} />);
+
+    нажать(проба.корень, "Войти");
+    const мир = await дождаться(
+      () => проба?.корень.querySelector<HTMLElement>("[data-screen='world']"),
+      "экран мира на свежем скоупе",
+    );
+    await осесть();
+
+    expect(мир.querySelector("[data-me-name]")?.textContent).toBe(СВЕЖИЙ_СКОУП.name);
+    expect(мир.querySelector("[data-me-brand] [data-state='empty']")).not.toBeNull();
+    // Отказа нет нигде: пустое — законное состояние, а не поломка ответа.
+    expect(мир.querySelector("[data-refusal]")).toBeNull();
   });
 });
 
