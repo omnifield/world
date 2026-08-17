@@ -83,6 +83,13 @@ SHARE_PID=""
 SHARE_PID_FILE="$TMP/share.pid"
 SHARE_LOG="$TMP/share.log"
 # Штамп сборки контроллера и явное имя образа от хозяина — значения прогона (`WORLD2-130`).
+# ПОДСТАВНАЯ МАШИНА С SSH — та, на которую контроллер заходит ПАРОЛЕМ, чтобы завести ключ
+# (`WORLD2-141`). Настоящий ssh-обмен, а не пересказ: команда уходит туда по-настоящему и
+# выполняется её шеллом в её домашнем каталоге, а мы смотрим потом В ЕЁ ФАЙЛ.
+MACHINE_PORT="${CONTROL_PROBE_SSH_PORT:-18022}"
+MACHINE_PASS="рут-пароль-от-впс-9876"
+MACHINE_HOME="$TMP/дом-машины"
+MACHINE_PID=""
 SRV_VERSION="sha-abc1234"
 SRV_WORLD_IMAGE=""
 SRV_SHARE_IMAGE=""
@@ -106,6 +113,7 @@ cleanup() {
     [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null || true
     [ -n "$SHARE_PID" ] && kill "$SHARE_PID" 2>/dev/null || true
     [ -s "$SHARE_PID_FILE" ] && kill "$(cat "$SHARE_PID_FILE")" 2>/dev/null || true
+    [ -n "$MACHINE_PID" ] && kill "$MACHINE_PID" 2>/dev/null || true
     # Точка входа держит контроллер в фоне: уйди проба, не сняв её, и на машине остался бы
     # осиротевший процесс на порту пробы — следующий прогон краснел бы «по наследству».
     [ -n "${ENTRY_PID:-}" ] && kill -TERM "$ENTRY_PID" 2>/dev/null || true
@@ -277,6 +285,39 @@ func main() {
 GO
     (cd "$TMP" && go build -o "$TMP/share" share.go) 2>"$TMP/share-build.log"
 }
+
+# mk_machine — собрать подставную машину. Она живёт в зоне обычным файлом (как `run/fake.go`
+# у соседей): им пользуются и тесты ручек, и эта проба, а из тестового файла его не взять.
+mk_machine() {
+    (cd "$HERE" && go build -o "$TMP/машина" ./internal/creds/sshtest/cmd) 2>"$TMP/machine-build.log"
+}
+
+# machine_start — поднять машину заново, с пустым домом: «что на ней появилось» проверяется
+# по её файлу, и хвост прошлого прогона превратил бы проверку в ложь.
+machine_start() {
+    machine_stop
+    rm -rf "$MACHINE_HOME"; mkdir -p "$MACHINE_HOME"
+    "$TMP/машина" "127.0.0.1:$MACHINE_PORT" world "$MACHINE_PASS" "$MACHINE_HOME" \
+        > "$TMP/machine.log" 2>&1 &
+    MACHINE_PID=$!
+    local n=0
+    while [ "$n" -lt 100 ]; do
+        if (exec 3<>/dev/tcp/127.0.0.1/"$MACHINE_PORT") 2>/dev/null; then return 0; fi
+        kill -0 "$MACHINE_PID" 2>/dev/null || return 1
+        sleep 0.1; n=$((n + 1))
+    done
+    return 1
+}
+
+machine_stop() {
+    [ -n "$MACHINE_PID" ] || return 0
+    kill "$MACHINE_PID" 2>/dev/null || true
+    wait "$MACHINE_PID" 2>/dev/null || true
+    MACHINE_PID=""
+}
+
+# machine_keys — что лежит в `~/.ssh/authorized_keys` подставной машины.
+machine_keys() { cat "$MACHINE_HOME/.ssh/authorized_keys" 2>/dev/null || true; }
 
 # share_start [файл-состояния] — поднять раздачу. Без файла раздача отвечает «состояния
 # ещё нет» (404) — так выглядит свежая раздача, и заведение скоупа опирается ровно на это.
@@ -470,7 +511,7 @@ want_status() {
 
 # завести — скоуп заводится ТАМ, где будет лежать: две пары (машина и скоуп) плюс личность.
 zavesti() {
-    call POST /api/scope "{\"scope\":{\"addr\":\"$SHARE_URL\",\"password\":\"$SHARE_PASS\"},\"identity\":{\"name\":\"егор\",\"brand\":\"\"},\"machine\":{\"name\":\"vps\",\"addr\":\"world@10.8.0.5\",\"creds\":\"-----ключ-----\"}}"
+    call POST /api/scope "{\"scope\":{\"addr\":\"$SHARE_URL\",\"password\":\"$SHARE_PASS\"},\"identity\":{\"name\":\"егор\",\"brand\":\"\"},\"machine\":{\"name\":\"vps\",\"addr\":\"world@10.8.0.5\",\"creds\":{\"kind\":\"key\",\"value\":\"-----ключ-----\"}}}"
     TOKEN="$(printf '%s' "$BODY" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
 }
 
@@ -831,6 +872,7 @@ else
 fi
 mk_fakes
 mk_share
+mk_machine
 mk_up_stub
 mk_entry
 
@@ -941,7 +983,7 @@ green() {
     call GET /api/recipes
     want_has '"name":"door"' "чем поднимать — отдельный список, и дверь в нём один из рецептов"
 
-    call POST /api/resources '{"name":"vps2","addr":"world@10.8.0.6","creds":"-----ключ-----"}'
+    call POST /api/resources '{"name":"vps2","addr":"world@10.8.0.6","creds":{"kind":"key","value":"-----ключ-----"}}'
     want_status 201 "территория заводится"
     if grep -q 'remote.sh add vps2 --addr world@10.8.0.6' "$CALLS"; then
         ok "подъём вещи позван ГОТОВЫЙ, своего зона не пишет"
@@ -1039,7 +1081,7 @@ green() {
     call GET /api/recipes
     want_has '"name":"весы"' "положенный рецепт появился в списке сам — перечня вещей в коде нет"
 
-    call POST /api/resources '{"name":"vps3","addr":"world@10.8.0.7","creds":"ключ","recipe":"весы"}'
+    call POST /api/resources '{"name":"vps3","addr":"world@10.8.0.7","creds":{"kind":"key","value":"ключ"},"recipe":"весы"}'
     want_status 201 "вторая вещь поднимается тем же путём"
     if grep -q -- "remote.sh add vps3 .*--recipe $RECIPES/весы.yaml" "$CALLS"; then
         ok "подъём позван ИМЕННО ТЕМ рецептом, который назвал человек"
@@ -1055,8 +1097,98 @@ green() {
         bad "рецепт при снятии" "снятие пошло без рецепта:" "$(cat "$CALLS")"
     fi
 
-    call POST /api/resources '{"name":"vps4","addr":"world@10.8.0.8","creds":"ключ","recipe":"часы"}'
+    call POST /api/resources '{"name":"vps4","addr":"world@10.8.0.8","creds":{"kind":"key","value":"ключ"},"recipe":"часы"}'
     want_refusal no-such-recipe "рецепта, которого нет, контроллер не выдумывает"
+
+    # ┌─────────────────────────────────────────────────────────────────────────────────┐
+    # │ КРЕДЫ ДВУХ ВИДОВ: КЛЮЧ ЛИБО ПАРОЛЬ, КАК В PuTTY (`WORLD2-141`).                   │
+    # │                                                                                   │
+    # │ Пароль транспортом не становится — докер ходит системным ssh, а тот пароля не      │
+    # │ берёт. Паролем контроллер заходит ОДИН раз и кладёт публичный ключ юзера в         │
+    # │ `~/.ssh/authorized_keys` машины; дальше всё по ключу. Юзер терминал не открывает.  │
+    # │                                                                                   │
+    # │ Проверяется это на НАСТОЯЩЕМ ssh-обмене с подставной машиной, и смотрим мы В ЕЁ    │
+    # │ ФАЙЛ: ответ контроллера мог бы сказать что угодно.                                 │
+    # └─────────────────────────────────────────────────────────────────────────────────┘
+    part "ЗЕЛЁНЫЙ — креды двух видов: ключ либо пароль"
+    if ! [ -x "$TMP/машина" ]; then
+        skip "весь путь пароля" \
+            "подставная машина не собралась: $(tail -2 "$TMP/machine-build.log" 2>/dev/null)" \
+            "она лежит в зоне: cd $HERE && go build ./internal/creds/sshtest/cmd"
+    else
+        machine_start || bad "подставная машина" "не поднялась на :$MACHINE_PORT"
+        call POST /api/resources "{\"name\":\"vpsp\",\"addr\":\"world@127.0.0.1:$MACHINE_PORT\",\"creds\":{\"kind\":\"password\",\"value\":\"$MACHINE_PASS\"}}"
+        want_status 201 "машина с ПАРОЛЕМ и без ключа заводится территорией"
+
+        # Смотрим в файл МАШИНЫ: ровно одна строка, и она подписана.
+        if [ "$(machine_keys | grep -c . || true)" = "1" ]; then
+            ok "на машине ровно одна строка в ~/.ssh/authorized_keys"
+        else
+            bad "строки на машине" "их не одна:" "$(machine_keys)"
+        fi
+        case "$(machine_keys)" in
+            *world-control*) ok "строка подписана — человек поймёт, откуда она и чем её убрать" ;;
+            *) bad "подпись" "строка без подписи:" "$(machine_keys)" ;;
+        esac
+
+        # ПОВТОРНЫЙ ЗАХОД НЕ ПЛОДИТ СТРОК: ключ юзера один на скоуп, второй раз кладётся то
+        # же самое. Иначе в чужом файле копился бы десяток наших ключей.
+        call POST /api/resources "{\"name\":\"vpsp2\",\"addr\":\"world@127.0.0.1:$MACHINE_PORT\",\"creds\":{\"kind\":\"password\",\"value\":\"$MACHINE_PASS\"}}"
+        want_status 201 "вторая территория на той же машине заводится"
+        if [ "$(machine_keys | grep -c . || true)" = "1" ]; then
+            ok "повторный заход строк НЕ плодит — ключ тот же"
+        else
+            bad "вторая строка" "заход дописал ещё одну:" "$(machine_keys)"
+        fi
+
+        # В СКОУП УШЁЛ КЛЮЧ, А НЕ ПАРОЛЬ.
+        if grep -q 'PRIVATE KEY' "$SHARE_FILE"; then
+            ok "в скоуп лёг ключ, который завёл контроллер"
+        else
+            bad "ключ в скоупе" "его там нет:" "$(head -c 300 "$SHARE_FILE")"
+        fi
+        # ┌─────────────────────────────────────────────────────────────────────────────┐
+        # │ ПАРОЛЬ НЕ ЖИВЁТ НИГДЕ: ни в скоупе, ни в связке, ни в журнале, ни в ответе.  │
+        # │ Это четыре разных места, и проверяются они по отдельности — утёкший в одно   │
+        # │ из них пароль не менее утёкший оттого, что в трёх других его нет.            │
+        # └─────────────────────────────────────────────────────────────────────────────┘
+        if grep -qF -- "$MACHINE_PASS" "$SHARE_FILE"; then
+            bad "пароль в скоупе" "он утёк в состояние юзера"
+        else
+            ok "пароля нет в скоупе"
+        fi
+        if grep -rqF -- "$MACHINE_PASS" "$KEYS" 2>/dev/null; then
+            bad "пароль в связке" "он утёк в связку контроллера"
+        else
+            ok "пароля нет в связке контроллера"
+        fi
+        if grep -qF -- "$MACHINE_PASS" "$TMP/server.log"; then
+            bad "пароль в журнале" "он утёк в журнал — а журнал читают и хранят"
+        else
+            ok "пароля нет в журнале"
+        fi
+        if grep -qF -- "$MACHINE_PASS" "$TMP/body"; then
+            bad "пароль в ответе" "он вернулся человеку обратно"
+        else
+            ok "пароля нет в ответе ручки"
+        fi
+
+        # ЦЕНА НАЗВАНА: контроллер написал в ЧУЖУЮ машину, и человек об этом узнаёт.
+        if grep -q 'authorized_keys' "$TMP/server.log"; then
+            ok "в журнале сказано, что контроллер пишет в ~/.ssh/authorized_keys чужой машины"
+        else
+            bad "молчание про запись" "человек узнал бы об этом от кого угодно, только не от нас"
+        fi
+
+        # ПРЕЖНИЙ ПУТЬ ПО КЛЮЧУ НЕ СЛОМАН.
+        call POST /api/resources '{"name":"vpsk","addr":"world@10.8.0.55","creds":{"kind":"key","value":"-----ключ-----"}}'
+        want_status 201 "машина с КЛЮЧОМ заводится как раньше"
+        if grep -q -- '-----ключ-----' "$SHARE_FILE"; then
+            ok "названный юзером ключ лёг в скоуп как есть — за него никто не ходил на машину"
+        else
+            bad "путь по ключу" "ключ юзера в скоуп не попал:" "$(head -c 300 "$SHARE_FILE")"
+        fi
+    fi
 
     # ┌─────────────────────────────────────────────────────────────────────────────────┐
     # │ ПОДЪЁМ ИДЁТ СВОЕЙ СБОРКОЙ (`WORLD2-130`). Выпуск возит тройку одной сборки под     │
@@ -1068,7 +1200,7 @@ green() {
     # └─────────────────────────────────────────────────────────────────────────────────┘
     part "ЗЕЛЁНЫЙ — подъём идёт СВОЕЙ сборкой и говорит, чем поднято"
 
-    call POST /api/resources '{"name":"vps5","addr":"world@10.8.0.5","creds":"ключ"}'
+    call POST /api/resources '{"name":"vps5","addr":"world@10.8.0.5","creds":{"kind":"key","value":"ключ"}}'
     want_status 201 "территория заводится"
     pin_u_vyzova "remote.sh add vps5 " "WORLD_IMAGE=ghcr.io/omnifield/world:sha-abc1234" \
         "дверь поднимается СВОЕЙ сборкой — пин уехал подстановкой рецепта"
@@ -1094,7 +1226,7 @@ green() {
         "раздача скоупа поднимается той же сборкой, что и контроллер"
     # СВОЯ вещь юзера пином не пинится: её образ не наш, и нашего тега у него нет. Журнал
     # обязан сказать это как есть, а не выдать намерение за сделанное.
-    call POST /api/resources '{"name":"vps6","addr":"world@10.8.0.6","creds":"ключ","recipe":"весы"}'
+    call POST /api/resources '{"name":"vps6","addr":"world@10.8.0.6","creds":{"kind":"key","value":"ключ"},"recipe":"весы"}'
     if grep -q 'весы:1.2' "$TMP/server.log"; then
         ok "чужой рецепт пином не пинится, и сказано, чем он поднят на самом деле"
     else
@@ -1107,7 +1239,7 @@ green() {
     share_start "$(lichnost егор vps:world@10.8.0.5)" || { bad "раздача" "не поднялась"; return; }
     start_server || { bad "подъём контроллера" "процесс не поднялся"; return; }
     вход
-    call POST /api/resources '{"name":"vps7","addr":"world@10.8.0.7","creds":"ключ"}'
+    call POST /api/resources '{"name":"vps7","addr":"world@10.8.0.7","creds":{"kind":"key","value":"ключ"}}'
     # Значение пустое — это и есть «не пинили»: подставной подъём печатает обе подстановки
     # всегда, поэтому смотрим на то, ЧТО стоит после знака равенства, а не на само имя.
     if grep -F -A1 -- "remote.sh add vps7 " "$CALLS" | grep -q 'WORLD_IMAGE=[^ ]'; then
@@ -1131,7 +1263,7 @@ green() {
     share_start "$(lichnost егор vps:world@10.8.0.5)" || { bad "раздача" "не поднялась"; return; }
     start_server || { bad "подъём контроллера" "процесс не поднялся"; return; }
     вход
-    call POST /api/resources '{"name":"vps8","addr":"world@10.8.0.8","creds":"ключ"}'
+    call POST /api/resources '{"name":"vps8","addr":"world@10.8.0.8","creds":{"kind":"key","value":"ключ"}}'
     pin_u_vyzova "remote.sh add vps8 " "WORLD_IMAGE=своя/дверь:мояверсия" \
         "имя, названное хозяином снаружи, СТАРШЕ пина — оно и поехало"
     if grep -q 'старше' "$TMP/server.log"; then
@@ -1738,7 +1870,7 @@ red() {
     # ВТОРОЙ УЧАСТОК С ЗАНЯТЫМ ИМЕНЕМ — отказ МЕХАНИКИ (`WORLD2` 2.3, `2.5` п. 11): на имени
     # стоит адрес локации, и молчаливая перезапись строки столкнула бы адреса. Порча 5.
     : > "$CALLS"
-    call POST /api/resources '{"name":"vps","addr":"world@10.8.0.99","creds":"другой"}'
+    call POST /api/resources '{"name":"vps","addr":"world@10.8.0.99","creds":{"kind":"key","value":"другой"}}'
     want_refusal name-taken "участок с занятым именем не заводится"
     if grep -q 'remote.sh' "$CALLS"; then
         bad "отказ после действия" "до отказа успели тронуть машину — проверять надо ДО докера:" "$(cat "$CALLS")"
@@ -1750,16 +1882,50 @@ red() {
     call POST /api/fields '{"name":"дом"}'
     want_refusal field-exists "поле не заводится дважды"
 
-    call POST /api/resources '{"name":"../побег","addr":"world@10.8.0.5","creds":"ключ"}'
+    call POST /api/resources '{"name":"../побег","addr":"world@10.8.0.5","creds":{"kind":"key","value":"ключ"}}'
     want_refusal bad-name "имя территории, уводящее из связки, не принимается"
 
+    # ┌─────────────────────────────────────────────────────────────────────────────────┐
+    # │ ВИД КРЕД НАЗЫВАЕТСЯ ЯВНО (`WORLD2-141`). «Не сказали» и «сказали не то» — разные  │
+    # │ отказы: первое чинится тем, что человек выберет вид, второе — тем, что он назовёт │
+    # │ существующий. Угадывать вид по виду строки нельзя вовсе: угаданный однажды примет │
+    # │ ключ за пароль, и разбираться человек будет с отказом ssh, а не с нашей догадкой.  │
+    # └─────────────────────────────────────────────────────────────────────────────────┘
     call POST /api/resources '{"name":"vps5","addr":"world@10.8.0.5"}'
-    want_refusal no-creds "креды машины не выдумываются — их называет юзер"
+    want_refusal no-creds-kind "вид кред не назван — и он не угадывается"
+
+    call POST /api/resources '{"name":"vps5","addr":"world@10.8.0.5","creds":{"kind":"key"}}'
+    want_refusal no-creds "вид назван, а самих кред нет"
+
+    call POST /api/resources '{"name":"vps5","addr":"world@10.8.0.5","creds":{"kind":"колдовство","value":"х"}}'
+    want_refusal bad-creds-kind "неизвестный вид кред назван отдельно от «не назван»"
+
+    # Пароль не подошёл — отказ ДОСТУПА, и на машине после него ничего не появляется.
+    if [ -x "$TMP/машина" ] && machine_start; then
+        call POST /api/resources "{\"name\":\"vpsx\",\"addr\":\"world@127.0.0.1:$MACHINE_PORT\",\"creds\":{\"kind\":\"password\",\"value\":\"не-тот\"}}"
+        want_refusal access-denied "неверный пароль машины назван причиной, а не «не получилось»"
+        if [ -z "$(machine_keys)" ]; then
+            ok "на машине после неверного пароля не появилось ничего"
+        else
+            bad "след на чужой машине" "там что-то записалось:" "$(machine_keys)"
+        fi
+
+        # НЕ ЗАПИСАЛОСЬ — ЭТО ОТКАЗ, А НЕ УСПЕХ. Дом машины закрыт на запись: `~/.ssh` не
+        # завести, файла не создать. Контроллер обязан это ИЗМЕРИТЬ и сказать, а не вывести
+        # успех из того, что шелл дошёл до конца (`WORLD2` 4.2 п. 5).
+        chmod 500 "$MACHINE_HOME" 2>/dev/null || true
+        call POST /api/resources "{\"name\":\"vpsz\",\"addr\":\"world@127.0.0.1:$MACHINE_PORT\",\"creds\":{\"kind\":\"password\",\"value\":\"$MACHINE_PASS\"}}"
+        want_refusal key-not-installed "ключ не записался — сказано отказом, а не отчётом об успехе"
+        chmod 700 "$MACHINE_HOME" 2>/dev/null || true
+        machine_stop
+    else
+        skip "неверный пароль машины" "подставная машина не поднялась — ломать нечего"
+    fi
 
     # Отказ соседа обязан доехать СВОИМ кодом: свой словарь тех же отказов разъехался бы
     # с его словарём на первой правке.
     printf 'access-denied' > "$TMP/refuse"
-    call POST /api/resources '{"name":"vps2","addr":"world@10.8.0.5","creds":"ключ"}'
+    call POST /api/resources '{"name":"vps2","addr":"world@10.8.0.5","creds":{"kind":"key","value":"ключ"}}'
     want_refusal access-denied "код подъёма доезжает своим, а не переписанным"
     want_has '"from":"deploy/remote.sh"' "названо, чей это отказ"
     if [ ! -f "$KEYS/world-vps2" ]; then
@@ -1863,7 +2029,7 @@ red() {
     share_start "$(lichnost егор vps:world@10.8.0.5)" || { bad "подставная раздача" "не поднялась"; return; }
     start_server "$TMP/docker" "$TMP/нет-такого-подъёма" || { bad "подъём контроллера" "не поднялся"; return; }
     вход
-    call POST /api/resources '{"name":"vps2","addr":"world@10.8.0.5","creds":"ключ"}'
+    call POST /api/resources '{"name":"vps2","addr":"world@10.8.0.5","creds":{"kind":"key","value":"ключ"}}'
     want_refusal no-remote-tool "подъёма вещи нет в образе — сказано прямо"
     stop_server
 

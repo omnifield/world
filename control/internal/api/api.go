@@ -45,10 +45,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/omnifield/world/control/internal/creds"
 	"github.com/omnifield/world/control/internal/pult"
 	"github.com/omnifield/world/control/internal/recipe"
 	"github.com/omnifield/world/control/internal/refusal"
@@ -95,6 +97,9 @@ type Options struct {
 	Named map[string]string
 	// ScopeTimeout — сколько секунд ждём ответа раздачи скоупа.
 	ScopeTimeout int
+	// SSHTimeout — сколько секунд ждём машину, когда заходим на неё ПАРОЛЕМ, чтобы завести
+	// ключ (`WORLD2-141`). Дальше по ssh ходит докер, и это уже его время.
+	SSHTimeout int
 	// PultDir — где лежит СОБРАННЫЙ пульт. Пусто — раздавать нечего, и контроллер
 	// скажет об этом кодом `no-pult`, а не пустой страницей.
 	PultDir string
@@ -257,9 +262,9 @@ type scopeBody struct {
 	// Machine — где поднять раздачу. Не назвали — значит раздача по адресу уже стоит
 	// (юзер поднял её сам: это его вилка, и мир в неё не смотрит — `0.3`).
 	Machine *struct {
-		Name  string `json:"name"`
-		Addr  string `json:"addr"`
-		Creds string `json:"creds"`
+		Name  string    `json:"name"`
+		Addr  string    `json:"addr"`
+		Creds credsBody `json:"creds"`
 	} `json:"machine"`
 }
 
@@ -311,6 +316,9 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 
 	st := state.New(strings.TrimSpace(body.Identity.Name), body.Identity.Brand)
 	raised := ""
+	// цена — что контроллер изменил на ЧУЖОЙ машине, если заходил паролем. Пусто — не
+	// заходил и ничего там не менял.
+	цена := ""
 	if m := body.Machine; m != nil {
 		if ref := resource.ValidName(m.Name); ref != nil {
 			return ref
@@ -318,16 +326,21 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		if _, _, ref := resource.CheckAddr(m.Addr); ref != nil {
 			return ref
 		}
-		if m.Creds == "" {
-			return noCreds()
-		}
 		shareRecipe, ref := h.shareRecipe()
 		if ref != nil {
 			return ref
 		}
 
+		// Креды двух видов: свой ключ либо пароль машины. Паролем контроллер один раз
+		// заходит и заводит ключ — сам пароль дальше не живёт (`WORLD2-141`).
+		key, note, ref := h.machineKey(r.Context(), sc, st, m.Name, m.Addr, m.Creds)
+		if ref != nil {
+			return ref
+		}
+		цена = note
+
 		// Ключ кладётся ДО подъёма: докер пойдёт по ssh сам и возьмёт его из связки.
-		if ref := h.res.PutKey(m.Name, m.Addr, m.Creds); ref != nil {
+		if ref := h.res.PutKey(m.Name, m.Addr, key.Value); ref != nil {
 			return ref
 		}
 		// Пароль скоупа уезжает подъёму раздачи её же именем: им закрыта раздача, и
@@ -338,10 +351,7 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		}
 		raised = m.Name
 
-		if ref := st.AddTerritory(
-			state.Territory{Name: m.Name, Addr: m.Addr},
-			state.Key{Name: m.Name, Kind: state.KindSSH, Value: m.Creds},
-		); ref != nil {
+		if ref := st.AddTerritory(state.Territory{Name: m.Name, Addr: m.Addr}, key); ref != nil {
 			return ref
 		}
 	}
@@ -363,13 +373,17 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	if ref != nil {
 		return ref
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	ответ := map[string]any{
 		"name":    st.Identity.Name,
 		"brand":   st.Identity.Brand,
 		"scope":   scopeView(addr),
 		"created": true,
 		"token":   token,
-	})
+	}
+	if цена != "" {
+		ответ["note"] = цена
+	}
+	writeJSON(w, http.StatusCreated, ответ)
 	return nil
 }
 
@@ -400,6 +414,80 @@ func (h *Handler) lowerQuietly(ctx context.Context, name string) {
 		}
 	}
 	h.res.DropKey(name)
+}
+
+// credsBody — КРЕДЫ К МАШИНЕ, и вид их называется ЯВНО (`WORLD2-141`, решение user).
+// Два вида, как в PuTTY: свой ключ либо пароль машины. Угадывать вид по виду строки нельзя
+// — угаданный однажды примет ключ за пароль, и разбираться человек будет с отказом ssh, а
+// не с нашей догадкой.
+type credsBody struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+}
+
+// machineKey — ключ, которым контроллер будет ходить на машину, и цена, названная вслух.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПАРОЛЬ — НЕ ТРАНСПОРТ, А СПОСОБ ПОЛУЧИТЬ КЛЮЧ (`WORLD2-141`). Докер ходит системным  │
+// │ ssh, а тот пароля не берёт; подменять его обёрткой или писать свой транспорт —       │
+// │ запрещено. Поэтому паролем контроллер заходит ОДИН раз и кладёт публичный ключ юзера │
+// │ в `~/.ssh/authorized_keys` машины. Дальше всё по ключу.                              │
+// │                                                                                      │
+// │ ПАРОЛЬ ЖИВЁТ РОВНО ЭТОТ ВЫЗОВ: в скоуп уходит КЛЮЧ, а сам пароль не попадает ни в    │
+// │ состояние, ни в связку, ни в журнал, ни в отказ.                                     │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// Ключ юзера ОДИН на скоуп: тот же ключ, положенный второй раз, строки не плодит.
+func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.State, name, addr string, body credsBody) (state.Key, string, *refusal.Refusal) {
+	kind, ref := creds.ParseKind(body.Kind)
+	if ref != nil {
+		return state.Key{}, "", ref
+	}
+	if strings.TrimSpace(body.Value) == "" {
+		return state.Key{}, "", noCreds(kind)
+	}
+
+	if kind == creds.Key {
+		// Прежний путь: ключ юзера — его собственный, кладём как есть, ничего на его машине
+		// не трогая. Ни одной строки на той стороне не появляется.
+		return state.Key{Name: name, Kind: state.KindSSH, Value: body.Value}, "", nil
+	}
+
+	user, host, port, ref := resource.SplitAddr(addr)
+	if ref != nil {
+		return state.Key{}, "", ref
+	}
+
+	key, есть := st.Key(state.UserKeyName)
+	if !есть || strings.TrimSpace(key.Value) == "" {
+		pair, ref := creds.Generate()
+		if ref != nil {
+			return state.Key{}, "", ref
+		}
+		key = state.Key{Name: state.UserKeyName, Kind: state.KindSSH, Value: pair.Private}
+		st.SetKey(key)
+		// Ключ записывается в скоуп ДО того, как попадёт на машину. Порядок не случаен:
+		// иначе неудача на полпути оставила бы на чужой машине строку с ключом, которого
+		// у юзера нет, — и убрать её было бы нечем.
+		if ref := sc.Write(ctx, st); ref != nil {
+			return state.Key{}, "", ref
+		}
+	}
+	authorized, ref := creds.Authorized(key.Value)
+	if ref != nil {
+		return state.Key{}, "", ref
+	}
+
+	// ЦЕНА НАЗЫВАЕТСЯ ДО ДЕЙСТВИЯ, а не после: контроллер сейчас изменит файл на ЧУЖОЙ
+	// машине. Пароля в этой строке нет и быть не может.
+	h.opt.Logf("control: машина %s: захожу паролем ОДИН раз и кладу публичный ключ юзера в её ~/.ssh/authorized_keys — дальше только по ключу", addr)
+	if ref := creds.Install(ctx, creds.Machine{User: user, Host: host, Port: port},
+		body.Value, authorized, filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout); ref != nil {
+		return state.Key{}, "", ref
+	}
+
+	return key, "на машину " + addr + " положен публичный ключ юзера (одна строка в её ~/.ssh/authorized_keys, подпись world-control) — " +
+		"пароль дальше не нужен и нигде не сохранён; убрать доступ можно, удалив эту строку", nil
 }
 
 // ── вход и выход ─────────────────────────────────────────────────────────────
@@ -536,9 +624,9 @@ func (h *Handler) getResources(w http.ResponseWriter, r *http.Request) *refusal.
 type resourceBody struct {
 	// Name — ИМЯ УЧАСТКА, и его называет юзер (`WORLD2` 2.5 п. 11). Мир его не выдумывает
 	// и из адреса машины не выводит: на имени стоит адрес локации.
-	Name  string `json:"name"`
-	Addr  string `json:"addr"`
-	Creds string `json:"creds"`
+	Name  string    `json:"name"`
+	Addr  string    `json:"addr"`
+	Creds credsBody `json:"creds"`
 	// Recipe — ЧТО поднять на этой территории: имя рецепта из каталога либо путь (в
 	// названии с косой чертой контроллер видит путь). Не назван — дверь.
 	Recipe string `json:"recipe"`
@@ -559,10 +647,6 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 	if _, _, ref := resource.CheckAddr(body.Addr); ref != nil {
 		return ref
 	}
-	if body.Creds == "" {
-		return noCreds()
-	}
-
 	st, ref := sess.sc.Read(r.Context())
 	if ref != nil {
 		return ref
@@ -584,7 +668,13 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 		return ref
 	}
 
-	if ref := h.res.PutKey(body.Name, body.Addr, body.Creds); ref != nil {
+	// Креды двух видов, и вид назван явно. Паролем контроллер заходит ОДИН раз — и
+	// говорит об этом вслух до того, как тронет чужую машину.
+	key, цена, ref := h.machineKey(r.Context(), sess.sc, st, body.Name, body.Addr, body.Creds)
+	if ref != nil {
+		return ref
+	}
+	if ref := h.res.PutKey(body.Name, body.Addr, key.Value); ref != nil {
 		return ref
 	}
 	if ref := h.res.Raise(r.Context(), body.Name, body.Addr, recipePath, nil); ref != nil {
@@ -594,10 +684,7 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 		return ref
 	}
 
-	if ref := st.AddTerritory(
-		state.Territory{Name: body.Name, Addr: body.Addr},
-		state.Key{Name: body.Name, Kind: state.KindSSH, Value: body.Creds},
-	); ref != nil {
+	if ref := st.AddTerritory(state.Territory{Name: body.Name, Addr: body.Addr}, key); ref != nil {
 		return ref
 	}
 	if ref := sess.sc.Write(r.Context(), st); ref != nil {
@@ -617,7 +704,12 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 	}
 	// Список отдаётся тем же ответом: главное, что должен увидеть человек, — что
 	// территорий стало две (`WORLD2-80`), и ради этого не надо спрашивать второй раз.
-	writeJSON(w, http.StatusCreated, map[string]any{"resource": added, "resources": list})
+	ответ := map[string]any{"resource": added, "resources": list}
+	if цена != "" {
+		// Что изменено на ЧУЖОЙ машине — говорится и человеку, а не только в журнал.
+		ответ["note"] = цена
+	}
+	writeJSON(w, http.StatusCreated, ответ)
 	return nil
 }
 
@@ -795,10 +887,17 @@ func noPassword() *refusal.Refusal {
 		"пароль называют при подъёме раздачи, и внутри файла состояния его нет")
 }
 
-func noCreds() *refusal.Refusal {
+func noCreds(kind creds.Kind) *refusal.Refusal {
+	if kind == creds.Password {
+		return refusal.New(http.StatusBadRequest, "no-creds",
+			"вид кред назван паролем, а самого пароля нет — заходить нечем",
+			`пришли его значением: creds = {"kind":"password","value":"<пароль машины>"}`,
+			"паролем контроллер зайдёт ОДИН раз и положит на машину публичный ключ юзера — дальше только по ключу")
+	}
 	return refusal.New(http.StatusBadRequest, "no-creds",
 		"креды машины не названы, а без них до неё не дотянуться — мир кред не заводит и не выдаёт",
-		"пришли ключ полем creds: он ляжет в скоуп, в раздел «ключи», и дальше берётся оттуда",
+		`пришли их с явным видом: creds = {"kind":"key","value":"<приватный ключ>"}`,
+		`если ключа нет, а есть пароль: creds = {"kind":"password","value":"<пароль>"} — контроллер заведёт ключ сам`,
 		"креды машины юзер даёт руками — из скоупа их взять неоткуда, пока скоупа нет (`WORLD2` 3.4)")
 }
 

@@ -679,6 +679,18 @@ func validName(name string) *refusal.Refusal {
 // машина названа. Разбирать его дальше не наше дело — адрес уезжает соседу как есть.
 func CheckAddr(addr string) (string, int, *refusal.Refusal) { return checkAddr(addr) }
 
+// SplitAddr — то же самое, но с юзером. Нужен там, где до машины дотягиваются НЕ докером:
+// заход паролем идёт своей библиотекой, и юзера ей надо назвать отдельно. Разбор при этом
+// один и тот же — второй разъехался бы с первым.
+func SplitAddr(addr string) (string, string, int, *refusal.Refusal) {
+	host, port, ref := checkAddr(addr)
+	if ref != nil {
+		return "", "", 0, ref
+	}
+	user, _, _ := strings.Cut(strings.TrimSpace(addr), "@")
+	return user, host, port, nil
+}
+
 func checkAddr(addr string) (string, int, *refusal.Refusal) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/omnifield/world/control/internal/creds/sshtest"
 	"github.com/omnifield/world/control/internal/run"
 	"github.com/omnifield/world/control/internal/state"
 )
@@ -406,7 +407,7 @@ func TestЗаведениеПоднимаетРаздачуНаНазванно�
 	status, body := st.зов(t, "POST", "/api/scope", `{
 		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
 		"identity":{"name":"егор","brand":""},
-		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":"-----ключ-----"}}`, "")
+		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"-----ключ-----"}}}`, "")
 	if status != http.StatusCreated {
 		t.Fatalf("скоуп не завёлся: %d %v", status, body)
 	}
@@ -456,7 +457,7 @@ func TestЗаведениеПоверхЧужойЛичностиОтказыв�
 	status, body := st.зов(t, "POST", "/api/scope", `{
 		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
 		"identity":{"name":"егор","brand":""},
-		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":"к"}}`, "")
+		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"к"}}}`, "")
 	if status != http.StatusConflict {
 		t.Fatalf("заведение поверх личности отдало %d: %v", status, body)
 	}
@@ -527,7 +528,7 @@ func TestТерриторияЗаписываетсяВСкоуп(t *testing.T) 
 	st.войти(t, ш)
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.5","creds":"-----ключ-----"}`, "metka")
+		`{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"-----ключ-----"}}`, "metka")
 	if status != http.StatusCreated {
 		t.Fatalf("территория не завелась: %d %v", status, body)
 	}
@@ -567,7 +568,7 @@ func TestВторойУчастокСЗанятымИменемОтказыва�
 	st.войти(t, ш)
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.9","creds":"другой"}`, "metka")
+		`{"name":"vps","addr":"world@10.8.0.9","creds":{"kind":"key","value":"другой"}}`, "metka")
 	if status != http.StatusConflict {
 		t.Fatalf("занятое имя принято как %d: %v", status, body)
 	}
@@ -674,6 +675,162 @@ func TestВыходСнимаетВремянкиИДругаяЛичность�
 	}
 }
 
+// ── креды: ключ или пароль ───────────────────────────────────────────────────
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПАРОЛЬ — СПОСОБ ПОЛУЧИТЬ КЛЮЧ, А НЕ ТРАНСПОРТ (`WORLD2-141`). Контроллер заходит им  │
+// │ ОДИН раз, кладёт публичный ключ юзера на машину, приватный отдаёт в скоуп. Дальше    │
+// │ всё по ключу, а пароль не живёт нигде.                                               │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+
+// машинаСПаролем — подставная машина, куда контроллер зайдёт паролем. Настоящий ssh, а не
+// пересказ: смотреть потом будем В ЕЁ ФАЙЛ.
+func машинаСПаролем(t *testing.T, пароль string) *sshtest.Machine {
+	t.Helper()
+	m, err := sshtest.Start("world", пароль, filepath.Join(t.TempDir(), "дом"))
+	if err != nil {
+		t.Fatalf("подставная машина не поднялась: %v", err)
+	}
+	t.Cleanup(m.Close)
+	return m
+}
+
+func TestПарольМеняетсяНаКлючИНеЖивётНигде(t *testing.T) {
+	пароль := "рут-пароль-от-впс-9876"
+	st := поднять(t, докерОтвечает)
+	машина := машинаСПаролем(t, пароль)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
+
+	status, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@`+машина.Addr+`","creds":{"kind":"password","value":"`+пароль+`"}}`, "metka")
+	if status != http.StatusCreated {
+		t.Fatalf("территория с паролем не завелась: %d %v", status, body)
+	}
+
+	// На машине лежит ровно одна строка — публичный ключ юзера с подписью.
+	лежит := strings.TrimSpace(машина.Authorized())
+	if лежит == "" || strings.Count(лежит, "\n") != 0 {
+		t.Fatalf("в authorized_keys машины не одна строка:\n%s", машина.Authorized())
+	}
+	if !strings.Contains(лежит, "world-control") {
+		t.Fatalf("строка не подписана — человек не поймёт, откуда она: %s", лежит)
+	}
+
+	// В скоупе лежит КЛЮЧ, и территория ссылается именно на него.
+	файл := ш.файл(t)
+	ключ, есть := файл.Key(state.UserKeyName)
+	if !есть || !strings.Contains(ключ.Value, "PRIVATE KEY") {
+		t.Fatalf("ключ юзера не появился в скоупе: %+v", файл.Keys)
+	}
+	if файл.Territories[0].Key != state.UserKeyName {
+		t.Fatalf("территория ссылается не на ключ юзера: %+v", файл.Territories[0])
+	}
+
+	// ПАРОЛЬ НЕ УТЁК НИКУДА: ни в скоуп, ни в связку, ни в журнал, ни в ответ.
+	состояние, _ := ш.файл(t).Bytes()
+	if strings.Contains(string(состояние), пароль) {
+		t.Fatal("пароль утёк в скоуп")
+	}
+	if strings.Contains(strings.Join(st.log, " "), пароль) {
+		t.Fatalf("пароль утёк в журнал: %v", st.log)
+	}
+	if data, err := os.ReadFile(filepath.Join(st.keys, "world-vps")); err == nil && strings.Contains(string(data), пароль) {
+		t.Fatal("пароль утёк в связку контроллера")
+	}
+	if строка, _ := json.Marshal(body); strings.Contains(string(строка), пароль) {
+		t.Fatal("пароль утёк в ответ ручки")
+	}
+
+	// ЦЕНА НАЗВАНА: контроллер написал в чужую машину, и человек об этом узнаёт.
+	if note, _ := body["note"].(string); !strings.Contains(note, "authorized_keys") {
+		t.Fatalf("не сказано, что изменено на чужой машине: %v", body)
+	}
+	if !strings.Contains(strings.Join(st.log, " "), "authorized_keys") {
+		t.Fatalf("в журнале нет строки про запись в чужую машину: %v", st.log)
+	}
+}
+
+// Ключ юзера ОДИН на скоуп: вторая машина берёт тот же ключ, и повторный заход на первую
+// строк не плодит.
+func TestКлючЮзераОдинНаСкоуп(t *testing.T) {
+	пароль := "пароль-два"
+	st := поднять(t, докерОтвечает)
+	первая := машинаСПаролем(t, пароль)
+	вторая := машинаСПаролем(t, пароль)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
+
+	for имя, машина := range map[string]*sshtest.Machine{"vps": первая, "home": вторая} {
+		status, body := st.зов(t, "POST", "/api/resources",
+			`{"name":"`+имя+`","addr":"world@`+машина.Addr+`","creds":{"kind":"password","value":"`+пароль+`"}}`, "metka")
+		if status != http.StatusCreated {
+			t.Fatalf("территория %s не завелась: %d %v", имя, status, body)
+		}
+	}
+	файл := ш.файл(t)
+	if len(файл.Keys) != 1 || файл.Keys[0].Name != state.UserKeyName {
+		t.Fatalf("ключей в скоупе больше одного — повторный заход начнёт плодить строки: %+v", файл.Keys)
+	}
+	if strings.TrimSpace(первая.Authorized()) == strings.TrimSpace(вторая.Authorized()) &&
+		strings.TrimSpace(первая.Authorized()) == "" {
+		t.Fatal("ни на одной машине ключа нет")
+	}
+}
+
+// ВИД КРЕД НАЗЫВАЕТСЯ ЯВНО. Не назван — отказ, а не догадка по виду строки: угаданный вид
+// однажды примет ключ за пароль.
+func TestВидКредНеУгадывается(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
+
+	_, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.5","creds":{"value":"-----ключ-----"}}`, "metka")
+	отказ(t, body, "no-creds-kind")
+
+	_, body = st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"колдовство","value":"х"}}`, "metka")
+	отказ(t, body, "bad-creds-kind")
+
+	// Пароль, названный ключом, паролем НЕ становится: до машины никто не идёт, ключ
+	// кладётся как есть — а дальше откажет ssh, и это честнее нашей догадки.
+	status, _ := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"похоже-на-пароль"}}`, "metka")
+	if status != http.StatusCreated {
+		t.Fatalf("прежний путь по ключу сломан: %d", status)
+	}
+	файл := ш.файл(t)
+	if ключ, есть := файл.Key("vps"); !есть || ключ.Value != "похоже-на-пароль" {
+		t.Fatalf("ключ юзера подменён догадкой: %+v", файл.Keys)
+	}
+}
+
+// Пароль не подошёл — отказ с причиной и выходом, и на машине ничего не появилось.
+func TestНеверныйПарольМашиныОтказывает(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	машина := машинаСПаролем(t, "настоящий")
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", ""))
+	st.войти(t, ш)
+
+	status, body := st.зов(t, "POST", "/api/resources",
+		`{"name":"vps","addr":"world@`+машина.Addr+`","creds":{"kind":"password","value":"не-тот"}}`, "metka")
+	if status != http.StatusForbidden {
+		t.Fatalf("неверный пароль принят как %d: %v", status, body)
+	}
+	отказ(t, body, "access-denied")
+	if машина.Authorized() != "" {
+		t.Fatal("на машине появилась строка при неверном пароле")
+	}
+	if len(ш.файл(t).Territories) != 0 {
+		t.Fatal("территория записалась, хотя зайти не вышло")
+	}
+}
+
 // ── рецепты ──────────────────────────────────────────────────────────────────
 
 func TestРецептДоезжаетДоПодъёма(t *testing.T) {
@@ -688,7 +845,7 @@ func TestРецептДоезжаетДоПодъёма(t *testing.T) {
 	}
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.5","creds":"к","recipe":"весы"}`, "metka")
+		`{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"к"},"recipe":"весы"}`, "metka")
 	if status != http.StatusCreated {
 		t.Fatalf("вторая вещь не поднялась: %d %v", status, body)
 	}
@@ -737,7 +894,7 @@ func TestНеизвестныйРецептОтказываетСвоимКод�
 	st.войти(t, ш)
 
 	status, body := st.зов(t, "POST", "/api/resources",
-		`{"name":"vps","addr":"world@10.8.0.5","creds":"к","recipe":"часы"}`, "metka")
+		`{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"к"},"recipe":"часы"}`, "metka")
 	if status != http.StatusNotFound {
 		t.Fatalf("неизвестный рецепт отдан как %d: %v", status, body)
 	}
@@ -762,7 +919,7 @@ func TestОтказПодъёмаДоезжаетДоПульта(t *testing.T) 
 	ш.поднять(t, личность(t, "егор", ""))
 	st.войти(t, ш)
 
-	status, body := st.зов(t, "POST", "/api/resources", `{"name":"vps","addr":"world@10.8.0.5","creds":"к"}`, "metka")
+	status, body := st.зов(t, "POST", "/api/resources", `{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"к"}}`, "metka")
 	if status != http.StatusBadGateway {
 		t.Fatalf("отказ подъёма отдан как %d: %v", status, body)
 	}
