@@ -281,13 +281,38 @@ chmod +x "$STUB_DIR/docker"
 # которая ради своего сценария правит рабочую копию, однажды съест чужую работу. Поэтому
 # гит здесь подставной, ровно как докер: он отвечает по сценарию и ничего не трогает.
 #
-# Знает он три вопроса и больше ничему не учится: репозиторий ли это, чисто ли дерево, какой
-# коммит. Ровно те три, что задаёт выпуск.
+# Знает он четыре вопроса и больше ничему не учится: репозиторий ли это, есть ли коммиты,
+# какой коммит тронул НАЗВАННЫЕ ПУТИ и чисто ли по НАЗВАННЫМ ПУТЯМ. Ровно те, что задаёт
+# версия образа.
+#
+# ПУТИ ЗДЕСЬ — НЕ ФОРМАЛЬНОСТЬ. С `WORLD2-146` версия принадлежит образу: `sha` берётся у
+# последнего коммита, тронувшего перечень ИМЕННО ЭТОГО образа, и чистота спрашивается по нему
+# же. Отвечай заглушка одинаково на любой список путей — проверить главное свойство («правка
+# только в `web/` двигает версию контроллера и не двигает дверь») было бы нечем вовсе:
+# зелёный прогон означал бы ровно то же, что и до задачи.
+#
+#   STUB_GIT_TOUCHED=<путь>:<sha>   этот путь тронут ОТДЕЛЬНЫМ коммитом; спросили список,
+#                                   в котором он есть, — ответ его, иначе общий
+#   STUB_GIT_DIRTY_PATH=<путь>      грязен только он: спросили без него — чисто
+#   STUB_GIT_DIRTY=1                грязно по любому списку (прежнее поведение)
 cat > "$STUB_DIR/git" <<'STUBGIT'
 #!/usr/bin/env bash
 # ПОДСТАВНОЙ git: отвечает по сценарию, рабочей копии не касается.
 printf 'git %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 while [ $# -gt 0 ]; do case "$1" in -C) shift 2 ;; *) break ;; esac; done
+
+# sprosili ПУТЬ — назван ли этот путь среди аргументов вызова. Смотрим ПОСЛЕ `--`: слева от
+# него ключи, справа пути, и путать их нельзя.
+sprosili() {
+    local hochu="$1"; shift
+    local posle= a
+    for a in "$@"; do
+        [ "$a" = "--" ] && { posle=1; continue; }
+        [ -n "$posle" ] && [ "$a" = "$hochu" ] && return 0
+    done
+    return 1
+}
+
 case "$1" in
     rev-parse)
         case "$*" in
@@ -297,7 +322,22 @@ case "$1" in
             # `version.sh` отвечает на него своим кодом (`no-commit`).
             *HEAD*)      printf '%s\n' "${STUB_GIT_SHA-abc1234}"; exit 0 ;;
         esac ;;
-    status) [ -n "${STUB_GIT_DIRTY:-}" ] && printf ' M deploy/probe.sh\n'; exit 0 ;;
+    log)
+        # Коммитов нет вовсе — молчим и здесь: иначе версия нашлась бы там, где её нет.
+        [ -n "${STUB_GIT_SHA-abc1234}" ] || exit 0
+        otvet="${STUB_GIT_SHA-abc1234}"
+        if [ -n "${STUB_GIT_TOUCHED:-}" ]; then
+            sprosili "${STUB_GIT_TOUCHED%%:*}" "$@" && otvet="${STUB_GIT_TOUCHED#*:}"
+        fi
+        # `STUB_GIT_NOHIST=<путь>`: перечня, в котором он назван, не касался ни один коммит.
+        if [ -n "${STUB_GIT_NOHIST:-}" ] && sprosili "$STUB_GIT_NOHIST" "$@"; then exit 0; fi
+        printf '%s\n' "$otvet"; exit 0 ;;
+    status)
+        if [ -n "${STUB_GIT_DIRTY:-}" ]; then printf ' M deploy/probe.sh\n'; exit 0; fi
+        if [ -n "${STUB_GIT_DIRTY_PATH:-}" ] && sprosili "$STUB_GIT_DIRTY_PATH" "$@"; then
+            printf ' M %s/nechto\n' "$STUB_GIT_DIRTY_PATH"
+        fi
+        exit 0 ;;
 esac
 exit 0
 STUBGIT
@@ -1111,145 +1151,162 @@ grep -qE "^![[:space:]]*${razresheno}\$" "$HERE/Dockerfile.dockerignore" \
 # правдой, публикует туда, куда сказал ФАЙЛ ЗАПУСКА, и не молчит, когда реестр отказал.
 #
 # Тегов у образа два, и они разной природы: подвижный `latest` и неподвижный `sha-<коммит>`.
-# Образов теперь ТРИ — дверь, раздача и контроллер (`WORLD2-119`, `WORLD2-138`), — значит
-# push'ей шесть, и проба держит три свойства этой шестёрки:
 #
-#   · ОБРАЗОВ РОВНО ТРИ. Проба их СЧИТАЕТ, а не перечисляет по одному: пропади из выпуска
-#     раздача — по отдельным «звалось» это выглядело бы как зелёный прогон с двумя ✔ меньше,
-#     а число называет пропажу вслух;
-#   · все три собраны и помечены ОДНИМ `sha`: по тегу видно, что они одной сборки;
-#   · порядок отдачи — неподвижные первыми, а пульт последним в каждой тройке. Пульт
-#     раскладывает и дверь, и раздачу, и новый пульт при отсутствующей вещи ломается у юзера.
+# ЗА ВЫЗОВ УЕЗЖАЕТ ОДИН ОБРАЗ (`WORLD2-146`). Прежде выпуск возил тройку одной сборки, и
+# проба стерегла свойства ШЕСТЁРКИ push'ей: три образа, один `sha` на всех, пульт последним.
+# Публикация стала раздельной — и вместе с набором ушли те свойства, а на их место встало
+# одно, но главное:
+#
+#   · ОБРАЗ РОВНО ОДИН. Проба его СЧИТАЕТ, а не перечисляет: «звалось push такого-то»
+#     зеленело бы и у выпуска, который заодно увёз соседа. Считается ИМЯ без тега — два тега
+#     одного образа это один образ, два разных имени уже набор, которого здесь быть не должно;
+#   · СОСЕДЕЙ НЕ ТРОГАЛИ ВОВСЕ — ни собирали, ни метили, ни отдавали. Это та же проверка с
+#     другой стороны, и держатся они парой: счёт ловит лишний образ, `not_called` называет,
+#     какой именно;
+#   · неподвижный тег уезжает раньше подвижного. Правило прежнее, предметов у него теперь два.
 #
 # Порядок проверяется НОМЕРАМИ СТРОК в журнале, а не фактом вызова: перепутанный порядок
-# оставляет ровно те же шесть записей и по одному `called` неотличим.
+# оставляет ровно те же записи и по одному `called` неотличим.
 ranshe() {   # ranshe ОПИСАНИЕ N M — строка N в журнале должна быть раньше строки M
     local what="$1" a="$2" b="$3"
     if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then good "$what"
     else bad "$what — не так: строки ${a:-нет} и ${b:-нет}"; fi
 }
 
+# odin_obraz ОПИСАНИЕ — в журнале ровно один образ и ровно два push'а. Сторож раздельной
+# публикации; зовётся из КАЖДОГО сценария штатного хода, а не один раз «где-нибудь»: увезти
+# соседа заодно можно на любом из путей по коду, а не только на том, который вспомнили.
+odin_obraz() {
+    local kto="$1" obrazov pushei
+    obrazov=$(grep '^push ' "$STUB_LOG" | sed 's/:[^:]*$//' | sort -u | wc -l | tr -d ' ')
+    pushei=$(grep -c '^push ' "$STUB_LOG")
+    [ "$obrazov" = 1 ] && good "$kto: за вызов уехал ОДИН образ" \
+                       || { bad "$kto: за вызов уехало образов: $obrazov — публикация раздельная"
+                            grep '^push ' "$STUB_LOG" >&2; }
+    [ "$pushei" = 2 ] && good "$kto: push'ей два — по тегу на неподвижный и подвижный" \
+                      || bad "$kto: push'ей оказалось $pushei вместо двух"
+}
+
 part "29. выпуск: --dry-run не трогает ничего"
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh" --dry-run
+    run_case 0 "$HERE/release.sh" --door --dry-run
 said "ghcr.io/omnifield/world:sha-abc1234"
 said "ghcr.io/omnifield/world:latest"
-said "ghcr.io/omnifield/world-share:sha-abc1234"
-said "ghcr.io/omnifield/world-share:latest"
-said "ghcr.io/omnifield/world-control:sha-abc1234"
-said "ghcr.io/omnifield/world-control:latest"
 said "не сделано НИЧЕГО"
 not_called "push"                                    # в реестр не ходили
-not_called "tag omnifield/world-control"             # и меток не ставили
-not_called "tag ghcr.io/omnifield/world:latest"      # ни у одного из трёх образов
-not_called "control/compose.yaml build"              # и не собирали
+not_called "tag "                                    # и меток не ставили
+not_called "compose -f $HERE/compose.yaml build"     # и не собирали
+not_called "control/compose.yaml build"              # соседей не трогали вовсе
 not_called "share/compose.yaml build"
-not_called "compose -f $HERE/compose.yaml build"
 
-part "29b. дерево не чисто → отказ: тег назвал бы не тот коммит"
-STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
-said "дерево не чисто"
-said "git -C"                                        # выход исполним: показано, где смотреть
+# ОБРАЗ НАЗЫВАЮТ ЯВНО. Умолчание здесь означало бы догадку о том, что человек хотел отдать
+# наружу, — а публикация необратима. Отказ обязан прийти ДО первого вызова докера: спросить
+# демона, чтобы потом сказать «ты не назвал образ», значит сделать работу зря.
+part "29a. образ не назван → отказ, и ни одного вызова докера"
+STUB_HAVE_PROBE=1 run_case 2 "$HERE/release.sh"
+said "образ не назван"
 not_called "push"
-not_called "control/compose.yaml build"              # до сборки дело не дошло
-not_called "share/compose.yaml build"
-not_called "compose -f $HERE/compose.yaml build"
+not_called "docker"
+not_called "compose"
+
+part "29a2. названы два образа в одной строке → отказ: за вызов уезжает ОДИН"
+STUB_HAVE_PROBE=1 run_case 2 "$HERE/release.sh" --door --control
+said "за вызов уезжает ОДИН"
+not_called "push"
+not_called "compose"
+
+part "29b. перечень образа не чист → отказ: тег назвал бы не тот коммит"
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh" --door
+said "не чист"
+said "sostav.sh --door"                              # выход исполним: показано, где смотреть
+not_called "push"
+not_called "compose -f $HERE/compose.yaml build"     # до сборки дело не дошло
 
 part "29c. выпуск не из репозитория → отказ, метить нечем"
 STUB_GIT_REPO= STUB_HAVE_PROBE=1 \
-    run_case 1 "$HERE/release.sh"
+    run_case 1 "$HERE/release.sh" --door
 # Причину называет `version.sh` — единственное место, где версия выводится из гита, — и
 # выпуск передаёт её ДОСЛОВНО (`WORLD2` 2.3), а свой выход дописывает рядом.
 said "не репозиторий"
 not_called "push"
 
-# Штатный ход. Здесь же — ЧИСЛО образов, порядок шести push'ей и один `sha` на всю тройку.
-part "29d. штатный выпуск: собрал ТРИ, пометил каждый двумя тегами, отдал шесть"
+# Штатный ход. Здесь же — ЧИСЛО образов, два push'а и порядок тегов.
+part "29d. штатный выпуск двери: собрал ОДИН, пометил двумя тегами, отдал два"
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
+    run_case 0 "$HERE/release.sh" --door
 called "compose -f $HERE/compose.yaml build"         # дверь собрана своей же сборкой
-called "share/compose.yaml build"                    # и раздача — ею же
-called "control/compose.yaml build"                  # и контроллер
 called "tag ghcr.io/omnifield/world:latest ghcr.io/omnifield/world:sha-abc1234"
 # Подвижная метка двери совпадает с её локальным именем — образ метится сам собой. Это не
 # лишний вызов, а следствие того, что имя в файле запуска и есть то, что публикуют
 # (`WORLD2-121`): докер такую метку принимает молча, и выпуску не приходится знать,
 # совпало имя или нет.
 called "tag ghcr.io/omnifield/world:latest ghcr.io/omnifield/world:latest"
-called "tag ghcr.io/omnifield/world-share:latest ghcr.io/omnifield/world-share:sha-abc1234"
-called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:sha-abc1234"
-called "tag omnifield/world-control:dev ghcr.io/omnifield/world-control:latest"
 called "push ghcr.io/omnifield/world:sha-abc1234"
 called "push ghcr.io/omnifield/world:latest"
+odin_obraz "дверь"
+# СОСЕДЕЙ НЕ ТРОГАЛИ. Это и есть раздельная публикация, и проверяется она по каждому из двух:
+# собрать соседа выпуск не звал, отдать — тем более.
+not_called "share/compose.yaml build"
+not_called "control/compose.yaml build"
+not_called "push ghcr.io/omnifield/world-share"
+not_called "push ghcr.io/omnifield/world-control"
+
+n_fixed=$(grep -n '^push .*/world:sha-abc1234$' "$STUB_LOG" | head -n1 | cut -d: -f1)
+n_mov=$(grep -n   '^push .*/world:latest$'      "$STUB_LOG" | head -n1 | cut -d: -f1)
+ranshe "неподвижный тег отдан раньше подвижного" "$n_fixed" "$n_mov"
+
+said "выпущен ОДИН образ"
+# Первый выпуск создаёт ПРИВАТНЫЙ пакет (умолчание GitHub) — молча оставить это значит
+# отдать юзеру `denied`, который выглядит как «образа нет».
+said "ПРИВАТНЫЙ пакет"
+called "image inspect --format .* ghcr.io/omnifield/world:sha-abc1234"
+
+# Те же свойства у двух остальных образов, и проверяются они ОТДЕЛЬНО намеренно: «работает у
+# двери» не значит «работает у контроллера» — ключ, файл запуска и сборка у них разные, и
+# разъезжается такое по одному.
+part "29d2. штатный выпуск раздачи: один образ, соседи не тронуты"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh" --share
+called "share/compose.yaml build"
 called "push ghcr.io/omnifield/world-share:sha-abc1234"
 called "push ghcr.io/omnifield/world-share:latest"
-called "push ghcr.io/omnifield/world-control:sha-abc1234"
+odin_obraz "раздача"
+not_called "compose -f $HERE/compose.yaml build"
+not_called "control/compose.yaml build"
+not_called "push ghcr.io/omnifield/world:"
+not_called "push ghcr.io/omnifield/world-control"
+
+part "29d3. штатный выпуск контроллера: один образ, соседи не тронуты"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh" --control
+called "control/compose.yaml build"
+called "push ghcr.io/omnifield/world-control:sha-"
 called "push ghcr.io/omnifield/world-control:latest"
-
-# ЧИСЛО — главная проверка ступени, и стоит она отдельно от перечисления. Убери кто-нибудь
-# раздачу из выпуска — перечисленные `called` выше просто исчезли бы вместе с ней, а вот
-# счёт покраснеет: два образа вместо трёх это не «меньше проверок», это другой выпуск.
-obrazov=$(grep '^push ' "$STUB_LOG" | sed 's/:[^:]*$//' | sort -u | wc -l)
-[ "$obrazov" = 3 ] && good "выпуск отдал ТРИ образа" \
-                   || bad "выпуск отдал $obrazov образа вместо трёх — набор не тот"
-pushei=$(grep -c '^push ' "$STUB_LOG")
-[ "$pushei" = 6 ] && good "push'ей шесть — по два тега на каждый образ" \
-                  || bad "push'ей оказалось $pushei вместо шести"
-
-n_dver_fixed=$(grep -n  '^push .*/world:sha-abc1234$'         "$STUB_LOG" | head -n1 | cut -d: -f1)
-n_razd_fixed=$(grep -n  '^push .*/world-share:sha-abc1234$'   "$STUB_LOG" | head -n1 | cut -d: -f1)
-n_pult_fixed=$(grep -n  '^push .*/world-control:sha-abc1234$' "$STUB_LOG" | head -n1 | cut -d: -f1)
-n_dver_mov=$(grep -n    '^push .*/world:latest$'              "$STUB_LOG" | head -n1 | cut -d: -f1)
-n_razd_mov=$(grep -n    '^push .*/world-share:latest$'        "$STUB_LOG" | head -n1 | cut -d: -f1)
-n_pult_mov=$(grep -n    '^push .*/world-control:latest$'      "$STUB_LOG" | head -n1 | cut -d: -f1)
-ranshe "неподвижный тег двери отдан раньше её подвижного"        "$n_dver_fixed" "$n_dver_mov"
-ranshe "неподвижный тег раздачи отдан раньше её подвижного"      "$n_razd_fixed" "$n_razd_mov"
-ranshe "неподвижный тег пульта отдан раньше его подвижного"      "$n_pult_fixed" "$n_pult_mov"
-ranshe "ВСЕ неподвижные уехали раньше первого подвижного"        "$n_pult_fixed" "$n_dver_mov"
-ranshe "пульт последний среди неподвижных: после двери"          "$n_dver_fixed" "$n_pult_fixed"
-ranshe "пульт последний среди неподвижных: после раздачи"        "$n_razd_fixed" "$n_pult_fixed"
-ranshe "пульт последний среди подвижных: после двери"            "$n_dver_mov"   "$n_pult_mov"
-ranshe "пульт последний среди подвижных: после раздачи"          "$n_razd_mov"   "$n_pult_mov"
-
-# Один коммит на все три образа — это и есть предмет выпуска. Метка `sha-` обязана быть ровно
-# одна на всю шестёрку: разъедься она, «дверь, раздача и пульт одной сборки» стало бы
-# неправдой, которую снаружи не отличить.
-shas=$(grep '^push ' "$STUB_LOG" | sed -n 's/.*:\(sha-[0-9a-f]*\)$/\1/p' | sort -u | wc -l)
-[ "$shas" = 1 ] && good "неподвижный тег у всех трёх образов ОДИН" \
-                || bad "неподвижных меток на шестёрку оказалось $shas — образы разъехались"
-said "одна сборка"
-# Первый выпуск создаёт ПРИВАТНЫЙ пакет (умолчание GitHub) — молча оставить это значит
-# отдать юзеру `denied`, который выглядит как «образа нет». Пакетов теперь три.
-said "ПРИВАТНЫЙ пакет"
-# Digest спрашивается у ВСЕХ ТРЁХ, а не у одного: часть ссылки хуже, чем никакой.
-called "image inspect --format .* ghcr.io/omnifield/world:sha-abc1234"
-called "image inspect --format .* ghcr.io/omnifield/world-share:sha-abc1234"
-called "image inspect --format .* ghcr.io/omnifield/world-control:sha-abc1234"
+odin_obraz "контроллер"
+not_called "compose -f $HERE/compose.yaml build"
+not_called "share/compose.yaml build"
+not_called "push ghcr.io/omnifield/world:"
+not_called "push ghcr.io/omnifield/world-share"
 
 part "29e. реестр не принял → отказ называет вход; дальше первого тега не уехало НИЧЕГО"
 STUB_PUSH=denied STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
+    run_case 1 "$HERE/release.sh" --door
 said "docker login"
 said "write:packages"
-called "push ghcr.io/omnifield/world:sha-abc1234"     # первым идёт неподвижный тег двери
+called "push ghcr.io/omnifield/world:sha-abc1234"     # первым идёт неподвижный тег
 not_called "push ghcr.io/omnifield/world:latest"
-not_called "push ghcr.io/omnifield/world-share"       # до раздачи дело не дошло вовсе
-not_called "push ghcr.io/omnifield/world-control"     # и до пульта
 
 # Реестр остаётся ЗНАЧЕНИЕМ, а не зашитым словом, — но решает он только там, где имя его не
 # несёт. Сегодняшние имена всех трёх образов несут реестр сами (`WORLD2-121`), поэтому
-# сценарий берёт имена БЕЗ реестра: иначе он проверял бы не переменную, а отказ «два разных
+# сценарий берёт имя БЕЗ реестра: иначе он проверял бы не переменную, а отказ «два разных
 # реестра» (его стерегут 29k и 29m).
-part "29f. реестр — значение: имена его не несут, сказали другой → поехали туда ВСЕ ТРИ"
+part "29f. реестр — значение: имя его не несёт, сказали другой → поехали туда"
 WORLD_REGISTRY=example.test \
-STUB_WORLD_IMAGE=omnifield/world:dev STUB_SHARE_IMAGE=omnifield/world-share:dev \
-STUB_CONTROL_IMAGE=omnifield/world-control:dev \
+STUB_WORLD_IMAGE=omnifield/world:dev \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
+    run_case 0 "$HERE/release.sh" --door
 called "push example.test/omnifield/world:sha-abc1234"
-called "push example.test/omnifield/world-share:sha-abc1234"
-called "push example.test/omnifield/world-control:sha-abc1234"
 not_called "push ghcr.io"
 
 # Главная граница всей затеи: обычная сборка публиковать не умеет. Проверяем её же
@@ -1284,15 +1341,11 @@ publik=$(grep -nE '^[[:space:]]*(--push|--release|--publish)\)' "$HERE/build.sh"
 
 part "29h. --dry-run на ГРЯЗНОМ дереве: показывает план, говорит про грязь, не отказывает"
 STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 \
-    run_case 0 "$HERE/release.sh" --dry-run
+    run_case 0 "$HERE/release.sh" --door --dry-run
 said "не сделано НИЧЕГО"
 said "ghcr.io/omnifield/world:sha-abc1234"
-said "ghcr.io/omnifield/world-share:sha-abc1234"
-said "ghcr.io/omnifield/world-control:sha-abc1234"
-said "дерево не чисто"                     # про грязь сказано вслух
+said "не чист"                             # про грязь сказано вслух
 not_called "push"
-not_called "control/compose.yaml build"
-not_called "share/compose.yaml build"
 not_called "compose -f $HERE/compose.yaml build"
 # Отказ, который советует выходом сам себя, — диагноз, а не отказ. Здесь отказа нет вовсе,
 # и проверяем именно это: холостой ход не может отправить человека делать холостой ход.
@@ -1300,98 +1353,93 @@ grep -qF '✗ не выпущено' "$STUB_DIR/out" \
     && { bad "холостой ход ОТКАЗАЛ на грязном дереве"; tail -n 6 "$STUB_DIR/out" >&2; } \
     || good "холостой ход не отказывает — и не советует выходом сам себя"
 
+# РАЗДЕЛ «ЧЕМ МЕТИМ» ГОВОРИТ И НА ГРЯЗНОМ. Найдено выпуском 18.08 и записано в `WORLD2-146`:
+# строка про версию печаталась ТОЛЬКО при чистом дереве, и раздел молчал ровно в том случае,
+# ради которого его читают. Стережём не формулировку, а то, что версия НАЗВАНА рядом с
+# грязью, — иначе починка держалась бы на памяти правившего.
+part "29h2. на грязном перечне раздел «чем метим» всё равно называет версию"
+STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 \
+    run_case 1 "$HERE/release.sh" --door
+said "чем метим"
+said "sha-abc1234"                         # чем пометили БЫ — сказано, а не оставлено гадать
+said "не чист"
+not_called "push"
+
 part "29i. имя от control УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
 STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
-called "push ghcr.io/omnifield/world-control:sha-abc1234"
+    run_case 0 "$HERE/release.sh" --control
+called "push ghcr.io/omnifield/world-control:sha-"
 not_called "ghcr.io/ghcr.io"               # двойного реестра нет ни в метке, ни в push
 said "реестр взят из имени зоны control"   # и сказано, откуда он взялся
 
-part "29j. в имени ПОРТ реестра → тег отрезан, имя цело; реестры у образов РАЗНЫЕ"
+part "29j. в имени ПОРТ реестра → тег отрезан, имя цело"
 STUB_CONTROL_IMAGE=registry.local:5000/omnifield/world-control:dev \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
-called "push registry.local:5000/omnifield/world-control:sha-abc1234"
+    run_case 0 "$HERE/release.sh" --control
+called "push registry.local:5000/omnifield/world-control:sha-"
 called "push registry.local:5000/omnifield/world-control:latest"
 not_called "push ghcr.io/omnifield/world-control"
-# Реестр у каждого образа СВОЙ — имя называет его само, и совпадать они не обязаны. Дверь и
-# раздача при этом уезжают в свой, а не за компанию в чужой.
-called "push ghcr.io/omnifield/world:sha-abc1234"
-called "push ghcr.io/omnifield/world-share:sha-abc1234"
-# И вход назван для ВСЕХ: совет «залогинься» с одним реестром отправил бы человека
-# наполовину, а узнал бы он об этом посреди отдачи — когда часть тегов уже уехала.
-said "ghcr.io и registry.local:5000"
+odin_obraz "контроллер в чужом реестре"
+# Вход назван ТУДА, КУДА ЕДЕМ, а не в значение переменной: совет «залогинься в ghcr.io»
+# отправил бы человека входить не в тот реестр. Реестров теперь по одному на вызов — и это
+# ровно то, что упрощает раздельная публикация: списка из трёх здесь больше нет.
+said "registry.local:5000"
 
 # Стык, которого в находках не было, но он того же рода: реестр назван ДВАЖДЫ и по-разному.
 # Молча выбрать нельзя — выпуск отдал бы вещь не туда, откуда её потом тянут.
 part "29k. реестр назван дважды и по-разному → отказ, а не догадка"
 WORLD_REGISTRY=example.test \
-STUB_WORLD_IMAGE=omnifield/world:dev STUB_SHARE_IMAGE=omnifield/world-share:dev \
 STUB_CONTROL_IMAGE=ghcr.io/omnifield/world-control:latest \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
+    run_case 1 "$HERE/release.sh" --control
 said "два разных реестра"
 said "зоны control"                        # названа ТА зона, чьё имя спорит с переменной
 not_called "push"
 not_called "control/compose.yaml build"    # отказ ДО сборки: собирать нечего и незачем
 
-# ================================================================== 29l…29u. ТРИ ОБРАЗА
+# ================================================================== 29l…29u. КАЖДЫЙ ОБРАЗ СВОЙ
 # Сценарии выше пришли из времени, когда выпускался один контроллер, и стерегут его же.
-# Здесь — то, что появилось вместе со вторым образом (`WORLD2-119`) и третьим
-# (`WORLD2-138`): своё имя у каждой зоны, общая судьба у тройки, место, где часть выпуска
-# могла бы уехать молча, и окружение, которое чуть не решало, куда публиковать.
+# Здесь — то, что появилось вместе со вторым образом (`WORLD2-119`), третьим (`WORLD2-138`)
+# и раздельной публикацией (`WORLD2-146`): своё имя у каждой зоны, своя версия у каждого
+# образа и окружение, которое чуть не решало, куда публиковать.
 
 # Разбор имени у двери ТОТ ЖЕ, что у контроллера, и проверяется он отдельно намеренно: общий
 # код разъезжается не сразу, а когда его чинят с одной стороны.
 part "29l. имя двери УЖЕ несёт реестр → публикуем туда, а не в ghcr.io/ghcr.io"
 STUB_WORLD_IMAGE=ghcr.io/omnifield/world:latest \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
+    run_case 0 "$HERE/release.sh" --door
 called "push ghcr.io/omnifield/world:sha-abc1234"
 not_called "ghcr.io/ghcr.io"
 said "реестр взят из имени зоны deploy"
 
 part "29m. реестр двери назван дважды и по-разному → отказ, а не догадка"
 WORLD_REGISTRY=example.test \
-STUB_SHARE_IMAGE=omnifield/world-share:dev STUB_CONTROL_IMAGE=omnifield/world-control:dev \
 STUB_WORLD_IMAGE=ghcr.io/omnifield/world:latest \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
+    run_case 1 "$HERE/release.sh" --door
 said "два разных реестра"
 said "зоны deploy"
 not_called "push"
 not_called "compose -f $HERE/compose.yaml build"
 
-# ГЛАВНОЕ СВОЙСТВО НАБОРА: сборка всех идёт ДО первой отдачи. Сборка контроллера падает чаще
-# всех — ей единственной нужны нода, сеть и чужая зона, — и упади она после отдачи двери, в
-# реестре осталась бы часть выпуска. Проверяем, что дверь и раздача при этом собрались
-# (значит порядок настоящий, а не случайно спасший нас отказ раньше времени), а в реестр не
-# ушло ни одного вызова.
-part "29n. сборка контроллера упала → не отдано НИЧЕГО, хотя дверь и раздача собрались"
+# СБОРКА ИДЁТ ДО ОТДАЧИ. Свойство пережило раздельную публикацию и стало проще: собирается
+# один образ, и упади сборка — в реестр не уходит ни одного вызова.
+#
+# ЧЕГО ЗДЕСЬ БОЛЬШЕ НЕТ И ПОЧЕМУ. Прежде сценарий стерёг свойство НАБОРА («дверь и раздача
+# собрались, пульт упал — не отдано ничего»), а рядом стоял 29o: два образа названы одинаково
+# → отказ, второй лёг бы поверх первого. Оба свойства были про тройку, которой больше нет.
+# Сверка имён между собой при этом не «стала не нужна» — она сменила владельца: это
+# cross-zone контракт, и держать его должен тот, кто владеет всеми тремя именами. Названо
+# вслух здесь и в шапке `release.sh`, чтобы пропажу не приняли за упрощение.
+part "29n. сборка упала → не отдано НИЧЕГО"
 STUB_HAVE_PROBE=1 STUB_BUILDER=fail \
-    run_case 1 "$HERE/release.sh"
-called "compose -f $HERE/compose.yaml build"   # дверь собралась
-called "share/compose.yaml build"              # и раздача — до пульта дошли
+    run_case 1 "$HERE/release.sh" --control
+said "не собрался"
 said "не отдано ничего"
 not_called "push"
 not_called "tag "
-
-part "29o. два образа названы одинаково → отказ: второй лёг бы поверх первого"
-STUB_WORLD_IMAGE=omnifield/world-control:dev \
-STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
-said "названы одинаково"
-not_called "push"
-not_called "compose -f $HERE/compose.yaml build"   # отказ ДО сборки
-
-# Сравниваются ВСЕ ПАРЫ, а не соседи по списку: совпасть могут любые двое из трёх, и пара
-# «дверь и раздача» ходит другим путём по коду, чем «дверь и контроллер».
-STUB_SHARE_IMAGE=ghcr.io/omnifield/world:latest \
-STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
-said "названы одинаково"
-not_called "push"
 
 # Имена образов принадлежат ЗОНАМ и спрашиваются у их файлов запуска. Копии в выпуске нет ни
 # у чужого имени (это стережёт 26e по всей зоне), ни у своего — а своё как раз и подмывает
@@ -1407,12 +1455,12 @@ kopii=$(grep -n 'omnifield/world' "$HERE/release.sh" || true)
 part "29q. имя раздачи взято У ЕЁ ЗОНЫ: сменилось умолчание — сменился адрес отдачи"
 STUB_SHARE_IMAGE=inaya.test/chuzhaya/razdacha:dev \
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
+    run_case 0 "$HERE/release.sh" --share
 called "push inaya.test/chuzhaya/razdacha:sha-abc1234"
 called "push inaya.test/chuzhaya/razdacha:latest"
 not_called "push ghcr.io/omnifield/world-share"
-called "push ghcr.io/omnifield/world:sha-abc1234"        # соседей это не сдвинуло
-said "ghcr.io и inaya.test"
+odin_obraz "раздача под чужим именем"
+said "inaya.test"
 
 # ================================================================== 29r…29u. ОКРУЖЕНИЕ
 # `WORLD2-114`. Зоны крутят своё имя подстановкой — ею поднимают названный выпуск вместо
@@ -1425,10 +1473,14 @@ said "ghcr.io и inaya.test"
 # поимённо — сценарий её зоны зеленел бы, а две другие двери остались бы открытыми; ровно
 # так эта находка и повторилась бы. Заглушка компоуза для этого подставляет переменные
 # по-настоящему (см. её `config`), иначе проверять было бы нечего.
-for peremennaya in WORLD_IMAGE SHARE_IMAGE CONTROL_IMAGE; do
-    part "29r. $peremennaya в окружении → выпуск ОТКАЗЫВАЕТ, в чужое имя не публикует"
+#
+# Спрашивать надо В ТОМ ВЫЗОВЕ, который эту зону и выпускает: за вызов уезжает один образ, и
+# чужая переменная в чужом вызове выпуску не видна вовсе — проверка мимо неё зеленела бы зря.
+for para in "WORLD_IMAGE --door" "SHARE_IMAGE --share" "CONTROL_IMAGE --control"; do
+    peremennaya="${para%% *}"; kl="${para##* }"
+    part "29r. $peremennaya в окружении → выпуск $kl ОТКАЗЫВАЕТ, в чужое имя не публикует"
     STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-        run_case 1 env "$peremennaya=chuzhoy.test/chuzhoe/imya:podstava" "$HERE/release.sh"
+        run_case 1 env "$peremennaya=chuzhoy.test/chuzhoe/imya:podstava" "$HERE/release.sh" "$kl"
     said "разные"
     said "$peremennaya"                       # отказ НАЗЫВАЕТ переменную, а не «что-то в окружении»
     not_called "push"                          # в реестр не ушло ничего
@@ -1438,9 +1490,9 @@ for peremennaya in WORLD_IMAGE SHARE_IMAGE CONTROL_IMAGE; do
     not_called "control/compose.yaml build"
 done
 
-part "29s. холостой ход при той же переменной: план по ФАЙЛАМ ЗАПУСКА, отказа нет"
+part "29s. холостой ход при той же переменной: план по ФАЙЛУ ЗАПУСКА, отказа нет"
 STUB_HAVE_PROBE=1 \
-    run_case 0 env WORLD_IMAGE=chuzhoy.test/chuzhoe/imya:podstava "$HERE/release.sh" --dry-run
+    run_case 0 env WORLD_IMAGE=chuzhoy.test/chuzhoe/imya:podstava "$HERE/release.sh" --door --dry-run
 said "не сделано НИЧЕГО"
 said "окружение уводит"                        # про увод сказано вслух
 said "ghcr.io/omnifield/world:sha-abc1234"     # а в плане — умолчание файла, не окружение
@@ -1466,8 +1518,24 @@ part "29u. пароля раздачи в окружении нет, а имя �
 [ -z "${SHARE_PASSWORD:-}" ] && good "пароля раздачи в окружении прогона нет" \
                              || skip "SHARE_PASSWORD задан в окружении — сценарий не проверяет ничего"
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh" --dry-run
+    run_case 0 "$HERE/release.sh" --share --dry-run
 said "ghcr.io/omnifield/world-share:sha-abc1234"
+
+# ================================================================== 29v. ГРАНИЦА ЗОНЫ
+# Правка в ЧУЖОЙ зоне не обязана мешать выпуску двери (`WORLD2-146`): тег утверждает про свой
+# образ, и чистота спрашивается по ЕГО перечню. Свойство парное, и краснеть должны обе
+# половины — проверь мы только «дверь выпускается», это зеленело бы и у выпуска, который
+# чистоту не проверяет вовсе.
+part "29v. грязь в share/ выпуску ДВЕРИ не мешает, а выпуску РАЗДАЧИ мешает"
+STUB_GIT_DIRTY_PATH=share STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/release.sh" --door
+called "push ghcr.io/omnifield/world:sha-abc1234"
+odin_obraz "дверь при грязной share"
+
+STUB_GIT_DIRTY_PATH=share STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh" --share
+said "не чист"
+not_called "push"
 
 # ================================================================== 30. ТОЧКА ВХОДА ОБРАЗА
 # `deploy/door-entry.sh` — то, что делает дверь ИЗНУТРИ образа: проверяет состояние,
@@ -1792,9 +1860,12 @@ esac
 #
 # Стережём здесь всю цепочку, а не «вписалось ли»:
 #
-#   · ОДНО МЕСТО вычисления. Два `rev-parse` в зоне — и тег со штампом разъедутся, а снаружи
+#   · ОДНО МЕСТО вычисления. Два счёта в зоне — и тег со штампом разъедутся, а снаружи
 #     это не отличить: оба выглядят правдой;
-#   · ЧЕСТНОЕ «версии нет». Нет гита, нет коммита, грязное дерево — штампа НЕТ ВОВСЕ. Ни
+#   · ОДИН ПЕРЕЧЕНЬ. С `WORLD2-146` версия принадлежит ОБРАЗУ и считается по тому, что в него
+#     едет. Перечень объявлен в `deploy/sostav.sh`, и по нему же сборка берёт исходник пульта:
+#     две копии перечня разъехались бы молча, и тег соврал бы про панель;
+#   · ЧЕСТНОЕ «версии нет». Нет гита, нет коммита, грязный перечень — штампа НЕТ ВОВСЕ. Ни
 #     `unknown`, ни пустого значения: приблизительная запись не отличима от измеренной и
 #     однажды уедет в тег (`WORLD2` 4.2 п. 5);
 #   · СВЕРКА ШТАМПА С ТЕГОМ до первой отдачи. Один источник — это хорошо, но проверять надо
@@ -1802,22 +1873,77 @@ esac
 
 part "32. версия считается в ОДНОМ месте — deploy/version.sh, и больше нигде в зоне"
 # Ищем не «есть ли version.sh», а не завёлся ли ВТОРОЙ счёт. Проба себя из поиска исключает:
-# в ней подставной гит, и `rev-parse` в нём — часть заглушки, а не второй источник.
-istochniki=$(grep -rl 'rev-parse' "$HERE" --include='*.sh' 2>/dev/null \
+# в ней подставной гит, и его ответы — часть заглушки, а не второй источник.
+#
+# Признаков теперь ДВА, и оба обязательны: `rev-parse` (репозиторий и наличие коммитов) и
+# `git log` (тот самый счёт по перечню). Оставь мы один — второй счёт завёлся бы соседним
+# способом и проверка зеленела бы: `git log -1` в чужом скрипте это ровно тот же дефект.
+istochniki=$(grep -rlE 'rev-parse|git .*log -1' "$HERE" --include='*.sh' 2>/dev/null \
              | grep -v 'probe-branching.sh' | sort || true)
 [ "$istochniki" = "$HERE/version.sh" ] \
     && good "версию из гита выводит ровно один файл зоны — deploy/version.sh" \
     || { bad "версия выводится из гита не в одном месте — тег и штамп разъедутся:"
          printf '%s\n' "$istochniki" >&2; }
 
-# vers_case ОЖИДАЕМЫЙ-КОД ОЖИДАЕМОЕ-СОСТОЯНИЕ ЧТО-НА-STDOUT ПЕРЕМЕННЫЕ… — прогон version.sh.
+# ПЕРЕЧЕНЬ — тоже в одном месте, и это вторая половина того же свойства. Счёт может быть
+# один, а перечней два — и тогда «из чего собрано» разъедется ровно так же, только тише.
+part "32-0. перечень образа объявлен в одном месте — deploy/sostav.sh"
+# Объявление ищем по самой форме объявления, а не по словам в комментариях: вторая копия
+# завелась бы именно присваиванием, а не пересказом.
+obyavleno=$(grep -rlE '^SOSTAV_(door|share|control)=' "$HERE" --include='*.sh' 2>/dev/null | sort || true)
+[ "$obyavleno" = "$HERE/sostav.sh" ] \
+    && good "перечни объявлены ровно в одном файле зоны — deploy/sostav.sh" \
+    || { bad "перечень образа объявлен не в одном месте — сборка и версия разъедутся:"
+         printf '%s\n' "$obyavleno" >&2; }
+
+# И главное: сборка НЕ ЗАШИВАЕТ путь пульта — она его СПРАШИВАЕТ. Иначе перечень остался бы
+# объявлением без читателя (`WORLD2` 0.3 п. 5), а порча «убрать web из перечня» прошла бы
+# зелёной: версия перестала бы замечать панель, а собиралась бы та же самая.
+zashito=$(grep -nE '\$\{?ROOT\}?/web\b' "$HERE/build.sh" 2>/dev/null \
+          | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+[ -z "$zashito" ] && good "сборка не зашивает путь пульта — берёт его из перечня" \
+                  || { bad "в сборке остался зашитый путь пульта — перечень ему не указ:"
+                       printf '%s\n' "$zashito" >&2; }
+grep -q 'sostav_pult' "$HERE/build.sh" \
+    && good "сборка спрашивает путь пульта у перечня — один список на сборку и на версию" \
+    || bad "сборка не спрашивает путь пульта у sostav.sh — перечень остался без читателя"
+
+# ПОРЧА, ПРОГНАННАЯ ПРОБОЙ, а не только руками (`WORLD2-146`, порча 1). Убираем `web` из
+# перечня контроллера во ВРЕМЕННОЙ копии зоны и смотрим, покраснеет ли. Настоящие файлы не
+# трогаем вовсе: проба, которая правит рабочую копию ради своего сценария, однажды съест
+# чужую работу.
+part "32-0b. порча: web/ убран из перечня контроллера → зона краснеет, а не молчит"
+PORCHA="$STUB_DIR/porcha"
+mkdir -p "$PORCHA"
+cp "$HERE/sostav.sh" "$HERE/version.sh" "$PORCHA/"
+# Убираем строку `web` из объявления контроллера — ровно так это и сломали бы по невниманию.
+sed -i "/^SOSTAV_control='control$/,/^SOSTAV_ZOVEM_control/{/^web$/d}" "$PORCHA/sostav.sh"
+if grep -qE "^web$" "$PORCHA/sostav.sh"; then
+    bad "порчу не удалось внести — сценарий ничего не проверил"
+else
+    porcha_out="$("$PORCHA/version.sh" --control 2>&1)"
+    porcha_code=$?
+    porcha_state="$(printf '%s\n' "$porcha_out" | sed -n 's/^VERSION-STATE: //p' | head -n1)"
+    if [ "$porcha_code" = 1 ] && [ "$porcha_state" = no-pult ]; then
+        good "перечень без пульта — отказ no-pult, версия не считается вовсе"
+    else
+        bad "перечень без пульта прошёл ЗЕЛЁНЫМ (код $porcha_code, состояние «${porcha_state:-нет}») — это дыра, ради которой правило написано"
+        printf '%s\n' "$porcha_out" >&2
+    fi
+fi
+rm -rf "$PORCHA"
+
+# vers_case ОБРАЗ КОД СОСТОЯНИЕ ЧТО-НА-STDOUT ПЕРЕМЕННЫЕ… — прогон version.sh.
 # Стережём КОД СОСТОЯНИЯ, а не формулировку: проба, привязанная к буквам, зеленеет на верной
 # правке и учит не трогать текст (`WORLD2` 4.2).
+#
+# ОБРАЗ НАЗЫВАЕТСЯ ПЕРВЫМ АРГУМЕНТОМ, и это не украшение подписи: версия принадлежит образу
+# (`WORLD2-146`), и «версии зоны» больше нет как понятия — спросить её без образа нельзя.
 VERR="$STUB_DIR/verr"
 vers_case() {
-    local want_code="$1" want_state="$2" want_out="$3"; shift 3
+    local obraz="$1" want_code="$2" want_state="$3" want_out="$4"; shift 4
     local out code state
-    out="$(env "$@" "$HERE/version.sh" 2>"$VERR")"
+    out="$(env "$@" "$HERE/version.sh" "--$obraz" 2>"$VERR")"
     code=$?
     state="$(sed -n 's/^VERSION-STATE: //p' "$VERR" | head -n1)"
     [ "$code" = "$want_code" ] && good "код возврата $code" \
@@ -1834,19 +1960,62 @@ vers_case() {
                              || bad "на stdout «$out», ждали «${want_out:-ничего}»"
 }
 
-part "32a. дерево чисто → версия есть, и это единственный случай, когда она печатается"
-vers_case 0 "" "sha-abc1234"
+part "32a. перечень чист → версия есть, и это единственный случай, когда она печатается"
+vers_case door    0 "" "sha-abc1234"
+vers_case share   0 "" "sha-abc1234"
+vers_case control 0 "" "sha-abc1234"
 
-part "32b. дерево грязное → версии НЕТ: коммит на месте, а собрано будет не из него"
-vers_case 1 dirty "" STUB_GIT_DIRTY=1
+part "32b. перечень грязен → версии НЕТ: коммит на месте, а собрано будет не из него"
+vers_case door 1 dirty "" STUB_GIT_DIRTY=1
 
-part "32c. не репозиторий · нет коммитов · нет гита — три разных состояния, три кода"
-vers_case 1 not-a-repo "" STUB_GIT_REPO=
-vers_case 1 no-commit  "" STUB_GIT_SHA=
+# ┌──────────────────────────────────────────────────────────────────────────────────────┐
+# │ ГЛАВНАЯ ПРОВЕРКА ЗАДАЧИ `WORLD2-146` — ради неё правило и написано.                    │
+# │                                                                                       │
+# │ В образ КОНТРОЛЛЕРА едет пульт, а пульт живёт в `web/`. Возьми версия «последний       │
+# │ коммит по `control/`» — выпуск отдал бы контроллер с новой панелью под СТАРЫМ тегом, и │
+# │ поймать это было бы нечем: и тег, и штамп выглядели бы правдой.                        │
+# │                                                                                       │
+# │ Проверяется это парой, а не одним «версия контроллера сдвинулась»: сдвиг у всех трёх   │
+# │ означал бы, что мы вернулись к `HEAD` и просто не заметили.                            │
+# └──────────────────────────────────────────────────────────────────────────────────────┘
+part "32a2. правка ТОЛЬКО в web/ двигает версию контроллера — и НЕ двигает дверь и раздачу"
+vers_case control 0 "" "sha-web1111" STUB_GIT_TOUCHED=web:web1111
+vers_case door    0 "" "sha-abc1234" STUB_GIT_TOUCHED=web:web1111
+vers_case share   0 "" "sha-abc1234" STUB_GIT_TOUCHED=web:web1111
+
+# Обратная сторона того же: правка в `share/` не сдвигает дверь. Раньше сдвигала — версию
+# считали от `HEAD`, и тег двери менялся от чужой работы.
+part "32a3. правка ТОЛЬКО в share/ не двигает версию двери, а раздачу двигает"
+vers_case share 0 "" "sha-shr2222" STUB_GIT_TOUCHED=share:shr2222
+vers_case door  0 "" "sha-abc1234" STUB_GIT_TOUCHED=share:shr2222
+
+# Чистота — тоже по перечню, и это та же граница с другой стороны: грязь у соседа выпуску
+# двери не мешает, а своя мешает.
+part "32a4. грязь в share/ — раздаче отказ, двери версия"
+vers_case share 1 dirty ""            STUB_GIT_DIRTY_PATH=share
+vers_case door  0 ""    "sha-abc1234" STUB_GIT_DIRTY_PATH=share
+
+part "32c. не репозиторий · нет коммитов · перечня не касался никто · нет гита"
+vers_case door 1 not-a-repo     "" STUB_GIT_REPO=
+vers_case door 1 no-commit      "" STUB_GIT_SHA=
+# «Коммитов нет вовсе» и «перечня этого образа не касался ни один коммит» — разные состояния
+# и чинятся по-разному: первое коммитом любым, второе коммитом ИМЕННО в этот образ.
+vers_case share 1 not-in-history "" STUB_GIT_NOHIST=share
+# Образ обязаны НАЗВАТЬ: умолчание здесь означало бы «версия репозитория» — понятие, которого
+# больше не существует.
+verr_out="$("$HERE/version.sh" 2>"$VERR")"; verr_code=$?
+if [ "$verr_code" = 1 ] \
+   && [ "$(sed -n 's/^VERSION-STATE: //p' "$VERR" | head -n1)" = no-image ] \
+   && [ -z "$verr_out" ]; then
+    good "без образа — код 1, состояние no-image, на stdout ничего"
+else
+    bad "версия без образа ответила не тем (код $verr_code): «$verr_out»"; tail -n 3 "$VERR" >&2
+fi
 # Гита нет ВОВСЕ: прогоняем с пустым `PATH`. Файл обязан дойти до ответа и на такой машине —
-# поэтому в нём нет ни одной внешней команды, кроме самого гита. Зовём своим bash: у
-# `#!/usr/bin/env bash` без PATH не нашлось бы даже интерпретатора.
-env PATH=/nonexistent "$BASH" "$HERE/version.sh" >"$STUB_DIR/vout" 2>"$VERR"
+# поэтому в нём нет ни одной внешней команды, кроме самого гита (перечень он ПОДКЛЮЧАЕТ, а не
+# запускает: запуск потребовал бы `env` из `PATH`). Зовём своим bash: у `#!/usr/bin/env bash`
+# без PATH не нашлось бы даже интерпретатора.
+env PATH=/nonexistent "$BASH" "$HERE/version.sh" --door >"$STUB_DIR/vout" 2>"$VERR"
 vers_nogit=$?
 if [ "$vers_nogit" = 1 ] \
    && [ "$(sed -n 's/^VERSION-STATE: //p' "$VERR" | head -n1)" = no-git ] \
@@ -1859,7 +2028,7 @@ fi
 part "32d. штатная сборка вписывает версию в образ — ту же, что уедет в тег"
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh"
-said "версия сборки sha-abc1234"
+said "версия образа sha-abc1234"
 said "версия вписана в образ"
 # Штамп ставится ПОВЕРХ готового образа, и значение приходит потоком — заглушка кладёт поток
 # в журнал. Смотрим и на то, ЧТО вписано, и на то, ВО ЧТО вписано.
@@ -1877,6 +2046,19 @@ STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh" --control
 called "STDIN FROM omnifield/world-control:dev"
 not_called "STDIN FROM ghcr.io/omnifield/world:latest"
+
+# ШТАМПУЕТСЯ ВЕРСИЯ СВОЕГО ОБРАЗА, а не одна на прогон. Порча ровно здесь и пряталась бы:
+# сборка контроллера, вписывающая версию двери, выглядит нормально во всём остальном.
+part "32e2. сборка штампует версию СВОЕГО образа — правка в web/ видна только контроллеру"
+STUB_GIT_TOUCHED=web:web1111 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh" --control
+called "STDIN ENV WORLD_VERSION=sha-web1111"
+not_called "STDIN ENV WORLD_VERSION=sha-abc1234"
+
+STUB_GIT_TOUCHED=web:web1111 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 0 "$HERE/build.sh"
+called "STDIN ENV WORLD_VERSION=sha-abc1234"
+not_called "STDIN ENV WORLD_VERSION=sha-web1111"
 
 # Пульт образом не является — штамповать там нечего, и лишний вызов означал бы, что сборка
 # метит не то, что сложила.
@@ -1901,16 +2083,18 @@ grep -qi 'unknown' "$STUB_DIR/out" \
     && { bad "сборка сказала «unknown» вместо «версии нет»"; grep -i 'unknown' "$STUB_DIR/out" >&2; } \
     || good "и вслух сборка «unknown» не произносит"
 
-part "32h. дерево грязное → тот же ответ: честной версии нет, штампа нет"
+part "32h. перечень грязен → тот же ответ: честной версии нет, штампа нет"
 STUB_GIT_DIRTY=1 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh"
 said "версии нет"
-said "не чисто"
+said "не чист"
 not_called "STDIN ENV WORLD_VERSION"
 
+# СВЕРКА ШТАМПА С ТЕГОМ ОСТАЁТСЯ И СТОИТ ДО ПЕРВОГО `push` — `WORLD2-146` оговаривает это
+# прямо: раздельная публикация сняла общий тег, но не сняла вопроса «а тот ли это образ».
 part "32i. выпуск сверяет штамп с тегом — разъехались → отказ, в реестр НЕ ушло ничего"
 STUB_STAMP=sha-9999999 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
+    run_case 1 "$HERE/release.sh" --door
 said "разъехались"
 said "sha-9999999"                         # названы ОБА значения, а не «что-то не сошлось»
 said "sha-abc1234"
@@ -1919,21 +2103,33 @@ not_called "tag "
 
 part "32j. образ без штампа → выпуск отказывает: тег утверждал бы больше, чем правда"
 STUB_STAMP= STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 1 "$HERE/release.sh"
+    run_case 1 "$HERE/release.sh" --door
 said "не знает своей версии"
 not_called "push"
 not_called "tag "
 
-part "32k. штатный выпуск: сверка была, и спрошено у ВСЕХ ТРЁХ образов"
+part "32k. штатный выпуск: сверка была, и спрошено у ТОГО образа, что выпускают"
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
-    run_case 0 "$HERE/release.sh"
+    run_case 0 "$HERE/release.sh" --door
 called "image inspect --format .*Config.Env.* ghcr.io/omnifield/world:latest"
-called "image inspect --format .*Config.Env.* ghcr.io/omnifield/world-share:latest"
-called "image inspect --format .*Config.Env.* omnifield/world-control:dev"
-# Сверка стоит ДО первой отдачи: отказ на ней не должен оставлять в реестре часть набора.
+not_called "image inspect --format .*Config.Env.* ghcr.io/omnifield/world-share"
+not_called "image inspect --format .*Config.Env.* omnifield/world-control"
+# Сверка стоит ДО первой отдачи: отказ на ней не должен оставлять в реестре ни одного тега.
 n_sverka=$(grep -n 'image inspect --format .*Config.Env' "$STUB_LOG" | head -n1 | cut -d: -f1)
 n_push=$(grep -n '^push ' "$STUB_LOG" | head -n1 | cut -d: -f1)
 ranshe "штамп сверен раньше первой отдачи" "$n_sverka" "$n_push"
+
+# И у двух остальных — своим ключом: сверка живёт в одном месте кода, но путь до неё у каждого
+# образа свой, и «работает у двери» тут ничего не доказывает.
+STUB_STAMP=sha-9999999 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh" --share
+said "разъехались"
+not_called "push"
+
+STUB_STAMP=sha-9999999 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/release.sh" --control
+said "разъехались"
+not_called "push"
 
 # ================================================================== итог
 part "── итог"

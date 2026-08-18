@@ -89,12 +89,10 @@ type Options struct {
 	Docker      string
 	KeysDir     string
 	DoorPort    int
-	// Version — своя версия сборки (`WORLD_VERSION`): ею контроллер пинит вещи, которые
-	// ставит (`WORLD2-130`). Пусто — версии нет, и подъём говорит об этом вслух.
-	Version string
-	// Named — подстановки имени образа, названные хозяином снаружи. Явное слово юзера
-	// старше нашего пина (`WORLD2` 0.1).
-	Named map[string]string
+	// СВОЕЙ ВЕРСИИ СБОРКИ ЗДЕСЬ НЕТ (`WORLD2-146`): ручкам она не нужна, потому что вещи
+	// поднимаются тем, что назвал рецепт, а не тем, чем собран контроллер. Своя версия
+	// называется там, где она про кого-то — в журнале подъёма самого контроллера.
+	//
 	// ScopeTimeout — сколько секунд ждём ответа раздачи скоупа.
 	ScopeTimeout int
 	// SSHTimeout — сколько секунд ждём машину, когда заходим на неё ПАРОЛЕМ, чтобы завести
@@ -155,8 +153,6 @@ func New(opt Options) *Handler {
 			Docker:   opt.Docker,
 			KeysDir:  opt.KeysDir,
 			Port:     opt.DoorPort,
-			Version:  opt.Version,
-			Named:    opt.Named,
 			Logf:     opt.Logf,
 		},
 		recipes: recipes,
