@@ -392,10 +392,28 @@ cmd_up() {
     # (`ghcr.io/omnifield/world:latest`, `WORLD2-121`) — и предупреждение начало врать при
     # правильно названном образе на месте, то есть учить человека не читать предупреждения.
     # То же самое и тем же способом делает точка входа образа.
-    local door_image
-    door_image="$(docker compose -f "$ROOT/deploy/compose.yaml" config --images 2>/dev/null | head -n1)"
-    if [ -z "$door_image" ]; then
-        warn "имя образа двери не спросить у $ROOT/deploy/compose.yaml — не проверил, есть ли он здесь"
+    # ПУСТОЙ ОТВЕТ БЫВАЕТ ДВУХ РОДОВ, И ПУТАТЬ ИХ НЕЛЬЗЯ (`WORLD2-145`). `docker compose
+    # config` — это всё или ничего: рецепт, который не читается целиком, отдаёт ровно ту же
+    # пустоту, что рецепт без образов. Заглушённый стдерр здесь уже стоил нам мёртвой
+    # проверки в точке входа образа — та же правка и по той же причине сделана там.
+    #
+    # Трубы здесь НЕТ намеренно: код возврата у трубы принадлежит последнему её звену, и
+    # `config --images | head` вернул бы успех `head` даже при отказе компоуза — то есть
+    # различение, ради которого правка и сделана, снова было бы мёртвым.
+    local door_image door_err door_why door_code=0
+    door_err="$(mktemp)"
+    door_image="$(docker compose -f "$ROOT/deploy/compose.yaml" config --images 2>"$door_err")" || door_code=$?
+    # `|| true` здесь не украшение: у скрипта включён `pipefail`, а `grep` без совпадений
+    # выходит с единицей — то есть пустой стдерр или пустой вывод обрывали бы весь подъём.
+    door_why="$(grep -v '^[[:space:]]*$' "$door_err" | tail -n1 || true)"
+    rm -f "$door_err"
+    door_image="$(printf '%s\n' "$door_image" | grep -v '^[[:space:]]*$' | head -n1 || true)"
+    if [ "$door_code" -ne 0 ]; then
+        warn "рецепт двери $ROOT/deploy/compose.yaml НЕ ЧИТАЕТСЯ — образ двери проверить нечем"
+        detail "компоуз сказал: ${door_why:-компоуз вышел с кодом $door_code и промолчал}"
+        detail "это НЕ «образа нет»: файл не разобран целиком, и имени образа в нём не назвал никто"
+    elif [ -z "$door_image" ]; then
+        warn "рецепт двери прочитан, а образа в нём не названо — не проверил, есть ли он здесь"
         detail "своей копии имени в этой зоне нет намеренно: она разъехалась бы с оригиналом молча"
     elif ! docker image inspect "$door_image" >/dev/null 2>&1; then
         warn "образа двери $door_image на этой машине нет"
