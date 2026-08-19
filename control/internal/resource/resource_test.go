@@ -223,12 +223,12 @@ func TestПодъёмЗовётГотовыйИНазываетРецептВс�
 func TestОтказСоседаДоезжаетСвоимКодом(t *testing.T) {
 	m, _, _ := стенд(t, func(c run.Command) (run.Result, error) {
 		if strings.HasSuffix(c.Name, "remote.sh") {
-			return run.Result{Code: 1, Out: "REMOTE-REFUSAL: no-image\n", Err: "отказ: образа двери на машине нет\n  выход: docker pull …\n"}, nil
+			return run.Result{Code: 1, Out: "REMOTE-REFUSAL: docker-install-no-net\n", Err: "отказ: машина не достала до установщика докера\n  выход: подними своё зеркало: WORLD_DOCKER_INSTALL_URL=…\n"}, nil
 		}
 		return докерОтвечает(c)
 	})
 	ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil)
-	if ref == nil || ref.Code != "no-image" {
+	if ref == nil || ref.Code != "docker-install-no-net" {
 		t.Fatalf("код соседа не доехал своим: %+v", ref)
 	}
 	if ref.From != "deploy/remote.sh" || len(ref.Ways) == 0 {
@@ -245,7 +245,7 @@ func TestСнятиеТогоЧегоПодъёмНеНашлоНеЗапира�
 		}
 		return докерОтвечает(c)
 	})
-	dropped, ref := m.Lower(context.Background(), "vps", рецептДвери, "", false, false)
+	dropped, ref := m.Lower(context.Background(), "vps", рецептДвери, "", nil, false, false)
 	if ref != nil {
 		t.Fatalf("снятие уперлось в отказ и заперло участок: %+v", ref)
 	}
@@ -256,7 +256,7 @@ func TestСнятиеТогоЧегоПодъёмНеНашлоНеЗапира�
 
 func TestСнятиеНазываетЧтоОсталось(t *testing.T) {
 	m, fake, _ := стенд(t, докерОтвечает)
-	dropped, ref := m.Lower(context.Background(), "vps", рецептДвери, "door", false, false)
+	dropped, ref := m.Lower(context.Background(), "vps", рецептДвери, "door", nil, false, false)
 	if ref != nil {
 		t.Fatal(ref.Why)
 	}
@@ -291,5 +291,51 @@ func TestАдресМашиныПроверяетсяРовноНастольк�
 	host, port, ref := CheckAddr("world@10.8.0.5:2222")
 	if ref != nil || host != "10.8.0.5" || port != 2222 {
 		t.Fatalf("адрес с портом разобран не так: %s %d %+v", host, port, ref)
+	}
+}
+
+// ── метка пути: слово соседа, довезённое дословно ────────────────────────────
+
+// Контроллер НЕ ТОЛКУЕТ путь и своего словаря не заводит: перечень путей принадлежит
+// соседу. Проверяется поэтому не «узнал ли он `image-copy`», а то, что мимо метки не
+// проходит ничего и что через метку проходит ЛЮБОЕ слово, включая незнакомое.
+func TestМеткаПутиДовозитсяДословноИТолькоОна(t *testing.T) {
+	m, _, _ := стенд(t, func(c run.Command) (run.Result, error) {
+		if strings.HasSuffix(c.Name, "remote.sh") && c.OnLine != nil {
+			c.OnLine("REMOTE-PATH: image-copy")
+			c.OnLine("REMOTE-REFUSAL: no-daemon") // не путь — это код отказа
+			c.OnLine("  ✓ образ поехал")          // не путь — это слова человеку
+			c.OnLine("REMOTE-PATH: путь-которого-мы-не-знаем")
+			c.OnLine("REMOTE-PATH:   ") // пустое имя пути — не путь
+			return run.Result{}, nil
+		}
+		return докерОтвечает(c)
+	})
+	var пути []string
+	m.OnPath = func(_, path string) { пути = append(пути, path) }
+
+	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
+		t.Fatal(ref.Why)
+	}
+	if len(пути) != 2 || пути[0] != "image-copy" || пути[1] != "путь-которого-мы-не-знаем" {
+		t.Fatalf("метка разобрана не дословно либо мимо неё прошло лишнее: %q", пути)
+	}
+}
+
+// Снятие несёт ТЕ ЖЕ значения, что подъём: рецепт собирает из них имя проекта, контейнера
+// и тома. Снять без них значит снять вещь ПО УМОЛЧАНИЮ — то есть соседнюю.
+func TestСнятиеВезётЗначенияРецепта(t *testing.T) {
+	m, fake, _ := стенд(t, докерОтвечает)
+	if _, ref := m.Lower(context.Background(), "vps", рецептДвери, "", []string{"SHARE_NAME=vps-8071"}, false, false); ref != nil {
+		t.Fatal(ref.Why)
+	}
+	var env []string
+	for i := range fake.Calls() {
+		if strings.Contains(fake.Line(i), "remote.sh drop") {
+			env = fake.Calls()[i].Env
+		}
+	}
+	if !есть(env, "SHARE_NAME=vps-8071") || !есть(env, "WORLD_PORT=8080") {
+		t.Fatalf("значения не доехали до снятия: %v", env)
 	}
 }

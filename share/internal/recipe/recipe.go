@@ -31,6 +31,9 @@ import (
 // причина и выход обязательны (`WORLD2` 2.3). Сторож, говорящий «строка 66 плохая», —
 // это молчание с номером.
 type Finding struct {
+	// Line — строка файла, 1-based. Ноль значит, что находка про ФАЙЛ ЦЕЛИКОМ: не «вот
+	// эта строка плохая», а «нужной строки в файле нет вовсе» (так краснеет пропавшее имя
+	// проекта). Показывать «строка 0» человеку нельзя — он пойдёт её искать.
 	Line int
 	Text string
 	Why  string
@@ -38,6 +41,9 @@ type Finding struct {
 }
 
 func (f Finding) String() string {
+	if f.Line == 0 {
+		return fmt.Sprintf("%s\n      выход: %s", f.Why, f.Way)
+	}
 	return fmt.Sprintf("строка %d: %s\n      строка: %s\n      выход: %s", f.Line, f.Why, strings.TrimSpace(f.Text), f.Way)
 }
 
