@@ -299,12 +299,18 @@ case "$cmd" in
 
     # Вопрос «есть ли докер вообще».
     *"WORLD-PROBE docker="*)
-        [ "${STUB_PROBE_MUTE:-0}" = 1 ] && exit 0
+        # Два РАЗНЫХ несчастья, и заглушка их различает: машина оборвала связь — и машина
+        # ответила, да не о том (так отвечает чужая оболочка юзера: fish, csh).
+        [ "${STUB_PROBE_DIES:-0}" = 1 ] && { printf 'Connection closed by remote host\n' >&2; exit 255; }
+        [ "${STUB_PROBE_ALIEN:-0}" = 1 ] && { printf 'fish: Unknown command: command\n'; exit 0; }
         printf 'WORLD-PROBE docker=%s\n' "${STUB_REMOTE_DOCKER_CLI:-no}"; exit 0 ;;
 
     # Вопрос «чем ставить»: права, чем скачать и достаёт ли машина до установщика.
     *"WORLD-PROBE root="*)
-        [ "${STUB_PROBE_MUTE:-0}" = 1 ] && exit 0
+        # Два РАЗНЫХ несчастья, и заглушка их различает: машина оборвала связь — и машина
+        # ответила, да не о том (так отвечает чужая оболочка юзера: fish, csh).
+        [ "${STUB_PROBE_DIES:-0}" = 1 ] && { printf 'Connection closed by remote host\n' >&2; exit 255; }
+        [ "${STUB_PROBE_ALIEN:-0}" = 1 ] && { printf 'fish: Unknown command: command\n'; exit 0; }
         printf 'WORLD-PROBE root=%s sudo=%s fetch=%s net=%s\n' \
             "${STUB_REMOTE_ROOT:-yes}" "${STUB_REMOTE_SUDO:-no}" \
             "${STUB_REMOTE_FETCH:-curl}" "${STUB_REMOTE_NET:-yes}"; exit 0 ;;
@@ -886,9 +892,20 @@ red() {
         -- add vps --addr world@10.8.0.5
     # Машина замолчала между проверкой доступа и вопросом про докер — это третье состояние,
     # и выдавать его за «докера нет» нельзя: мы бы полезли ставить докер вслепую.
-    want_refusal access-denied "машина замолчала на вопросе про докер" \
-        "${CHISTAYA[@]}" STUB_PROBE_MUTE=1 \
+    want_refusal access-denied "машина оборвала связь на вопросе про докер" \
+        "${CHISTAYA[@]}" STUB_PROBE_DIES=1 \
         -- add vps --addr world@10.8.0.5
+    # А это ЧЕТВЁРТОЕ: машина ответила, но не о докере. Так отвечает чужая оболочка юзера
+    # (fish, csh) — не поломка связи и не отсутствие докера, и чинится оно третьим действием.
+    want_refusal bad-remote-answer "машина ответила, но не о докере" \
+        "${CHISTAYA[@]}" STUB_PROBE_ALIEN=1 \
+        -- add vps --addr world@10.8.0.5
+    if has "$INSTALL_URL"; then
+        bad "докер ставится вслепую на машину, которая нам не ответила" "$JOURNAL" \
+            "мы не знаем, есть там докер или нет: ставить поверх чужого — прямое нарушение границы"
+    else
+        ok "непонятный ответ — докер не ставится вслепую"
+    fi
     # Реестр отказал — это СВОЯ ступень, а не «образ не доехал»: чинится она не повтором
     # передачи, а доступом той машины к реестру либо открытием пакета.
     want_refusal image-pull-failed "ресурсу не дают притянуть образ из реестра" \

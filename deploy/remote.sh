@@ -183,7 +183,8 @@ usage() {
 Отказ печатается двумя строками: причина и выход — человеку, `REMOTE-REFUSAL: <код>` —
 машине. Коды: no-name · bad-name · no-address · bad-address · no-recipe · bad-recipe ·
 recipe-no-image · no-docker · no-daemon · no-compose · no-ssh · access-denied ·
-no-remote-docker · remote-docker-denied · docker-install-denied · docker-install-no-fetch ·
+no-remote-docker · remote-docker-denied · bad-remote-answer · docker-install-denied ·
+docker-install-no-fetch ·
 docker-install-no-net · docker-install-failed · docker-install-silent · image-send-failed ·
 image-pull-failed · no-network · port-busy · up-failed · thing-silent · no-such-resource ·
 down-failed · context-failed.
@@ -455,7 +456,8 @@ ensure_remote_docker() {
     # трое разных: докера нет вовсе (ставит мир) · докер стоит, а прав говорить с ним нет
     # (хозяин машины) · докер стоит, а демон молчит (хозяин машины). Схлопнуть их в одно
     # «докер не отвечает» значит отправить чинить не туда (`WORLD2` 2.3).
-    remote_run "$PROBE_DOCKER" || true
+    local probe_rc=0
+    remote_run "$PROBE_DOCKER" || probe_rc=$?
     case "$REMOTE_SAID" in
         *"WORLD-PROBE docker=yes"*)
             # ДОКЕР ЕСТЬ — и мир его не трогает. Ни ставит поверх, ни чинит, ни заменяет.
@@ -475,9 +477,18 @@ ensure_remote_docker() {
         *"WORLD-PROBE docker=no"*)
             install_remote_docker ;;
         *)
-            # Машина ответила не то, о чём спрашивали, — значит связь оборвалась между
-            # проверкой доступа и этим вопросом. Не «докера нет» и не «докер есть»: третье.
+            # Ни «да», ни «нет». Здесь два РАЗНЫХ состояния, и валить их в одно нельзя:
+            # машина не ответила вовсе (связь) — и машина ответила, но не тем, о чём
+            # спрашивали. Второе — не поломка связи: так отвечает машина, у которой оболочка
+            # юзера не понимает обычных слов (`fish`, `csh` и подобные). Гадать между ними
+            # значило бы полезть ставить докер вслепую на машину, где он, может быть, есть.
             detail "${REMOTE_SAID:-(ssh промолчал)}"
+            [ "$probe_rc" -eq 0 ] && refuse bad-remote-answer \
+                "ресурс $ADDR ответил, но не о докере — понять, есть он там или нет, нечем" \
+                "чаще всего это оболочка юзера на той машине: она не разбирает обычные слова (fish, csh)" \
+                "назови в адресе юзера с обычной оболочкой: --addr <другой>@$HOST" \
+                "либо поставь докер сам — мир его не тронет: https://docs.docker.com/engine/install/" \
+                "это НЕ «докера нет» и НЕ «машина молчит»: она ответила, и ответ не про то"
             refuse access-denied \
                 "ресурс $ADDR перестал отвечать по ssh — спросить его про докер не вышло" \
                 "проверь связь: ssh -p $SSH_PORT $(ssh_target) true" \
@@ -506,10 +517,16 @@ install_remote_docker() {
 
     # Чем ставить — спрашиваем машину ОДНИМ вопросом. Каждая непригодность отказывает своим
     # кодом: «нет прав» и «не достала до сети» — разные состояния, и второе законно.
-    remote_run "$(probe_ready_cmd)" || true
+    local probe_rc=0
+    remote_run "$(probe_ready_cmd)" || probe_rc=$?
     local answer; answer="$(printf '%s\n' "$REMOTE_SAID" | sed -n 's/.*WORLD-PROBE //p' | head -n1)"
     if [ -z "$answer" ]; then
         detail "${REMOTE_SAID:-(ssh промолчал)}"
+        [ "$probe_rc" -eq 0 ] && refuse bad-remote-answer \
+            "ресурс $ADDR ответил, но не о том, чем ставить докер" \
+            "чаще всего это оболочка юзера на той машине: она не разбирает обычные слова (fish, csh)" \
+            "назови в адресе юзера с обычной оболочкой: --addr <другой>@$HOST" \
+            "либо поставь докер сам — мир его не тронет: https://docs.docker.com/engine/install/"
         refuse access-denied \
             "ресурс $ADDR перестал отвечать по ssh — спросить его, чем ставить докер, не вышло" \
             "проверь связь: ssh -p $SSH_PORT $(ssh_target) true" \
