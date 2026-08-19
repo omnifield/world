@@ -9,6 +9,7 @@
 //	POST   /api/session            вход: АДРЕС и ПАРОЛЬ, и больше ничего
 //	DELETE /api/session            выход: времянки контроллера снимаются
 //	GET    /api/me                 кто я сейчас
+//	GET    /api/progress           каким путём идёт начатое ПРЯМО СЕЙЧАС — до того, как оно кончилось
 //	GET    /api/resources          территории юзера: имя, адрес, отвечает ли, что на ней стоит
 //	POST   /api/resources          завести территорию — на ней встаёт вещь, названная рецептом
 //	DELETE /api/resources/{имя}    снять территорию; в ответе — что осталось на той машине
@@ -46,11 +47,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/omnifield/world/control/internal/creds"
+	"github.com/omnifield/world/control/internal/progress"
 	"github.com/omnifield/world/control/internal/pult"
 	"github.com/omnifield/world/control/internal/recipe"
 	"github.com/omnifield/world/control/internal/refusal"
@@ -65,11 +68,26 @@ import (
 // можно, иначе проверять его придётся только глазами через пульт.
 const cookieName = "control-session"
 
-// sharePasswordEnv — имя, которым пароль скоупа уезжает подъёму РАЗДАЧИ. Это ШОВ с зоной
-// `share`: значение принадлежит её рецепту (`share/compose.yaml`), а не нам, и повтор
-// стережётся пробой. Знать про раздачу контроллеру приходится ровно здесь и ровно одно:
-// заведение скоупа — это подъём раздачи, а пароль называет тот, кто её поднимает.
-const sharePasswordEnv = "SHARE_PASSWORD"
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ТРИ ЗНАЧЕНИЯ, КОТОРЫЕ КОНТРОЛЛЕР НАЗЫВАЕТ ПОДЪЁМУ РАЗДАЧИ. ЭТО ШОВ С ЗОНОЙ `share`.   │
+// │                                                                                      │
+// │ Имена принадлежат ЕЁ рецепту (`share/compose.yaml`), а не нам: ими рецепт с нами и    │
+// │ разговаривает. Повтор стережётся пробой — переименуй их сосед молча, и раздача встала │
+// │ бы с умолчаниями вместо того, что назвал юзер.                                        │
+// │                                                                                      │
+// │ Знать про раздачу контроллеру приходится ровно это и ровно здесь: заведение скоупа —  │
+// │ подъём раздачи, а адрес и пароль называет тот, кто её поднимает.                       │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+const (
+	// sharePasswordEnv — пароль скоупа. Им закрыта раздача, и внутри файла состояния его
+	// нет: запирать ключ внутри замка нельзя (`WORLD2` 3.4).
+	sharePasswordEnv = "SHARE_PASSWORD"
+	// shareNameEnv — имя проекта, контейнера и тома раздачи. Разное у разных скоупов на
+	// одной машине — иначе второй сядет поверх первого.
+	shareNameEnv = "SHARE_NAME"
+	// sharePortEnv — публикация раздачи. Тот порт, который юзер назвал в адресе скоупа.
+	sharePortEnv = "SHARE_PORT"
+)
 
 // Options — всё, что контроллеру дают снаружи. Ни одного значения ручки не выдумывают
 // сами: подменяемость — то, чем проба проверяет поведение там, где нет ни докера, ни
@@ -115,6 +133,9 @@ type Handler struct {
 	recipes *recipe.Catalog
 	pult    *pult.Handler
 	mux     *http.ServeMux
+	// live — ход текущего действия. Не состояние контроллера, а то, что ждущий вправе
+	// прочитать ПОКА он ждёт (`internal/progress`).
+	live *progress.Live
 
 	mu   sync.Mutex
 	sess *session
@@ -144,6 +165,7 @@ func New(opt Options) *Handler {
 	}
 
 	recipes := &recipe.Catalog{Dir: opt.RecipesDir, Door: opt.DoorRecipe}
+	live := &progress.Live{Now: opt.Now}
 	h := &Handler{
 		opt: opt,
 		res: &resource.Manager{
@@ -154,9 +176,14 @@ func New(opt Options) *Handler {
 			KeysDir:  opt.KeysDir,
 			Port:     opt.DoorPort,
 			Logf:     opt.Logf,
+			// Метка пути соседа уходит отсюда прямо в ход действия — той же горутиной, что
+			// её прочитала. Через ответ ручки её было бы не довезти: ответ приходит, когда
+			// путь уже пройден (`WORLD2-150` B2).
+			OnPath: func(_, path string) { live.Path(path) },
 		},
 		recipes: recipes,
 		pult:    pult.New(opt.PultDir),
+		live:    live,
 		mux:     http.NewServeMux(),
 	}
 
@@ -164,6 +191,7 @@ func New(opt Options) *Handler {
 	h.mux.HandleFunc("POST /api/session", h.wrap("session", h.postSession))
 	h.mux.HandleFunc("DELETE /api/session", h.wrap("session-out", h.deleteSession))
 	h.mux.HandleFunc("GET /api/me", h.wrap("me", h.getMe))
+	h.mux.HandleFunc("GET /api/progress", h.wrap("progress", h.getProgress))
 	h.mux.HandleFunc("GET /api/resources", h.wrap("resources", h.getResources))
 	h.mux.HandleFunc("POST /api/resources", h.wrap("resource-add", h.postResource))
 	h.mux.HandleFunc("DELETE /api/resources/{name}", h.wrap("resource-drop", h.deleteResource))
@@ -173,7 +201,7 @@ func New(opt Options) *Handler {
 
 	// Тот же путь другим методом — это не «нет такой ручки», а «не тем глаголом», и
 	// сказать об этом надо разными словами: иначе человек ищет опечатку в пути.
-	for _, p := range []string{"/api/scope", "/api/session", "/api/me", "/api/resources", "/api/resources/{name}", "/api/recipes", "/api/fields"} {
+	for _, p := range []string{"/api/scope", "/api/session", "/api/me", "/api/progress", "/api/resources", "/api/resources/{name}", "/api/recipes", "/api/fields"} {
 		h.mux.HandleFunc(p, h.wrap("wrong-method", wrongMethod))
 	}
 
@@ -306,12 +334,16 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		return refusal.New(http.StatusBadGateway, "no-share",
 			fmt.Sprintf("по адресу %s раздачи нет — состояние класть некуда", addr),
 			"назови машину, и контроллер поднимет раздачу там: machine = {name, addr, creds}",
-			"либо подними раздачу сам и повтори: форма стыковки — `WORLD2` 3.4 и share/PROTOCOL.md",
+			"либо подними раздачу сам и повтори: форма стыковки — `WORLD2` 3.4",
 			"проверь адрес и порт: наша раздача по умолчанию слушает 8070")
 	}
 
 	st := state.New(strings.TrimSpace(body.Identity.Name), body.Identity.Brand)
 	raised := ""
+	// shareEnv — ТЕ ЖЕ значения, которыми раздача поднята. Держим их, потому что снимать её
+	// придётся ими же: рецепт собирает из `SHARE_NAME` имя проекта, контейнера и тома, и
+	// снятие без него сняло бы раздачу ПО УМОЛЧАНИЮ — то есть чужую, а нашу оставило бы.
+	var shareEnv []string
 	// цена — что контроллер изменил на ЧУЖОЙ машине, если заходил паролем. Пусто — не
 	// заходил и ничего там не менял.
 	цена := ""
@@ -327,6 +359,11 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 			return ref
 		}
 
+		// Ход начинается ЗДЕСЬ, до первого касания чужой машины: заход паролем и подъём —
+		// оба длинные, и ждущий вправе видеть «идёт» с самого начала, а не с середины.
+		h.live.Start("scope-create", m.Name)
+		defer h.live.Done()
+
 		// Креды двух видов: свой ключ либо пароль машины. Паролем контроллер один раз
 		// заходит и заводит ключ — сам пароль дальше не живёт (`WORLD2-141`).
 		key, note, ref := h.machineKey(r.Context(), sc, st, m.Name, m.Addr, m.Creds)
@@ -339,9 +376,8 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		if ref := h.res.PutKey(m.Name, m.Addr, key.Value); ref != nil {
 			return ref
 		}
-		// Пароль скоупа уезжает подъёму раздачи её же именем: им закрыта раздача, и
-		// внутри файла состояния его нет — запирать ключ внутри замка нельзя (`3.4`).
-		if ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, []string{sharePasswordEnv + "=" + body.Scope.Password}); ref != nil {
+		shareEnv = shareVars(m.Name, addr, body.Scope.Password)
+		if ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, shareEnv); ref != nil {
 			h.res.DropKey(m.Name)
 			return ref
 		}
@@ -357,7 +393,7 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		// которую состояние не легло, снимаем вместе с ключом. Не снять её значило бы
 		// оставить на чужой машине вещь, о которой в скоупе не написано ничего.
 		if raised != "" {
-			h.lowerQuietly(r.Context(), raised)
+			h.lowerQuietly(r.Context(), raised, shareEnv)
 		}
 		return ref
 	}
@@ -403,13 +439,56 @@ func (h *Handler) shareRecipe() (string, *refusal.Refusal) {
 
 // lowerQuietly — убрать за собой то, что мы только что подняли. Отказ уже собран и уедет
 // человеку; вторым отказом поверх первого его перебивать нельзя — причина у неудачи одна.
-func (h *Handler) lowerQuietly(ctx context.Context, name string) {
+//
+// `env` — ТЕ ЖЕ значения, которыми поднимали, и это здесь главное. Без `SHARE_NAME` компоуз
+// взял бы имя проекта по умолчанию и снял бы раздачу СОСЕДНЕГО скоупа, стоящую на той же
+// машине, а нашу оставил бы жить (`WORLD2-150` B3).
+func (h *Handler) lowerQuietly(ctx context.Context, name string, env []string) {
 	if recipePath, ref := h.shareRecipe(); ref == nil {
-		if _, ref := h.res.Lower(ctx, name, recipePath, "", false, false); ref != nil {
+		if _, ref := h.res.Lower(ctx, name, recipePath, "", env, false, false); ref != nil {
 			h.opt.Logf("control: раздачу %s снять за собой не вышло: %s", name, ref.Why)
 		}
 	}
 	h.res.DropKey(name)
+}
+
+// shareVars — чем контроллер называет раздаче, КТО она и ГДЕ ей слушать.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ НИ ОДНО ИЗ ТРЁХ ЗНАЧЕНИЙ КОНТРОЛЛЕР НЕ ВЫДУМЫВАЕТ — ВСЕ ТРИ ЮЗЕР УЖЕ НАЗВАЛ.          │
+// │                                                                                      │
+// │ Машина не единица личности, единица — АДРЕС (`WORLD2` 3.4, «Копий нет — есть          │
+// │ адреса»): скоупов на одной машине может быть сколько угодно, и разводить их обязан    │
+// │ тот, кто их поднимает.                                                                │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func shareVars(territory string, addr scope.Address, password string) []string {
+	return []string{
+		sharePasswordEnv + "=" + password,
+		shareNameEnv + "=" + shareName(territory, addr),
+		sharePortEnv + "=" + strconv.Itoa(addr.Port()),
+	}
+}
+
+// shareName — имя раздачи: им рецепт называет проект, контейнер и том.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ИМЯ УЧАСТКА + ПОРТ СКОУПА, И ОБА КУСКА СКАЗАНЫ ЮЗЕРОМ.                                │
+// │                                                                                      │
+// │ Порт здесь не украшение, а ЕДИНСТВЕННОЕ, чем два скоупа на ОДНОЙ машине отличаются:   │
+// │ машина у них общая, а адрес — нет. Имя участка стоит первым, потому что искать вещь   │
+// │ человек будет тем словом, которое сам придумал (`docker ps` покажет `vps-8071`).      │
+// │                                                                                      │
+// │ ЧЕГО ЗДЕСЬ НЕТ НАМЕРЕННО:                                                             │
+// │   счётчика — он теряется при снятии и переподъёме, и второй заход занял бы чужое имя; │
+// │   случайного суффикса — человек не найдёт такую вещь руками;                          │
+// │   слова «share» — так называет раздачу РЕЦЕПТ соседа, и повторить его имя здесь       │
+// │     значило бы завести вторую копию чужого знания, которая разъедется молча.           │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// Имя участка проверено (`resource.ValidName`) до этого вызова, порт — число: собранное
+// годится и в имя проекта компоуза, и в имя контейнера.
+func shareName(territory string, addr scope.Address) string {
+	return territory + "-" + strconv.Itoa(addr.Port())
 }
 
 // credsBody — КРЕДЫ К МАШИНЕ, и вид их называется ЯВНО (`WORLD2-141`, решение user).
@@ -578,6 +657,29 @@ func (h *Handler) getMe(w http.ResponseWriter, r *http.Request) *refusal.Refusal
 	return nil
 }
 
+// ── каким путём идёт начатое ─────────────────────────────────────────────────
+
+// getProgress — ход действия, которое идёт ПРЯМО СЕЙЧАС.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ЧИТАЕТСЯ БЕЗ ВХОДА, И ЭТО НЕ ОГОВОРКА (`WORLD2-150` B2).                             │
+// │                                                                                      │
+// │ Единственный момент, ради которого ручка заведена, — тот, когда сессии ЕЩЁ НЕТ:       │
+// │ `POST /api/scope` метку не выдал, а раздача на чужой машине уже поднимается, и        │
+// │ копия образа по ssh идёт минуты. Потребуй мы здесь входа — ждущий не прочёл бы ход     │
+// │ ровно тогда, когда ждёт, и ручка стала бы украшением.                                 │
+// │                                                                                      │
+// │ Цена названа вслух и она настоящая: пульт публикуется наружу умолчанием (`B4`),       │
+// │ значит ход читает любой, кто знает его адрес. Поэтому наружу отсюда уезжает только    │
+// │ род действия, метка пути и ИМЯ УЧАСТКА — слово, которое юзер придумал сам. Ни адреса   │
+// │ машины, ни адреса скоупа, ни кред здесь нет и не появится: они названы в теле запроса │
+// │ и оттуда никуда не едут.                                                              │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func (h *Handler) getProgress(w http.ResponseWriter, _ *http.Request) *refusal.Refusal {
+	writeJSON(w, http.StatusOK, h.live.Snapshot())
+	return nil
+}
+
 // remember — выдать метку сессии. Метка приезжает печеньем И телом: пульт берёт печенье,
 // человек курлом — заголовок `Authorization: Bearer`.
 func (h *Handler) remember(w http.ResponseWriter, sc *scope.Scope) (string, *refusal.Refusal) {
@@ -664,6 +766,11 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 		return ref
 	}
 
+	// Ход начинается до первого касания чужой машины — по той же причине, что у заведения
+	// скоупа: доставка образа на ту машину идёт минутами, и ждущий вправе знать, чем.
+	h.live.Start("resource-add", body.Name)
+	defer h.live.Done()
+
 	// Креды двух видов, и вид назван явно. Паролем контроллер заходит ОДИН раз — и
 	// говорит об этом вслух до того, как тронет чужую машину.
 	key, цена, ref := h.machineKey(r.Context(), sess.sc, st, body.Name, body.Addr, body.Creds)
@@ -684,7 +791,9 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 		return ref
 	}
 	if ref := sess.sc.Write(r.Context(), st); ref != nil {
-		if _, low := h.res.Lower(r.Context(), body.Name, recipePath, body.Recipe, false, false); low != nil {
+		// Вещь по ЧУЖОМУ рецепту снимается без наших значений: что ей нужно, знает она, а
+		// не мы, и подсовывать ей `SHARE_*` значило бы толковать чужой рецепт.
+		if _, low := h.res.Lower(r.Context(), body.Name, recipePath, body.Recipe, nil, false, false); low != nil {
 			h.opt.Logf("control: вещь %s снять за собой не вышло: %s", body.Name, low.Why)
 		}
 		h.res.DropKey(body.Name)
@@ -747,7 +856,7 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 		return ref
 	}
 
-	dropped, ref := h.res.Lower(r.Context(), name, recipePath, recipeName,
+	dropped, ref := h.res.Lower(r.Context(), name, recipePath, recipeName, nil,
 		flag(q.Get("with-state")), flag(q.Get("with-image")))
 	if ref != nil {
 		return ref
@@ -953,7 +1062,7 @@ func unknownEndpoint(_ http.ResponseWriter, r *http.Request) *refusal.Refusal {
 	return refusal.New(http.StatusNotFound, "unknown-endpoint",
 		"такой ручки у контроллера нет: "+r.URL.Path,
 		"список ручек — в control/README.md",
-		"их шесть путей: /api/scope, /api/session, /api/me, /api/resources, /api/recipes, /api/fields")
+		"их семь путей: /api/scope, /api/session, /api/me, /api/progress, /api/resources, /api/recipes, /api/fields")
 }
 
 // writeRefusal печатает отказ ОДИН И ТОТ ЖЕ, но подаёт его двумя способами: машине —
