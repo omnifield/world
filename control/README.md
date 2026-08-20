@@ -312,8 +312,23 @@ curl -X POST http://127.0.0.1:8090/api/session \
 curl -X POST http://127.0.0.1:8090/api/scope -d '{
   "scope":    {"addr":"http://10.8.0.5:8070/","password":"<пароль скоупа>"},
   "identity": {"name":"егор","brand":"омнифилд"},
-  "machine":  {"name":"vps","addr":"world@10.8.0.5","creds":"'"$(cat ~/.ssh/id_ed25519)"'"}}'
+  "machine":  {"name":"vps","addr":"world@10.8.0.5",
+               "creds":{"kind":"key","value":"'"$(cat ~/.ssh/id_ed25519)"'"}}}'
 ```
+
+**Машина без докера — законный случай, а не поломка:** контроллер поставит его там сам и скажет об этом ДО, а не после (`WORLD2` 3.5 п. 7). Раздачи по названному адресу в этот момент тоже ещё нет — её и поднимает этот ход.
+
+Даёшь **пароль** машины вместо ключа — так же законно, и чаще всего так и делают:
+
+```sh
+curl -X POST http://127.0.0.1:8090/api/scope -d '{
+  "scope":    {"addr":"http://10.8.0.5:8071/","password":"<пароль скоупа>"},
+  "identity": {"name":"егор","brand":""},
+  "machine":  {"name":"vps","addr":"root@10.8.0.5",
+               "creds":{"kind":"password","value":"<пароль машины>"}}}'
+```
+
+**Паролей здесь два, и они разные.** Пароль **скоупа** закрывает раздачу — им потом входят. Пароль **машины** нужен ровно один раз: контроллер зайдёт им, положит в её `~/.ssh/authorized_keys` одну подписанную строку и дальше пойдёт по ключу. Сам пароль не сохраняется нигде (`WORLD2-141`).
 
 **Пары ДВЕ, и путать их дорого** (`WORLD2` 3.4, «Два адреса»):
 
@@ -372,7 +387,7 @@ curl -X POST -H "Authorization: Bearer $T" http://127.0.0.1:8090/api/resources \
 ```sh
 curl -H "Authorization: Bearer $T" http://127.0.0.1:8090/api/resources
 curl -X POST -H "Authorization: Bearer $T" http://127.0.0.1:8090/api/resources \
-  -d '{"name":"vps","addr":"world@10.8.0.5","creds":"'"$(cat ~/.ssh/id_ed25519)"'"}'
+  -d '{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"'"$(cat ~/.ssh/id_ed25519)"'"}}'
 curl -X DELETE -H "Authorization: Bearer $T" 'http://127.0.0.1:8090/api/resources/vps?with-state=1'
 ```
 
