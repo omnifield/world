@@ -278,6 +278,58 @@ func Remove(ctx context.Context, m Machine, password, authorized, knownHosts str
 	_, _ = session.Output(remove(authorized))
 }
 
+// RemoveByKey — снять свою строку с машины, ЗАЙДЯ ПО КЛЮЧУ. Зовётся при снятии участка:
+// пароля к тому времени нет и быть не должно (он не сохраняется нигде), а ключ есть — он
+// лежит в скоупе, и это ровно тот ключ, чью строку мы и убираем.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПОЧЕМУ ЭТО ОБЯЗАТЕЛЬНО. Мы обещаем юзеру: «убрать доступ можно, удалив эту строку».   │
+// │ Пока строки копятся, обещание неисполнимо — они все подписаны одинаково, и какая      │
+// │ чья, юзер не знает. Живой прогон 2026-08-20: на машине их накопилось восемь.          │
+// │                                                                                      │
+// │ Снял участок — мир уходит с машины совсем: ни контекста, ни ключа в связке, ни        │
+// │ строки в чужом `authorized_keys`. Иначе «снял» значит «почти снял».                    │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+//
+// Молча, как и `Remove`: это уборка, и её отказ не вправе подменить собой ответ про
+// снятие вещи, которое уже состоялось.
+func RemoveByKey(ctx context.Context, m Machine, private, authorized, knownHosts string, timeout int) {
+	if strings.TrimSpace(private) == "" || strings.TrimSpace(authorized) == "" {
+		return
+	}
+	signer, err := ssh.ParsePrivateKey([]byte(private))
+	if err != nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = 15
+	}
+	cfg := &ssh.ClientConfig{
+		User:            m.User,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: rememberHost(knownHosts),
+		Timeout:         time.Duration(timeout) * time.Second,
+	}
+	d := net.Dialer{Timeout: cfg.Timeout}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(m.Port)))
+	if err != nil {
+		return
+	}
+	c, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(m.Host, strconv.Itoa(m.Port)), cfg)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	client := ssh.NewClient(c, chans, reqs)
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return
+	}
+	defer session.Close()
+	_, _ = session.Output(remove(authorized))
+}
+
 // remove — обратная команда к `install`. Убирает РОВНО нашу строку и ничего кроме: файл
 // принадлежит юзеру, и всё остальное в нём — не наше дело. Через временный файл рядом,
 // потому что перенаправление в тот же файл обнулило бы его до чтения.

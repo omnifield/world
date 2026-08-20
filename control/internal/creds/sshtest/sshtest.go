@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -73,6 +74,28 @@ func StartOn(addr, user, pass, home string) (*Machine, error) {
 				return nil, nil
 			}
 			return nil, errors.New("пароль не подошёл")
+		},
+		// ┌─────────────────────────────────────────────────────────────────────────────┐
+		// │ КЛЮЧ ПРИНИМАЕТСЯ ТАК ЖЕ, КАК У НАСТОЯЩЕГО sshd: если его строка лежит в       │
+		// │ `~/.ssh/authorized_keys` этой машины. Без этого двойник умел только пароль —  │
+		// │ и всё, что мир делает КЛЮЧОМ, проверить было нечем. Ровно на этом сторож не   │
+		// │ увидел бы, убирает ли мир свою строку при снятии участка.                     │
+		// └─────────────────────────────────────────────────────────────────────────────┘
+		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if c.User() != user {
+				return nil, errors.New("не тот юзер")
+			}
+			дан := string(ssh.MarshalAuthorizedKey(key))
+			for _, line := range strings.Split(m.Authorized(), "\n") {
+				поле := strings.Fields(strings.TrimSpace(line))
+				if len(поле) < 2 {
+					continue
+				}
+				if strings.TrimSpace(dropComment(дан)) == поле[0]+" "+поле[1] {
+					return nil, nil
+				}
+			}
+			return nil, errors.New("ключ не в authorized_keys")
 		},
 	}
 	cfg.AddHostKey(hostKey)
@@ -187,4 +210,13 @@ func (m *Machine) Close() {
 		m.closed = true
 		_ = m.listener.Close()
 	}
+}
+
+// dropComment — «тип ключ» без подписи: сравнивать надо ключ, а не то, чем его подписали.
+func dropComment(line string) string {
+	f := strings.Fields(strings.TrimSpace(line))
+	if len(f) < 2 {
+		return strings.TrimSpace(line)
+	}
+	return f[0] + " " + f[1]
 }

@@ -270,3 +270,51 @@ func TestНезнакомаяМашинаЗапоминается(t *testing.T) 
 		t.Fatalf("ключ незнакомой машины не запомнился: %v %s", err, data)
 	}
 }
+
+// СНЯЛИ УЧАСТОК — УХОДИМ С МАШИНЫ СОВСЕМ. Пароля к этому времени нет и быть не должно, а
+// ключ есть: им и заходим, чтобы убрать СВОЮ строку. Пока строки копились, обещание
+// «убрать доступ можно, удалив эту строку» было неисполнимым — они подписаны одинаково, и
+// какая чья, юзер не знает (живой прогон 2026-08-20: восемь строк на одной машине).
+func TestСнятиеУбираетСвоюСтрокуЗаходомПоКлючу(t *testing.T) {
+	m := машина(t)
+	pair, _ := Generate()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+
+	if ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, known, 5); ref != nil {
+		t.Fatalf("ключ не лёг: %s", ref.Why)
+	}
+	if strings.TrimSpace(m.Authorized()) == "" {
+		t.Fatal("ключа на машине нет — проверять нечего")
+	}
+
+	RemoveByKey(context.Background(), куда(t, m), pair.Private, pair.Authorized, known, 5)
+
+	if лежит := strings.TrimSpace(m.Authorized()); лежит != "" {
+		t.Fatalf("после снятия участка наша строка осталась на машине:\n%s", лежит)
+	}
+}
+
+// ЧУЖИЕ СТРОКИ НЕ ТРОГАЕМ: файл принадлежит юзеру, и всё, что в нём не наше, — не наше дело.
+func TestСнятиеНеТрогаетЧужиеСтроки(t *testing.T) {
+	m := машина(t)
+	наша, _ := Generate()
+	чужая, _ := Generate()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+
+	if ref := Install(context.Background(), куда(t, m), m.Pass, чужая.Authorized, known, 5); ref != nil {
+		t.Fatalf("чужой ключ не лёг: %s", ref.Why)
+	}
+	if ref := Install(context.Background(), куда(t, m), m.Pass, наша.Authorized, known, 5); ref != nil {
+		t.Fatalf("наш ключ не лёг: %s", ref.Why)
+	}
+
+	RemoveByKey(context.Background(), куда(t, m), наша.Private, наша.Authorized, known, 5)
+
+	лежит := strings.TrimSpace(m.Authorized())
+	if strings.Contains(лежит, strings.TrimSpace(наша.Authorized)) {
+		t.Fatalf("своя строка не убрана:\n%s", лежит)
+	}
+	if !strings.Contains(лежит, strings.TrimSpace(чужая.Authorized)) {
+		t.Fatalf("убрана ЧУЖАЯ строка — мир распорядился не своим:\n%s", лежит)
+	}
+}

@@ -927,6 +927,24 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 	if ref != nil {
 		return ref
 	}
+	// СНЯЛИ УЧАСТОК — УХОДИМ С МАШИНЫ СОВСЕМ. Ключ юзера, положенный туда при заведении,
+	// снимаем ЗАХОДОМ ПО НЕМУ ЖЕ: пароля у нас нет и не должно быть, а ключ есть — он в
+	// скоупе. Иначе строки копятся, и обещание «убрать доступ можно, удалив эту строку»
+	// становится неисполнимым: подписаны они одинаково, и какая чья, юзер не знает
+	// (живой прогон 2026-08-20 — восемь строк на одной машине).
+	//
+	// Делается ДО того, как участок исчезнет из состояния: после него мы уже не будем
+	// знать ни адреса, ни ключа.
+	if ключ, есть := st.Key(t.Key); есть {
+		if authorized, ref := creds.Authorized(ключ.Value); ref == nil {
+			if user, host, port, ref := resource.SplitAddr(t.Addr); ref == nil {
+				creds.RemoveByKey(r.Context(), creds.Machine{User: user, Host: host, Port: port},
+					ключ.Value, authorized, filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
+				h.opt.Logf("control: участок %s снят — убрал свою строку из ~/.ssh/authorized_keys машины %s", name, t.Addr)
+			}
+		}
+	}
+
 	if ref := st.DropTerritory(name); ref != nil {
 		return ref
 	}
