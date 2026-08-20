@@ -407,13 +407,16 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 			return ref
 		}
 		shareEnv = shareVars(m.Name, addr, body.Scope.Password)
-		if ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, shareEnv); ref != nil {
+		вещь, ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, shareEnv)
+		if ref != nil {
 			h.res.DropKey(m.Name)
 			return ref
 		}
 		raised = m.Name
 
-		if ref := st.AddTerritory(state.Territory{Name: m.Name, Addr: m.Addr}, key); ref != nil {
+		// Имя поднятой вещи запоминается В СКОУПЕ: на этой машине могут стоять вещи чужих
+		// юзеров, и отличить своё можно только помня, что заводил сам.
+		if ref := st.AddTerritory(state.Territory{Name: m.Name, Addr: m.Addr, Things: вещи(вещь)}, key); ref != nil {
 			return ref
 		}
 	}
@@ -518,6 +521,16 @@ func shareVars(territory string, addr scope.Address, password string) []string {
 //
 // Имя участка проверено (`resource.ValidName`) до этого вызова, порт — число: собранное
 // годится и в имя проекта компоуза, и в имя контейнера.
+// вещи — имя, названное соседом, списком. Пусто — сосед промолчал: значит и помнить нам
+// нечего, и список вещей этой территории показывается целиком, как раньше. Выдумывать имя
+// за него нельзя: оно принадлежит рецепту (`WORLD2` 3.7).
+func вещи(имя string) []string {
+	if strings.TrimSpace(имя) == "" {
+		return nil
+	}
+	return []string{имя}
+}
+
 func shareName(territory string, addr scope.Address) string {
 	return territory + "-" + strconv.Itoa(addr.Port())
 }
@@ -832,14 +845,15 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 	if ref := h.res.PutKey(body.Name, body.Addr, key.Value); ref != nil {
 		return ref
 	}
-	if ref := h.res.Raise(r.Context(), body.Name, body.Addr, recipePath, nil); ref != nil {
+	вещь, ref := h.res.Raise(r.Context(), body.Name, body.Addr, recipePath, nil)
+	if ref != nil {
 		// Подъём не удался — свой след убираем за собой. Оставленный ключ означал бы, что
 		// вторая попытка пойдёт кредами, которых юзер уже не называет.
 		h.res.DropKey(body.Name)
 		return ref
 	}
 
-	if ref := st.AddTerritory(state.Territory{Name: body.Name, Addr: body.Addr}, key); ref != nil {
+	if ref := st.AddTerritory(state.Territory{Name: body.Name, Addr: body.Addr, Things: вещи(вещь)}, key); ref != nil {
 		return ref
 	}
 	if ref := sess.sc.Write(r.Context(), st); ref != nil {

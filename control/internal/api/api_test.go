@@ -1408,3 +1408,57 @@ func TestУпавшееЗаведениеУбираетКлючСМашины(t 
 		t.Fatalf("на чужой машине остался наш ключ, которого у юзера нет:\n%s", лежит)
 	}
 }
+
+// СКОУП ПОМНИТ, ЧТО КОНТРОЛЛЕР НА ТЕРРИТОРИИ ПОДНЯЛ. Имя приходит от соседа меткой
+// `REMOTE-THING:` — он рецепт и читал. Без этой памяти список вещей показывал бы юзеру
+// раздачи чужих скоупов, стоящие на той же машине (живой прогон 2026-08-20).
+func TestЗаведениеЗапоминаетИмяПоднятойВещи(t *testing.T) {
+	ш := новаяРаздача(t, "тайна")
+	var st *стенд
+	st = поднять(t, func(c run.Command) (run.Result, error) {
+		if strings.HasSuffix(c.Name, "remote.sh") && содержит(c.Args, "add") {
+			ш.поднять(t, nil)
+			// Сосед называет имя вещи — тем же путём, что путь доставки и отказ.
+			return run.Result{Out: "REMOTE-PATH: image-pull\nREMOTE-THING: vps-8070\n"}, nil
+		}
+		return докерОтвечает(c)
+	})
+
+	status, _ := st.зов(t, "POST", "/api/scope", `{
+		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
+		"identity":{"name":"егор","brand":""},
+		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"-----ключ-----"}}}`, "")
+	if status != http.StatusCreated {
+		t.Fatalf("скоуп не завёлся: %d", status)
+	}
+
+	файл := ш.файл(t)
+	if len(файл.Territories) != 1 || len(файл.Territories[0].Things) != 1 ||
+		файл.Territories[0].Things[0] != "vps-8070" {
+		t.Fatalf("скоуп не запомнил поднятую вещь: %+v", файл.Territories)
+	}
+}
+
+// А ЕСЛИ СОСЕД ПРОМОЛЧАЛ — не выдумываем: имя принадлежит рецепту, и пустая память честнее
+// придуманной. Список вещей у такой территории показывается целиком.
+func TestМолчаниеСоседаНеПревращаетсяВВыдуманноеИмя(t *testing.T) {
+	ш := новаяРаздача(t, "тайна")
+	var st *стенд
+	st = поднять(t, func(c run.Command) (run.Result, error) {
+		if strings.HasSuffix(c.Name, "remote.sh") && содержит(c.Args, "add") {
+			ш.поднять(t, nil)
+			return run.Result{}, nil // ни метки, ни имени
+		}
+		return докерОтвечает(c)
+	})
+
+	st.зов(t, "POST", "/api/scope", `{
+		"scope":{"addr":"`+ш.URL+`","password":"тайна"},
+		"identity":{"name":"егор","brand":""},
+		"machine":{"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"key","value":"-----ключ-----"}}}`, "")
+
+	файл := ш.файл(t)
+	if len(файл.Territories) != 1 || len(файл.Territories[0].Things) != 0 {
+		t.Fatalf("имя вещи выдумано на пустом месте: %+v", файл.Territories)
+	}
+}
