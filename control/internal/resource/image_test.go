@@ -86,7 +86,7 @@ func TestВерсияКонтроллераВПодъёмВещиНеУходи�
 		}
 	}
 	// И то же самое — на снятии: пин уезжал туда вторым путём.
-	if _, ref := m.Lower(context.Background(), "vps", рецептДвери, "", nil, false, true); ref != nil {
+	if _, ref := m.Lower(context.Background(), Drop{Name: "vps", RecipePath: рецептДвери, WithImage: true}); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	for _, e := range подъёмПозван(t, fake, "drop") {

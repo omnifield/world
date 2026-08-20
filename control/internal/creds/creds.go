@@ -262,58 +262,29 @@ func Install(ctx context.Context, m Machine, password, authorized, knownHosts st
 }
 
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-// │ Remove — УБРАТЬ СВОЮ СТРОКУ С ЧУЖОЙ МАШИНЫ. Зовётся, когда заведение не состоялось.  │
-// │                                                                                      │
+// │ Remove — УБРАТЬ СВОЮ СТРОКУ С ЧУЖОЙ МАШИНЫ ЗАХОДОМ ПО ПАРОЛЮ. Зовётся там, где        │
+// │ паролем же её и положили: заведение не состоялось, либо мир на этой машине закончил   │
+// │ дело и уходит.                                                                         │
+// │                                                                                        │
 // │ Живой прогон 2026-08-20: заведение падало ПОСЛЕ того, как ключ уже лёг, — и строка    │
 // │ оставалась. Скоуп при этом не записался, значит приватного ключа у юзера нет: строку  │
 // │ на своей машине он опознать не может и убрать её ему нечем. За несколько попыток их   │
 // │ накопилось шесть.                                                                     │
-// │                                                                                      │
+// │                                                                                        │
 // │ Отказ не вправе ничего оставлять за собой (`WORLD2` 2.3 п. 5) — а на ЧУЖОЙ машине     │
 // │ тем более. Снятие идёт тем же паролем и тем же заходом, что и установка: другого      │
 // │ способа у нас нет, а требовать его от юзера значит перекладывать свой мусор на него.  │
-// │                                                                                      │
-// │ Молча: это уборка за неудачей, и её собственный отказ подменил бы собой настоящую     │
-// │ причину, ради которой мы сюда вернулись. Не вышло — юзер узнает из `note`, который    │
-// │ ему уже сказан.                                                                       │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
-func Remove(ctx context.Context, m Machine, password, authorized, knownHosts string, timeout int) {
+func Remove(ctx context.Context, m Machine, password, authorized, knownHosts string, timeout int) *refusal.Refusal {
 	if strings.TrimSpace(password) == "" || strings.TrimSpace(authorized) == "" {
-		return // заходили ключом — на машине ничего нашего не появлялось
+		return nil // заходили ключом — на машине ничего нашего не появлялось
 	}
-	if timeout <= 0 {
-		timeout = 15
-	}
-	cfg := &ssh.ClientConfig{
-		User:            m.User,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
-		HostKeyCallback: rememberHost(knownHosts),
-		Timeout:         time.Duration(timeout) * time.Second,
-	}
-	d := net.Dialer{Timeout: cfg.Timeout}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(m.Port)))
-	if err != nil {
-		return
-	}
-	c, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(m.Host, strconv.Itoa(m.Port)), cfg)
-	if err != nil {
-		_ = conn.Close()
-		return
-	}
-	client := ssh.NewClient(c, chans, reqs)
-	defer client.Close()
-
-	session, err := client.NewSession()
-	if err != nil {
-		return
-	}
-	defer session.Close()
-	_, _ = session.Output(remove(authorized))
+	return какОсталось(m, authorized, убрать(ctx, m, ssh.Password(password), authorized, knownHosts, timeout))
 }
 
-// RemoveByKey — снять свою строку с машины, ЗАЙДЯ ПО КЛЮЧУ. Зовётся при снятии участка:
-// пароля к тому времени нет и быть не должно (он не сохраняется нигде), а ключ есть — он
-// лежит в скоупе, и это ровно тот ключ, чью строку мы и убираем.
+// RemoveByKey — снять свою строку с машины, ЗАЙДЯ ПО КЛЮЧУ. Зовётся там, где пароля нет и
+// быть не должно (он не сохраняется нигде), а ключ есть — он лежит в скоупе, и это ровно
+// тот ключ, чью строку мы и убираем.
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
 // │ ПОЧЕМУ ЭТО ОБЯЗАТЕЛЬНО. Мы обещаем юзеру: «убрать доступ можно, удалив эту строку».   │
@@ -323,44 +294,120 @@ func Remove(ctx context.Context, m Machine, password, authorized, knownHosts str
 // │ Снял участок — мир уходит с машины совсем: ни контекста, ни ключа в связке, ни        │
 // │ строки в чужом `authorized_keys`. Иначе «снял» значит «почти снял».                    │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
-//
-// Молча, как и `Remove`: это уборка, и её отказ не вправе подменить собой ответ про
-// снятие вещи, которое уже состоялось.
-func RemoveByKey(ctx context.Context, m Machine, private, authorized, knownHosts string, timeout int) {
+func RemoveByKey(ctx context.Context, m Machine, private, authorized, knownHosts string, timeout int) *refusal.Refusal {
 	if strings.TrimSpace(private) == "" || strings.TrimSpace(authorized) == "" {
-		return
+		return nil
 	}
 	signer, err := ssh.ParsePrivateKey([]byte(private))
 	if err != nil {
-		return
+		return keyLeft(m, authorized, "ключ, которым мы туда ходим, не разобрать: "+err.Error())
 	}
+	ref := убрать(ctx, m, ssh.PublicKeys(signer), authorized, knownHosts, timeout)
+	// ┌─────────────────────────────────────────────────────────────────────────────────┐
+	// │ МАШИНА НАШ КЛЮЧ НЕ ПРИНЯЛА — ЗНАЧИТ ЕГО СТРОКИ В ЕЁ ФАЙЛЕ НЕТ, и это тот самый    │
+	// │ исход, ради которого мы сюда шли. Лежи она там, ключ пустил бы: тем же ключом      │
+	// │ ходит и докер.                                                                     │
+	// │                                                                                    │
+	// │ Считать это неудачей значило бы пугать юзера строкой, которой нет, — а «не         │
+	// │ дотянулись» и «строка осталась» он чинит одинаково и зря. Ступени связи при этом    │
+	// │ остаются неудачей: там мы и правда НЕ ЗНАЕМ, что лежит в файле.                     │
+	// └─────────────────────────────────────────────────────────────────────────────────┘
+	if ref != nil && ref.Code == "access-denied" {
+		return nil
+	}
+	return какОсталось(m, authorized, ref)
+}
+
+// какОсталось — ступень связи, пересказанная как «что теперь лежит на машине юзера».
+// Ступени (`no-route` · `no-answer` · `host-key-changed`) — про дорогу, а человеку здесь
+// важно другое: строка не убрана, и вот она какая.
+func какОсталось(m Machine, authorized string, ref *refusal.Refusal) *refusal.Refusal {
+	if ref == nil || ref.Code == "key-left" {
+		return ref
+	}
+	return keyLeft(m, authorized, ref.Why)
+}
+
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ УБОРКА НЕ ОТКАЗЫВАЕТ, НО И НЕ МОЛЧИТ — И ЭТО РАЗНЫЕ ВЕЩИ.                             │
+// │                                                                                      │
+// │ Раньше здесь было «молча»: своим отказом уборка подменила бы причину, ради которой мы │
+// │ сюда вернулись, — и это по-прежнему верно. Но из «не отказывать» не следует «не        │
+// │ говорить»: строка осталась на МАШИНЕ ЮЗЕРА, и узнать о ней он обязан от нас, а не      │
+// │ найдя её однажды сам. Поэтому здесь возвращается ОТКАЗ КАК СЛОВА: звать его отказом    │
+// │ ручки или сказать словами в ответе — решает тот, кто звал.                             │
+// │                                                                                        │
+// │ РЕЗУЛЬТАТ ИЗМЕРЯЕТСЯ, а не выводится из кода возврата (`WORLD2` 4.2 п. 5): команда на  │
+// │ той стороне заканчивается подсчётом НАШИХ строк, и «убрали» — это ровно ноль.          │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func убрать(ctx context.Context, m Machine, auth ssh.AuthMethod, authorized, knownHosts string, timeout int) *refusal.Refusal {
 	if timeout <= 0 {
 		timeout = 15
 	}
 	cfg := &ssh.ClientConfig{
 		User:            m.User,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Auth:            []ssh.AuthMethod{auth},
 		HostKeyCallback: rememberHost(knownHosts),
 		Timeout:         time.Duration(timeout) * time.Second,
 	}
 	d := net.Dialer{Timeout: cfg.Timeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(m.Port)))
 	if err != nil {
-		return
+		return reachFailure(m, err)
 	}
 	c, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(m.Host, strconv.Itoa(m.Port)), cfg)
 	if err != nil {
 		_ = conn.Close()
-		return
+		// Ступени те же, что у установки, и коды те же: «не пустили» отличается от «не
+		// дотянулись» и здесь — от первого зависит, знаем ли мы, что лежит в файле.
+		return handshakeFailure(m, err)
 	}
 	client := ssh.NewClient(c, chans, reqs)
 	defer client.Close()
+
 	session, err := client.NewSession()
 	if err != nil {
-		return
+		return keyLeft(m, authorized, "сеанс не открылся: "+err.Error())
 	}
 	defer session.Close()
-	_, _ = session.Output(remove(authorized))
+
+	out, err := session.Output(remove(authorized))
+	// РЕШАЕТ СЧЁТ, А НЕ КОД ВОЗВРАТА — как и при установке. Ошибка команды идёт
+	// подробностью, а не вместо измерения: «код ноль» говорит лишь, что шелл дошёл до конца.
+	if strings.TrimSpace(lastLine(string(out))) == "0" {
+		return nil
+	}
+	подробность := "строка после уборки в файле осталась"
+	if err != nil {
+		подробность += ": " + err.Error()
+	}
+	return keyLeft(m, authorized, подробность)
+}
+
+// keyLeft — НАША СТРОКА ОСТАЛАСЬ НА ЧУЖОЙ МАШИНЕ, и юзеру названо, какая именно.
+//
+// Подпись содержит АДРЕС СКОУПА (`Sign`), и это здесь главное: строк на машине может быть
+// несколько, а убрать человеку надо ту самую. Обещание «убрать доступ можно, удалив эту
+// строку» исполнимо ровно настолько, насколько он может её опознать.
+func keyLeft(m Machine, authorized, почему string) *refusal.Refusal {
+	way := "убери её руками на той машине: строка в ~/.ssh/authorized_keys"
+	if подпись := signOf(authorized); подпись != "" {
+		way += ", подписанная «" + подпись + "»"
+	}
+	return refusal.New(http.StatusBadGateway, "key-left",
+		fmt.Sprintf("на машине %s осталась наша строка в ~/.ssh/authorized_keys — %s", m, почему),
+		way,
+		"или повтори то же действие, когда машина ответит: уборка идёт по ключу, а не по подписи")
+}
+
+// signOf — подпись строки, то есть всё, что стоит ПОСЛЕ ключа. Ею человек и опознаёт свою
+// строку среди чужих; сравнивать по ней нельзя (`keyPart`), а называть — только ею.
+func signOf(line string) string {
+	f := strings.Fields(strings.TrimSpace(line))
+	if len(f) < 3 {
+		return ""
+	}
+	return strings.Join(f[2:], " ")
 }
 
 // remove — обратная команда к `install`. Убирает РОВНО нашу строку и ничего кроме: файл
@@ -372,10 +419,16 @@ func remove(authorized string) string {
 	line := quote(keyPart(authorized))
 	return strings.Join([]string{
 		"umask 077",
-		"[ -f ~/.ssh/authorized_keys ] || exit 0",
-		"grep -vF -- " + line + " ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.world-tmp",
-		"mv ~/.ssh/authorized_keys.world-tmp ~/.ssh/authorized_keys",
-		"chmod 600 ~/.ssh/authorized_keys",
+		"if [ -f ~/.ssh/authorized_keys ]; then",
+		"  grep -vF -- " + line + " ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.world-tmp",
+		"  mv ~/.ssh/authorized_keys.world-tmp ~/.ssh/authorized_keys",
+		"  chmod 600 ~/.ssh/authorized_keys",
+		"fi",
+		// Счёт печатается ВСЕГДА, и ноль печатается тоже: `grep -c` на ноль совпадений
+		// выходит единицей, а на отсутствующем файле — двойкой и молчанием. Молчание здесь
+		// неотличимо от «команда не дошла», а различать их надо: файла нет — значит нашей
+		// строки в нём нет, и это НОЛЬ, а не неизвестность.
+		"grep -cF -- " + line + " ~/.ssh/authorized_keys 2>/dev/null || printf '0\\n'",
 	}, "\n")
 }
 
