@@ -74,7 +74,7 @@ func TestВерсияКонтроллераВПодъёмВещиНеУходи�
 	m, fake, _ := стенд(t, рецептОтвечает("ghcr.io/omnifield/world:latest"))
 	строки := журнал(m)
 
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
 		t.Fatal(ref.Why)
 	}
 
@@ -115,7 +115,7 @@ func TestИмяНазванноеСнаружиЧитаетРецептИОно�
 
 	// Значение приходит окружением подъёма — ровно так, как оно приходит в живом контроллере
 	// из его собственного окружения.
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери,
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери,
 		[]string{"WORLD_IMAGE=своя/дверь:мояверсия"}); ref != nil {
 		t.Fatal(ref.Why)
 	}
@@ -130,7 +130,7 @@ func TestСвояВещьЮзераПоднимаетсяТемЖеПутём(t 
 	m, _, _ := стенд(t, рецептОтвечает("весы:1.2"))
 	строки := журнал(m)
 
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", "/рецепты/весы.yaml", nil); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", "/рецепты/весы.yaml", nil); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	if !strings.Contains(strings.Join(*строки, " "), "весы:1.2") {
@@ -168,7 +168,7 @@ func TestРецептНеЧитаетсяИРецептБезОбразаЭто�
 		})
 		строки := журнал(m)
 
-		if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
+		if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
 			t.Fatalf("%s: подъём отказал, а это не поломка подъёма: %s", tt.имя, ref.Why)
 		}
 		сказано := strings.Join(*строки, " ")
@@ -193,7 +193,7 @@ func TestПричинаНечитаемогоРецептаДоезжаетДо�
 	})
 	строки := журнал(m)
 
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	if !strings.Contains(strings.Join(*строки, " "), "SHARE_PASSWORD") {
@@ -212,7 +212,7 @@ func TestРецептСНесколькимиОбразамиНазываетИ�
 	})
 	строки := журнал(m)
 
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", "/рецепты/пара.yaml", nil); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", "/рецепты/пара.yaml", nil); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	сказано := strings.Join(*строки, " ")
@@ -227,7 +227,7 @@ func TestРецептСпрашиваетсяТемЖеОкружениемЧт�
 	m, fake, _ := стенд(t, рецептОтвечает("ghcr.io/omnifield/world:latest"))
 	_ = журнал(m)
 
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	var спрошено []string

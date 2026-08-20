@@ -202,7 +202,7 @@ func TestУчастокБезКлючаВСкоупеЭтоОтказСВыхо�
 
 func TestПодъёмЗовётГотовыйИНазываетРецептВсегда(t *testing.T) {
 	m, fake, _ := стенд(t, докерОтвечает)
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, []string{"SHARE_PASSWORD=тайна"}); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, []string{"SHARE_PASSWORD=тайна"}); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	if !fake.Called("remote.sh", "add", "vps", "--addr", "world@10.8.0.5", "--recipe", рецептДвери) {
@@ -227,7 +227,7 @@ func TestОтказСоседаДоезжаетСвоимКодом(t *testing.T
 		}
 		return докерОтвечает(c)
 	})
-	ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil)
+	_, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil)
 	if ref == nil || ref.Code != "docker-install-no-net" {
 		t.Fatalf("код соседа не доехал своим: %+v", ref)
 	}
@@ -314,7 +314,7 @@ func TestМеткаПутиДовозитсяДословноИТолькоОн�
 	var пути []string
 	m.OnPath = func(_, path string) { пути = append(пути, path) }
 
-	if ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
+	if _, ref := m.Raise(context.Background(), "vps", "world@10.8.0.5", рецептДвери, nil); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	if len(пути) != 2 || пути[0] != "image-copy" || пути[1] != "путь-которого-мы-не-знаем" {
@@ -337,5 +337,65 @@ func TestСнятиеВезётЗначенияРецепта(t *testing.T) {
 	}
 	if !есть(env, "SHARE_NAME=vps-8071") || !есть(env, "WORLD_PORT=8080") {
 		t.Fatalf("значения не доехали до снятия: %v", env)
+	}
+}
+
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ЮЗЕР ВИДИТ ТОЛЬКО СВОИ ВЕЩИ (решение user 2026-08-20, найдено живым прогоном).       │
+// │                                                                                      │
+// │ На одной машине законно стоят раздачи РАЗНЫХ юзеров. Список показывал их все — с      │
+// │ именами и портами, — а пульт открыт по адресу: значит чужое видел бы каждый, кто до   │
+// │ него дошёл.                                                                           │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func TestЧужиеВещиНаТойЖеМашинеНеПоказываются(t *testing.T) {
+	m, _, _ := стенд(t, func(c run.Command) (run.Result, error) {
+		switch {
+		case есть(c.Args, "context") && есть(c.Args, "inspect"):
+			return run.Result{Code: 1, Err: "context not found"}, nil
+		case есть(c.Args, "ps"):
+			return run.Result{Out: "aaa\nbbb\nccc\n"}, nil
+		case есть(c.Args, "inspect") && есть(c.Args, "--format"):
+			// Наша дверь, наша раздача — и раздача ЧУЖОГО скоупа на той же машине.
+			return run.Result{Out: "world\thealthy\trunning\nvps-8071\thealthy\trunning\nчужой-8072\thealthy\trunning\n"}, nil
+		}
+		return run.Result{}, nil
+	})
+
+	list := m.List(context.Background(), []state.Territory{
+		{Name: "vps", Addr: "world@10.8.0.5", Things: []string{"world", "vps-8071"}},
+	})
+	var имена []string
+	for _, thing := range list[0].Things {
+		имена = append(имена, thing.Name)
+		if thing.Name == "чужой-8072" {
+			t.Fatalf("чужая раздача попала в список юзера: %v", имена)
+		}
+	}
+	if len(имена) != 2 {
+		t.Fatalf("своих вещей должно быть две, а показано: %v", имена)
+	}
+}
+
+// ПУСТОЙ СПИСОК — ЭТО «НЕ ЗНАЕМ», А НЕ «НИЧЕГО СВОЕГО НЕТ». Так выглядят скоупы, заведённые
+// до того, как контроллер начал помнить поднятое: спрятать у них всё значило бы стереть
+// юзеру его вещи с экрана.
+func TestСкоупБезПамятиОВещахВидитВсё(t *testing.T) {
+	m, _, _ := стенд(t, докерОтвечает)
+	list := m.List(context.Background(), []state.Territory{{Name: "vps", Addr: "world@10.8.0.5"}})
+	if len(list[0].Things) == 0 {
+		t.Fatal("старому скоупу спрятали его собственные вещи")
+	}
+}
+
+// А МОЛЧАЩАЯ машина остаётся молчащей: `null` и пустой список — разные ответы (`4.2`).
+func TestОтсевНеПревращаетМолчаниеВПустоту(t *testing.T) {
+	m, _, _ := стенд(t, func(c run.Command) (run.Result, error) {
+		return run.Result{Code: 1, Err: "cannot connect"}, nil
+	})
+	list := m.List(context.Background(), []state.Territory{
+		{Name: "vps", Addr: "world@10.8.0.5", Things: []string{"world"}},
+	})
+	if list[0].Things != nil {
+		t.Fatalf("молчание превратилось в пустой список: %+v", list[0])
 	}
 }
