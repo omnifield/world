@@ -366,7 +366,7 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 
 		// Креды двух видов: свой ключ либо пароль машины. Паролем контроллер один раз
 		// заходит и заводит ключ — сам пароль дальше не живёт (`WORLD2-141`).
-		key, note, ref := h.machineKey(r.Context(), sc, st, m.Name, m.Addr, m.Creds)
+		key, note, ref := h.machineKey(r.Context(), sc, st, m.Name, m.Addr, m.Creds, presence == scope.PresenceEmpty)
 		if ref != nil {
 			return ref
 		}
@@ -513,7 +513,10 @@ type credsBody struct {
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
 // Ключ юзера ОДИН на скоуп: тот же ключ, положенный второй раз, строки не плодит.
-func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.State, name, addr string, body credsBody) (state.Key, string, *refusal.Refusal) {
+// `раздачаОтвечает` — стоит ли уже раздача по адресу скоупа. От этого зависит, можно ли
+// записать в неё ключ ДО того, как он ляжет на чужую машину: в стоящую — можно и нужно, а
+// той, которую этот же ход только поднимет, ещё нет на свете.
+func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.State, name, addr string, body credsBody, раздачаОтвечает bool) (state.Key, string, *refusal.Refusal) {
 	kind, ref := creds.ParseKind(body.Kind)
 	if ref != nil {
 		return state.Key{}, "", ref
@@ -541,11 +544,26 @@ func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.Sta
 		}
 		key = state.Key{Name: state.UserKeyName, Kind: state.KindSSH, Value: pair.Private}
 		st.SetKey(key)
-		// Ключ записывается в скоуп ДО того, как попадёт на машину. Порядок не случаен:
-		// иначе неудача на полпути оставила бы на чужой машине строку с ключом, которого
-		// у юзера нет, — и убрать её было бы нечем.
-		if ref := sc.Write(ctx, st); ref != nil {
-			return state.Key{}, "", ref
+		// ┌──────────────────────────────────────────────────────────────────────────────┐
+		// │ ЗАПИСАТЬ КЛЮЧ ДО ТОГО, КАК ОН ПОПАДЁТ НА МАШИНУ, МОЖНО ЛИШЬ В РАЗДАЧУ,       │
+		// │ КОТОРАЯ УЖЕ ОТВЕЧАЕТ. В неё и пишем: неудача на полпути иначе оставила бы на │
+		// │ чужой машине строку с ключом, которого у юзера нет, — и убрать её было бы     │
+		// │ нечем.                                                                        │
+		// │                                                                               │
+		// │ Когда раздачи ЕЩЁ НЕТ — а её и поднимают этим же ходом — писать физически     │
+		// │ НЕКУДА: `PUT` уходит по адресу, который `postScope` двумя шагами выше уже     │
+		// │ признал молчащим, и заведение падает `no-answer` ДО первого касания машины.   │
+		// │ Так оно и падало, ровно на главном пути продукта: пароль, чистая машина,      │
+		// │ раздачи там нет (живой прогон 2026-08-20).                                    │
+		// └──────────────────────────────────────────────────────────────────────────────┘
+		//
+		// Тогда ключ уезжает в скоуп общей записью — после того, как раздача поднята
+		// (`postScope`, один `Write` на всё состояние). Цена при этом названа по-прежнему:
+		// строку, легшую на чужую машину, юзер видит в `note` ответа.
+		if раздачаОтвечает {
+			if ref := sc.Write(ctx, st); ref != nil {
+				return state.Key{}, "", ref
+			}
 		}
 	}
 	authorized, ref := creds.Authorized(key.Value)
@@ -773,7 +791,10 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 
 	// Креды двух видов, и вид назван явно. Паролем контроллер заходит ОДИН раз — и
 	// говорит об этом вслух до того, как тронет чужую машину.
-	key, цена, ref := h.machineKey(r.Context(), sess.sc, st, body.Name, body.Addr, body.Creds)
+	// Раздача здесь заведомо отвечает: без неё не состоялся бы вход, а состояние этой
+	// сессии только что из неё и прочитано. Значит ключ ложится в скоуп ДО машины — как и
+	// задумано, и обратный порядок тут не нужен.
+	key, цена, ref := h.machineKey(r.Context(), sess.sc, st, body.Name, body.Addr, body.Creds, true)
 	if ref != nil {
 		return ref
 	}
