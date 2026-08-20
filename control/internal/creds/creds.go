@@ -67,7 +67,40 @@ const (
 
 // comment — подпись в строке `authorized_keys`. Человек, открывший файл своей машины,
 // обязан понимать, откуда там эта строка и чем её убрать.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПОДПИСЬ ОБЯЗАНА РАЗЛИЧАТЬ, А НЕ ТОЛЬКО ОБЪЯСНЯТЬ. Пока она была одна на всех, мы      │
+// │ обещали юзеру «убрать доступ можно, удалив эту строку» — и обещание было              │
+// │ неисполнимым: строк на машине накапливалось с десяток, все подписаны `world-control`, │
+// │ и какая от какого скоупа, узнать было нечем (живой прогон 2026-08-20).                │
+// │                                                                                       │
+// │ Различает АДРЕС СКОУПА: единица личности — адрес, а не машина и не имя (`WORLD2` 3.4, │
+// │ «Копий нет — есть адреса»). По нему человек и опознаёт свою строку.                    │
+// │                                                                                       │
+// │ СРАВНИВАЕМ ПРИ ЭТОМ НЕ ПОДПИСЬ, А КЛЮЧ (`keyPart`): подпись — это слова для человека, │
+// │ и если по ней искать, смена слов положила бы на машину ВТОРУЮ строку с тем же ключом. │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
 const comment = "world-control"
+
+// Sign — подпись строки для названного скоупа. Пустой адрес оставляет прежнюю подпись:
+// так подписаны ключи, положенные до этого правила, и переподписывать их нечем — да и
+// незачем, ключ от этого не меняется.
+func Sign(scopeAddr string) string {
+	if strings.TrimSpace(scopeAddr) == "" {
+		return comment
+	}
+	return comment + " " + strings.TrimSpace(scopeAddr)
+}
+
+// keyPart — «тип ключ» без подписи. Строки сравниваются ИМ: ключ — это то, что даёт
+// доступ, а подпись лишь объясняет человеку, откуда он взялся.
+func keyPart(line string) string {
+	f := strings.Fields(strings.TrimSpace(line))
+	if len(f) < 2 {
+		return strings.TrimSpace(line)
+	}
+	return f[0] + " " + f[1]
+}
 
 // ParseKind — вид кред, названный явно. Пустое и неизвестное — РАЗНЫЕ отказы: первое
 // значит «не сказали», второе «сказали не то», и чинятся они по-разному.
@@ -113,7 +146,7 @@ type Pair struct {
 // Generate заводит новую пару. Ed25519, потому что это сегодняшнее умолчание OpenSSH:
 // короткий ключ, без параметров, которые надо выбирать (сверка с рынком 2026-08-17 —
 // `ssh-keygen` без ключей заводит ed25519 с OpenSSH 9).
-func Generate() (Pair, *refusal.Refusal) {
+func Generate(sign string) (Pair, *refusal.Refusal) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return Pair{}, refusal.New(http.StatusInternalServerError, "no-key",
@@ -121,7 +154,7 @@ func Generate() (Pair, *refusal.Refusal) {
 			"попробуй ещё раз",
 			"если повторяется — это дефект контроллера, заведи задачу зоне control")
 	}
-	block, err := ssh.MarshalPrivateKey(priv, comment)
+	block, err := ssh.MarshalPrivateKey(priv, sign)
 	if err != nil {
 		return Pair{}, refusal.New(http.StatusInternalServerError, "no-key",
 			"приватный ключ не собрался: "+err.Error(),
@@ -135,14 +168,14 @@ func Generate() (Pair, *refusal.Refusal) {
 	}
 	return Pair{
 		Private:    string(pem.EncodeToMemory(block)),
-		Authorized: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer))) + " " + comment,
+		Authorized: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer))) + " " + sign,
 	}, nil
 }
 
 // Authorized — строка `authorized_keys` по приватному ключу, который уже лежит в скоупе.
 // Публичный ключ в формате не хранится намеренно: он производен от приватного, а второе
 // поле того же самого однажды разъехалось бы с первым.
-func Authorized(private string) (string, *refusal.Refusal) {
+func Authorized(private, sign string) (string, *refusal.Refusal) {
 	signer, err := ssh.ParsePrivateKey([]byte(private))
 	if err != nil {
 		return "", refusal.New(http.StatusBadGateway, "bad-key",
@@ -150,7 +183,7 @@ func Authorized(private string) (string, *refusal.Refusal) {
 			"посмотри раздел «ключи» в состоянии: там лежит приватный ключ в формате OpenSSH",
 			"либо заведи территорию заново — контроллер заведёт новый ключ")
 	}
-	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + comment, nil
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + sign, nil
 }
 
 // Install кладёт публичный ключ на машину, зайдя туда ПАРОЛЕМ.
@@ -334,11 +367,13 @@ func RemoveByKey(ctx context.Context, m Machine, private, authorized, knownHosts
 // принадлежит юзеру, и всё остальное в нём — не наше дело. Через временный файл рядом,
 // потому что перенаправление в тот же файл обнулило бы его до чтения.
 func remove(authorized string) string {
-	line := quote(authorized)
+	// Убираем ПО КЛЮЧУ, а не по строке целиком: подписи у одного и того же ключа могли
+	// меняться, и строка со старой подписью иначе осталась бы на машине навсегда.
+	line := quote(keyPart(authorized))
 	return strings.Join([]string{
 		"umask 077",
 		"[ -f ~/.ssh/authorized_keys ] || exit 0",
-		"grep -vxF -- " + line + " ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.world-tmp",
+		"grep -vF -- " + line + " ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.world-tmp",
 		"mv ~/.ssh/authorized_keys.world-tmp ~/.ssh/authorized_keys",
 		"chmod 600 ~/.ssh/authorized_keys",
 	}, "\n")
@@ -361,17 +396,20 @@ func lastLine(s string) string {
 // десяток наших ключей, и убирать их пришлось бы человеку руками.
 func install(authorized string) string {
 	line := quote(authorized)
+	// Ищем ключ, а кладём строку с подписью: подпись — слова для человека, и по ней искать
+	// нельзя. Смена слов иначе положила бы ВТОРУЮ строку с тем же ключом.
+	ключ := quote(keyPart(authorized))
 	return strings.Join([]string{
 		"umask 077",
 		"mkdir -p ~/.ssh",
 		"touch ~/.ssh/authorized_keys",
 		"chmod 700 ~/.ssh",
 		"chmod 600 ~/.ssh/authorized_keys",
-		"grep -qxF -- " + line + " ~/.ssh/authorized_keys || printf '%s\\n' " + line + " >> ~/.ssh/authorized_keys",
+		"grep -qF -- " + ключ + " ~/.ssh/authorized_keys || printf '%s\\n' " + line + " >> ~/.ssh/authorized_keys",
 		// Счёт печатается ВСЕГДА: `grep -c` на ноль совпадений выходит единицей, и без
 		// `|| true` «ноль строк» было бы неотличимо от «команда упала». А различать их
 		// надо: в первом случае мы точно знаем, что не записалось.
-		"grep -cxF -- " + line + " ~/.ssh/authorized_keys 2>/dev/null || true",
+		"grep -cF -- " + ключ + " ~/.ssh/authorized_keys 2>/dev/null || true",
 	}, "\n")
 }
 
