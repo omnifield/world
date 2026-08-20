@@ -245,7 +245,7 @@ func TestСнятиеТогоЧегоПодъёмНеНашлоНеЗапира�
 		}
 		return докерОтвечает(c)
 	})
-	dropped, ref := m.Lower(context.Background(), "vps", рецептДвери, "", nil, false, false)
+	dropped, ref := m.Lower(context.Background(), Drop{Name: "vps", RecipePath: рецептДвери})
 	if ref != nil {
 		t.Fatalf("снятие уперлось в отказ и заперло участок: %+v", ref)
 	}
@@ -256,7 +256,7 @@ func TestСнятиеТогоЧегоПодъёмНеНашлоНеЗапира�
 
 func TestСнятиеНазываетЧтоОсталось(t *testing.T) {
 	m, fake, _ := стенд(t, докерОтвечает)
-	dropped, ref := m.Lower(context.Background(), "vps", рецептДвери, "door", nil, false, false)
+	dropped, ref := m.Lower(context.Background(), Drop{Name: "vps", RecipePath: рецептДвери, RecipeName: "door", Ручка: "DELETE /api/resources/vps"})
 	if ref != nil {
 		t.Fatal(ref.Why)
 	}
@@ -326,7 +326,7 @@ func TestМеткаПутиДовозитсяДословноИТолькоОн�
 // и тома. Снять без них значит снять вещь ПО УМОЛЧАНИЮ — то есть соседнюю.
 func TestСнятиеВезётЗначенияРецепта(t *testing.T) {
 	m, fake, _ := стенд(t, докерОтвечает)
-	if _, ref := m.Lower(context.Background(), "vps", рецептДвери, "", []string{"SHARE_NAME=vps-8071"}, false, false); ref != nil {
+	if _, ref := m.Lower(context.Background(), Drop{Name: "vps", RecipePath: рецептДвери, Env: []string{"SHARE_NAME=vps-8071"}}); ref != nil {
 		t.Fatal(ref.Why)
 	}
 	var env []string

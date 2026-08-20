@@ -6,6 +6,7 @@
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
 //	POST   /api/scope              завести скоуп: две пары — машина и скоуп — плюс личность
+//	DELETE /api/scope              снять скоуп по адресу: то же тело, что у заведения
 //	POST   /api/session            вход: АДРЕС и ПАРОЛЬ, и больше ничего
 //	DELETE /api/session            выход: времянки контроллера снимаются
 //	GET    /api/me                 кто я сейчас
@@ -188,6 +189,10 @@ func New(opt Options) *Handler {
 	}
 
 	h.mux.HandleFunc("POST /api/scope", h.wrap("scope-create", h.postScope))
+	// СНЯТИЕ СИММЕТРИЧНО ЗАВЕДЕНИЮ, и это не украшение таблицы: что мир умеет завести, он
+	// обязан уметь и убрать. Иначе поднятая раздача снимается только руками на той машине —
+	// то есть мир заводит вещи, за которые потом не отвечает (решение user 2026-08-20).
+	h.mux.HandleFunc("DELETE /api/scope", h.wrap("scope-drop", h.deleteScope))
 	h.mux.HandleFunc("POST /api/session", h.wrap("session", h.postSession))
 	h.mux.HandleFunc("DELETE /api/session", h.wrap("session-out", h.deleteSession))
 	h.mux.HandleFunc("GET /api/me", h.wrap("me", h.getMe))
@@ -271,25 +276,37 @@ func (rc *recorder) WriteHeader(code int) {
 //	машина  адрес и креды РЕСУРСА — по ним контроллер туда дотянется и поднимет раздачу;
 //	скоуп   адрес, по которому состояние будет раздаваться, и пароль — по ним потом входят.
 //
-// Креды машины юзер даёт РУКАМИ, а не берёт из скоупа: скоупа в этот момент ещё нет.
-// После создания они записываются В НЕГО, в раздел `территории`, и дальше берутся оттуда.
+// Креды машины юзер даёт РУКАМИ, а не берёт из скоупа: скоупа в этот момент ещё нет. И
+// после заведения их там тоже нет — мир поднял раздачу и ушёл (`WORLD2-152`). Территорию
+// заводит отдельное решение юзера (`POST /api/resources`), и вот тогда креды ложатся в
+// скоуп, потому что мир на ту машину ХОДИТ.
+//
 // На слиянии этих двух пар в одну выросла мёртвая `WORLD2-77`.
 type scopeBody struct {
-	Scope struct {
-		Addr     string `json:"addr"`
-		Password string `json:"password"`
-	} `json:"scope"`
+	Scope    scopePair `json:"scope"`
 	Identity struct {
 		Name  string `json:"name"`
 		Brand string `json:"brand"`
 	} `json:"identity"`
 	// Machine — где поднять раздачу. Не назвали — значит раздача по адресу уже стоит
 	// (юзер поднял её сам: это его вилка, и мир в неё не смотрит — `0.3`).
-	Machine *struct {
-		Name  string    `json:"name"`
-		Addr  string    `json:"addr"`
-		Creds credsBody `json:"creds"`
-	} `json:"machine"`
+	Machine *machinePair `json:"machine"`
+}
+
+// scopePair — ПАРА СКОУПА: где он будет раздаваться и чем закрыт. Пароль здесь не «поле
+// формы», а доказательство: им и заводят, и входят, и снимают.
+type scopePair struct {
+	Addr     string `json:"addr"`
+	Password string `json:"password"`
+}
+
+// machinePair — ПАРА МАШИНЫ: как её зовёт юзер, где она и чем до неё дотянуться. Названа
+// один раз на обе ручки: заведение и снятие принимают ОДНО И ТО ЖЕ, и разъехаться этим
+// двум описаниям было бы нечем, только если описание одно.
+type machinePair struct {
+	Name  string    `json:"name"`
+	Addr  string    `json:"addr"`
+	Creds credsBody `json:"creds"`
 }
 
 func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
@@ -338,6 +355,19 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 			"проверь адрес и порт: наша раздача по умолчанию слушает 8070")
 	}
 
+	// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+	// │ СВЕЖИЙ СКОУП — ЭТО ЛИЧНОСТЬ И ПУСТОТА (`WORLD2` 3.4, «Почему так», п. 5).            │
+	// │                                                                                      │
+	// │ Ни территории, ни ключа сюда не пишется, и это ПРИЧИНА, а не косметика. Записывая    │
+	// │ машину раздачи территорией, заведение делало два дела вместо одного: у скоупа        │
+	// │ появлялся «дом», снятие такого участка приходилось запрещать (`drop-scope-home`), а  │
+	// │ ключ мира оставался на чужой машине навсегда — убрать его через мир было нельзя ПО   │
+	// │ УСТРОЙСТВУ. Живой прогон 2026-08-20: одиннадцать строк на одной машине.               │
+	// │                                                                                      │
+	// │ «В документах юзера не пишут, где эти документы лежат» — решение user 2026-08-20     │
+	// │ (`WORLD2-152`). Территорию заводит он сам, отдельным ходом, и та же машина там        │
+	// │ законна: это его решение, а не побочный след заведения.                               │
+	// └─────────────────────────────────────────────────────────────────────────────────────┘
 	st := state.New(strings.TrimSpace(body.Identity.Name), body.Identity.Brand)
 	// завелось — дошли ли до конца. Читается отложенной уборкой ниже: пока здесь `false`,
 	// всё, что мы успели оставить на ЧУЖОЙ машине, подлежит снятию.
@@ -347,8 +377,11 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	// придётся ими же: рецепт собирает из `SHARE_NAME` имя проекта, контейнера и тома, и
 	// снятие без него сняло бы раздачу ПО УМОЛЧАНИЮ — то есть чужую, а нашу оставило бы.
 	var shareEnv []string
-	// цена — что контроллер изменил на ЧУЖОЙ машине, если заходил паролем. Пусто — не
-	// заходил и ничего там не менял.
+	// уход — чем мир уходит с машины: убирает свою строку из её `~/.ssh/authorized_keys`.
+	// Пусто — класть было нечего (юзер дал свой ключ), и трогать там нечего тем более.
+	var уход func() *refusal.Refusal
+	// цена — что контроллер изменил на ЧУЖОЙ машине и что там осталось. Пусто — не заходил
+	// и ничего не менял.
 	цена := ""
 	if m := body.Machine; m != nil {
 		if ref := resource.ValidName(m.Name); ref != nil {
@@ -369,55 +402,77 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 
 		// Креды двух видов: свой ключ либо пароль машины. Паролем контроллер один раз
 		// заходит и заводит ключ — сам пароль дальше не живёт (`WORLD2-141`).
-		key, note, ref := h.machineKey(r.Context(), sc, st, m.Name, m.Addr, m.Creds, presence == scope.PresenceEmpty)
+		ключ, строка, ref := h.ключРаздачи(r.Context(), sc, m.Addr, m.Creds)
 		if ref != nil {
 			return ref
 		}
-		цена = note
 
 		// ┌───────────────────────────────────────────────────────────────────────────────┐
-		// │ УБРАТЬ ЗА СОБОЙ НА ЧУЖОЙ МАШИНЕ, ЕСЛИ ЗАВЕДЕНИЕ НЕ СОСТОИТСЯ.                  │
+		// │ СТРОКА, КОТОРУЮ МЫ ПОЛОЖИЛИ, УХОДИТ В ЛЮБОМ ИСХОДЕ.                            │
 		// │                                                                                │
-		// │ Ключ уже лежит в её `authorized_keys`, а скоуп ещё не записан. Упади мы здесь — │
-		// │ и у юзера на машине останется доступ, приватной половины которого у него НЕТ:  │
-		// │ опознать строку и убрать её ему нечем. Живой прогон 2026-08-20: за несколько    │
-		// │ неудачных попыток их накопилось шесть.                                          │
+		// │ Заведение состоялось — мир на эту машину больше не ходит, и оставленный ключ    │
+		// │ был бы доступом, о котором юзер не просил. Не состоялось — тем более: скоуп не  │
+		// │ записан, приватной половины у юзера нет, опознать строку и убрать её ему нечем  │
+		// │ (живой прогон 2026-08-20 — шесть строк за несколько неудачных попыток).          │
 		// │                                                                                │
 		// │ Снимаем ровно то, что положили, и только когда положили ПАРОЛЕМ: свой ключ      │
 		// │ юзера мы на машину не клали и трогать его не смеем.                             │
 		// └───────────────────────────────────────────────────────────────────────────────┘
-		if note != "" {
-			if authorized, ref := creds.Authorized(key.Value, creds.Sign(sc.Addr.String())); ref == nil {
-				if user, host, port, ref := resource.SplitAddr(m.Addr); ref == nil {
-					машина, пароль := creds.Machine{User: user, Host: host, Port: port}, m.Creds.Value
-					defer func() {
-						if завелось {
-							return
-						}
-						creds.Remove(r.Context(), машина, пароль, authorized,
-							filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
-						h.opt.Logf("control: заведение не состоялось — снял свою строку из ~/.ssh/authorized_keys машины %s", m.Addr)
-					}()
-				}
+		if строка != "" {
+			user, host, port, ref := resource.SplitAddr(m.Addr)
+			if ref != nil {
+				return ref
 			}
+			машина, пароль := creds.Machine{User: user, Host: host, Port: port}, m.Creds.Value
+			уход = func() *refusal.Refusal {
+				return creds.Remove(r.Context(), машина, пароль, строка,
+					filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
+			}
+			defer func() {
+				if завелось {
+					return // ушли выше, на удачном пути, и сказали об этом юзеру
+				}
+				if ref := уход(); ref != nil {
+					h.opt.Logf("control: заведение не состоялось, и строку с машины %s убрать не вышло: %s", m.Addr, ref.Why)
+					return
+				}
+				h.opt.Logf("control: заведение не состоялось — снял свою строку из ~/.ssh/authorized_keys машины %s", m.Addr)
+			}()
 		}
 
 		// Ключ кладётся ДО подъёма: докер пойдёт по ssh сам и возьмёт его из связки.
-		if ref := h.res.PutKey(m.Name, m.Addr, key.Value); ref != nil {
+		if ref := h.res.PutKey(m.Name, m.Addr, ключ); ref != nil {
 			return ref
 		}
 		shareEnv = shareVars(m.Name, addr, body.Scope.Password)
-		вещь, ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, shareEnv)
-		if ref != nil {
+		// Имя поднятой вещи сосед называет, а помнить его тут некому и незачем: территории у
+		// свежего скоупа нет. Имя вещи запоминает тот, кто ЗАВОДИТ участок.
+		if _, ref := h.res.Raise(r.Context(), m.Name, m.Addr, shareRecipe, shareEnv); ref != nil {
 			h.res.DropKey(m.Name)
 			return ref
 		}
 		raised = m.Name
 
-		// Имя поднятой вещи запоминается В СКОУПЕ: на этой машине могут стоять вещи чужих
-		// юзеров, и отличить своё можно только помня, что заводил сам.
-		if ref := st.AddTerritory(state.Territory{Name: m.Name, Addr: m.Addr, Things: вещи(вещь)}, key); ref != nil {
-			return ref
+		// ┌───────────────────────────────────────────────────────────────────────────────┐
+		// │ РАЗДАЧА ВСТАЛА НА СТАРЫЙ ТОМ, И В НЁМ УЖЕ ЛЕЖИТ ЛИЧНОСТЬ — НЕ ПИШЕМ ПОВЕРХ.    │
+		// │                                                                                │
+		// │ Спрашивать надо ЗДЕСЬ: до подъёма по адресу не отвечал никто, и «пусто» тогда   │
+		// │ значило лишь «раздачи нет». Том её переживает нарочно (`DELETE /api/scope` без  │
+		// │ `with-state`), и поднятая заново раздача отдаёт то, что в нём лежало. Пиши мы   │
+		// │ поверх — обещание «том остался, личность цела» было бы ложью через один вызов.  │
+		// │                                                                                │
+		// │ Раздачу при этом НЕ снимаем: она уже отдаёт ту личность, и снять её значило бы  │
+		// │ отобрать у юзера единственный вход в неё. Мир уходит с машины иначе — снимает    │
+		// │ свою строку и времянки, что и делает отложенная уборка ниже.                     │
+		// └───────────────────────────────────────────────────────────────────────────────┘
+		if встало, ref := sc.Look(r.Context()); ref == nil && встало == scope.PresenceState {
+			h.res.DropKey(m.Name)
+			h.res.DropContext(r.Context(), m.Name)
+			return refusal.New(http.StatusConflict, "scope-exists",
+				fmt.Sprintf("раздача по адресу %s поднята, и в её томе уже лежит личность — заводить поверх значит стереть её", addr),
+				"войди в неё: POST /api/session с этим адресом и паролем — раздача стоит и отвечает",
+				"это не твоя личность — назови другое имя тома у рецепта раздачи либо другое имя участка",
+				"стереть её насовсем и завести заново: DELETE /api/scope?with-state=1, потом POST /api/scope")
 		}
 	}
 
@@ -431,6 +486,24 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		return ref
 	}
 
+	// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+	// │ МИР ПОДНЯЛ РАЗДАЧУ И УШЁЛ С МАШИНЫ. Здесь, а не раньше: до записи состояния уборка   │
+	// │ за неудачей ещё ходит на ту машину нашим же ключом (`lowerQuietly`), и сняв строку   │
+	// │ до этого, мы отрезали бы себе руку, которой убираем.                                 │
+	// └─────────────────────────────────────────────────────────────────────────────────────┘
+	var осталось *refusal.Refusal
+	if уход != nil {
+		if осталось = уход(); осталось == nil {
+			цена = "на машину " + body.Machine.Addr + " заходили паролем ОДИН раз: положили строку в её ~/.ssh/authorized_keys и убрали " +
+				"её сразу после подъёма раздачи — мир туда больше не ходит, своего на ней не осталось; пароль нигде не сохранён"
+			h.opt.Logf("control: раздача поднята — снял свою строку из ~/.ssh/authorized_keys машины %s: мир туда больше не ходит", body.Machine.Addr)
+		} else {
+			цена = осталось.Why
+			h.opt.Logf("control: раздача поднята, а строку с машины %s убрать не вышло: %s", body.Machine.Addr, осталось.Why)
+		}
+	}
+	// Времянки заведения (ключ в связке, блок в `config`, контекст докера) снимает `Bind`:
+	// он раскладывает связку ЦЕЛИКОМ из скоупа, а в свежем скоупе территорий нет.
 	if ref := h.res.Bind(r.Context(), st); ref != nil {
 		return ref
 	}
@@ -448,9 +521,56 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	if цена != "" {
 		ответ["note"] = цена
 	}
+	if осталось != nil {
+		// Выходы уезжают человеку целиком: строка на ЕГО машине, и убрать её теперь может
+		// только он — значит обязан знать, какая именно и чем.
+		ответ["ways"] = осталось.Ways
+	}
 	завелось = true
 	writeJSON(w, http.StatusCreated, ответ)
 	return nil
+}
+
+// ключРаздачи — чем контроллер дотянется до машины, чтобы поднять на ней раздачу, и какую
+// строку он на этой машине оставил (пусто — не оставлял).
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ В СКОУП ЭТОТ КЛЮЧ НЕ ПОПАДАЕТ — этим он и отличается от ключа ТЕРРИТОРИИ.            │
+// │                                                                                      │
+// │ Ключ территории живёт в скоупе, потому что мир на ту машину ХОДИТ: поднимает вещи,   │
+// │ спрашивает, что стоит, снимает. К машине раздачи он идёт РОВНО ОДИН раз — поднять её │
+// │ — и уходит. Ключ, положенный в скоуп «на всякий случай», был бы доступом, о котором  │
+// │ юзер не просил, а свежий скоуп обязан быть пустым (`WORLD2` 3.4).                     │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func (h *Handler) ключРаздачи(ctx context.Context, sc *scope.Scope, addr string, body credsBody) (string, string, *refusal.Refusal) {
+	kind, ref := creds.ParseKind(body.Kind)
+	if ref != nil {
+		return "", "", ref
+	}
+	if strings.TrimSpace(body.Value) == "" {
+		return "", "", noCreds(kind)
+	}
+	if kind == creds.Key {
+		// Свой ключ юзера: идём им как есть. На его машине не появляется ни одной строки, и
+		// убирать потом нечего — трогать чужие строки мир не смеет.
+		return body.Value, "", nil
+	}
+
+	user, host, port, ref := resource.SplitAddr(addr)
+	if ref != nil {
+		return "", "", ref
+	}
+	pair, ref := creds.Generate(creds.Sign(sc.Addr.String()))
+	if ref != nil {
+		return "", "", ref
+	}
+	// ЦЕНА НАЗЫВАЕТСЯ ДО ДЕЙСТВИЯ, а не после. Пароля в этой строке нет и быть не может.
+	h.opt.Logf("control: машина %s: захожу паролем ОДИН раз и кладу ключ в её ~/.ssh/authorized_keys — уберу его, как только раздача встанет", addr)
+	if ref := creds.Install(ctx, creds.Machine{User: user, Host: host, Port: port},
+		body.Value, pair.Authorized, filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout); ref != nil {
+		return "", "", ref
+	}
+	return pair.Private, pair.Authorized, nil
 }
 
 // shareRecipe — рецепт раздачи скоупа. Своего перечня вещей у зоны нет и здесь тоже: это
@@ -479,7 +599,9 @@ func (h *Handler) shareRecipe() (string, *refusal.Refusal) {
 // машине, а нашу оставил бы жить (`WORLD2-150` B3).
 func (h *Handler) lowerQuietly(ctx context.Context, name string, env []string) {
 	if recipePath, ref := h.shareRecipe(); ref == nil {
-		if _, ref := h.res.Lower(ctx, name, recipePath, "", env, false, false); ref != nil {
+		// Ручка здесь не названа намеренно: это уборка за неудачей, её выходы человеку не
+		// уезжают вовсе — ему уже сказана настоящая причина.
+		if _, ref := h.res.Lower(ctx, resource.Drop{Name: name, RecipePath: recipePath, Env: env}); ref != nil {
 			h.opt.Logf("control: раздачу %s снять за собой не вышло: %s", name, ref.Why)
 		}
 	}
@@ -557,10 +679,13 @@ type credsBody struct {
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
 // Ключ юзера ОДИН на скоуп: тот же ключ, положенный второй раз, строки не плодит.
-// `раздачаОтвечает` — стоит ли уже раздача по адресу скоупа. От этого зависит, можно ли
-// записать в неё ключ ДО того, как он ляжет на чужую машину: в стоящую — можно и нужно, а
-// той, которую этот же ход только поднимет, ещё нет на свете.
-func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.State, name, addr string, body credsBody, раздачаОтвечает bool) (state.Key, string, *refusal.Refusal) {
+//
+// РАЗДАЧА ЗДЕСЬ ЗАВЕДОМО ОТВЕЧАЕТ, и поэтому ключ пишется в скоуп ДО того, как ляжет на
+// чужую машину: территорию заводят из сессии, а сессии без живой раздачи не бывает. Прежде
+// сюда ходило и заведение скоупа — с оговоркой «а если раздачи ещё нет, писать некуда»; с
+// `WORLD2-152` оно ходит своим путём (`ключРаздачи`) и в скоуп не пишет вовсе, так что
+// оговорки больше нет — вместе с полем, которым она держалась.
+func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.State, name, addr string, body credsBody) (state.Key, string, *refusal.Refusal) {
 	kind, ref := creds.ParseKind(body.Kind)
 	if ref != nil {
 		return state.Key{}, "", ref
@@ -589,25 +714,12 @@ func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.Sta
 		key = state.Key{Name: state.UserKeyName, Kind: state.KindSSH, Value: pair.Private}
 		st.SetKey(key)
 		// ┌──────────────────────────────────────────────────────────────────────────────┐
-		// │ ЗАПИСАТЬ КЛЮЧ ДО ТОГО, КАК ОН ПОПАДЁТ НА МАШИНУ, МОЖНО ЛИШЬ В РАЗДАЧУ,       │
-		// │ КОТОРАЯ УЖЕ ОТВЕЧАЕТ. В неё и пишем: неудача на полпути иначе оставила бы на │
-		// │ чужой машине строку с ключом, которого у юзера нет, — и убрать её было бы     │
-		// │ нечем.                                                                        │
-		// │                                                                               │
-		// │ Когда раздачи ЕЩЁ НЕТ — а её и поднимают этим же ходом — писать физически     │
-		// │ НЕКУДА: `PUT` уходит по адресу, который `postScope` двумя шагами выше уже     │
-		// │ признал молчащим, и заведение падает `no-answer` ДО первого касания машины.   │
-		// │ Так оно и падало, ровно на главном пути продукта: пароль, чистая машина,      │
-		// │ раздачи там нет (живой прогон 2026-08-20).                                    │
+		// │ КЛЮЧ ПИШЕТСЯ В СКОУП ДО ТОГО, КАК ПОПАДЁТ НА МАШИНУ. Неудача на полпути иначе │
+		// │ оставила бы на чужой машине строку с ключом, которого у юзера нет, — и убрать │
+		// │ её было бы нечем.                                                             │
 		// └──────────────────────────────────────────────────────────────────────────────┘
-		//
-		// Тогда ключ уезжает в скоуп общей записью — после того, как раздача поднята
-		// (`postScope`, один `Write` на всё состояние). Цена при этом названа по-прежнему:
-		// строку, легшую на чужую машину, юзер видит в `note` ответа.
-		if раздачаОтвечает {
-			if ref := sc.Write(ctx, st); ref != nil {
-				return state.Key{}, "", ref
-			}
+		if ref := sc.Write(ctx, st); ref != nil {
+			return state.Key{}, "", ref
 		}
 	}
 	authorized, ref := creds.Authorized(key.Value, creds.Sign(sc.Addr.String()))
@@ -625,6 +737,277 @@ func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.Sta
 
 	return key, "на машину " + addr + " положен публичный ключ юзера (одна строка в её ~/.ssh/authorized_keys, подпись world-control) — " +
 		"пароль дальше не нужен и нигде не сохранён; убрать доступ можно, удалив эту строку", nil
+}
+
+// ── снять скоуп ──────────────────────────────────────────────────────────────
+
+// scopeDropBody — то же, что у заведения, МИНУС личность: снимают то, что лежит по адресу,
+// а не того, кем себя назвали. Личность в этом теле не поле, а недоразумение — и поэтому
+// она здесь не игнорируется молча, а краснеет лишним полем (`decode`).
+type scopeDropBody struct {
+	Scope scopePair `json:"scope"`
+	// Machine — ГДЕ снимать, и назвать её обязательно: в скоупе кред нет и не было (мир их
+	// туда не клал), а до машины надо дотянуться, чтобы снять с неё раздачу.
+	Machine *machinePair `json:"machine"`
+}
+
+// deleteScope — СНЯТЬ СКОУП ПО АДРЕСУ.
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ СИММЕТРИЯ ЗАВЕДЕНИЮ — ГЛАВНОЕ ТРЕБОВАНИЕ (решение user 2026-08-20, `WORLD2-152`):    │
+// │ «есть ручка создать скоуп на машине по адресу — значит есть и снять по адресу».      │
+// │ Мир, умеющий заводить и не умеющий убирать, оставляет за собой вещи, за которые       │
+// │ отвечать некому: снять раздачу можно было только руками на той машине.                │
+// │                                                                                      │
+// │ Три дела, и о каждом сказано вслух:                                                   │
+// │   1. раздача снимается ТЕМ ЖЕ рецептом и ТЕМИ ЖЕ значениями, какими поднята;          │
+// │   2. наша строка уходит из `~/.ssh/authorized_keys` машины — мир уходит совсем;       │
+// │   3. контекст докера и ключ снимаются из связки контроллера.                          │
+// │                                                                                      │
+// │ ТОМ РАЗДАЧИ ПО УМОЛЧАНИЮ ОСТАЁТСЯ: снятие вещи не означает потерю личности (`1.9`).   │
+// │ Стереть — отдельно и явно, `?with-state=1`, и оба исхода названы словами.              │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func (h *Handler) deleteScope(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	var body scopeDropBody
+	if ref := decode(r, &body); ref != nil {
+		return ref
+	}
+	addr, ref := scope.Parse(body.Scope.Addr)
+	if ref != nil {
+		return ref
+	}
+	// ПАРОЛЬ ОБЯЗАТЕЛЕН: им доказывают, что скоуп твой. Проверяет его сама раздача — мы лишь
+	// спрашиваем её тем же паролем, и `401` приезжает отказом `bad-password`.
+	if body.Scope.Password == "" {
+		return noPassword()
+	}
+	m := body.Machine
+	if m == nil {
+		return refusal.New(http.StatusBadRequest, "no-machine",
+			"снять раздачу можно только НА машине, а машина не названа — из скоупа её кред взять неоткуда, мир их туда и не клал",
+			`назови её так же, как при заведении: machine = {"name":"vps","addr":"world@10.8.0.5","creds":{"kind":"password","value":"…"}}`,
+			"имя участка назови ТО ЖЕ, что при заведении: из него и порта скоупа собрано имя раздачи, и снимается она по нему")
+	}
+	if ref := resource.ValidName(m.Name); ref != nil {
+		return ref
+	}
+	if _, _, ref := resource.CheckAddr(m.Addr); ref != nil {
+		return ref
+	}
+	shareRecipe, ref := h.shareRecipe()
+	if ref != nil {
+		return ref
+	}
+
+	sc := scope.Open(addr, body.Scope.Password, h.opt.ScopeTimeout)
+	presence, ref := sc.Look(r.Context())
+	if ref != nil {
+		return ref
+	}
+	if presence == scope.PresenceNone {
+		// ПОВТОРНЫЙ ВЫЗОВ ПРИХОДИТ СЮДА ЖЕ, и это не поломка, а ответ: раздачи по адресу нет.
+		return refusal.New(http.StatusNotFound, "no-share",
+			fmt.Sprintf("по адресу %s раздачи нет — снимать нечего", addr),
+			"проверь адрес и порт: снимают по тому же адресу, по которому заводили",
+			"если её уже сняли — это тот же ответ во второй раз, а не ошибка",
+			"она стоит, но не отвечает — сними её на той машине: ./deploy/remote.sh drop <имя участка> --recipe <рецепт раздачи>")
+	}
+
+	// КЛЮЧ САМОГО СКОУПА — тот, что мир завёл ему паролем (`ключ юзера`). Скоуп снимается,
+	// значит и доступ, выданный ради него, обязан уйти. Читаем состояние ДО снятия: после
+	// него спросить будет некого.
+	var свой string
+	var st *state.State
+	нечитаемо := ""
+	if presence == scope.PresenceState {
+		прочитано, ref := sc.Read(r.Context())
+		if ref != nil {
+			// Состояние не читается — снятию это не мешает (раздача есть, и она наша по
+			// паролю), но своих прежних ключей мы на этой машине не найдём. Молчать нельзя.
+			нечитаемо = "состояние по адресу прочитать не вышло (" + ref.Code + "), поэтому прежний ключ скоупа на машине не искали"
+		} else {
+			st = прочитано
+			if k, есть := st.Key(state.UserKeyName); есть {
+				свой = k.Value
+			}
+		}
+	}
+
+	h.live.Start("scope-drop", m.Name)
+	defer h.live.Done()
+
+	ключ, строка, ref := h.ключРаздачи(r.Context(), sc, m.Addr, m.Creds)
+	if ref != nil {
+		return ref
+	}
+	user, host, port, ref := resource.SplitAddr(m.Addr)
+	if ref != nil {
+		return ref
+	}
+	машина := creds.Machine{User: user, Host: host, Port: port}
+	// Строка, положенная ЭТИМ ходом, — временная: она нужна ровно на время снятия и уходит в
+	// любом исходе, удачном и нет.
+	снято := false
+	if строка != "" {
+		defer func() {
+			if снято {
+				return // ушли ниже, на удачном пути, и сказали об этом юзеру
+			}
+			if ref := creds.Remove(r.Context(), машина, m.Creds.Value, строка,
+				filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout); ref != nil {
+				h.opt.Logf("control: снятие не состоялось, и временную строку с машины %s убрать не вышло: %s", m.Addr, ref.Why)
+			}
+		}()
+	}
+
+	// Ключ и КОНТЕКСТ кладутся до вызова: снятие берёт адрес машины из контекста, а не из
+	// наших аргументов (`deploy/remote.sh`, `cmd_drop`).
+	if ref := h.res.PutKey(m.Name, m.Addr, ключ); ref != nil {
+		return ref
+	}
+	if ref := h.res.PutContext(r.Context(), m.Name, m.Addr); ref != nil {
+		h.res.DropKey(m.Name)
+		return ref
+	}
+	dropped, ref := h.res.Lower(r.Context(), resource.Drop{
+		Name:       m.Name,
+		RecipePath: shareRecipe,
+		// СНИМАЕМ ТЕМИ ЖЕ ЗНАЧЕНИЯМИ, КАКИМИ ПОДНИМАЛИ: имя проекта, контейнера и тома
+		// рецепт собирает из `SHARE_NAME`, а его — из имени участка и порта скоупа. Позови
+		// мы снятие без них, компоуз снял бы раздачу ПО УМОЛЧАНИЮ, то есть соседнюю.
+		Env:       shareVars(m.Name, addr, body.Scope.Password),
+		WithState: flag(r.URL.Query().Get("with-state")),
+		WithImage: flag(r.URL.Query().Get("with-image")),
+		Ручка:     "DELETE /api/scope",
+	})
+	if ref != nil {
+		h.res.DropKey(m.Name)
+		h.res.DropContext(r.Context(), m.Name)
+		return ref
+	}
+	снято = true
+
+	// ── мир уходит с машины ──────────────────────────────────────────────────
+	if строка != "" {
+		if осталось := creds.Remove(r.Context(), машина, m.Creds.Value, строка,
+			filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout); осталось != nil {
+			h.opt.Logf("control: раздача снята, а временную строку с машины %s убрать не вышло: %s", m.Addr, осталось.Why)
+			dropped.Left = append(dropped.Left, осталось.Why)
+			dropped.Ways = append(dropped.Ways, осталось.Ways...)
+		} else {
+			dropped.Removed = append(dropped.Removed, "наша временная строка в ~/.ssh/authorized_keys той машины")
+		}
+	}
+	// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+	// │ КЛЮЧ САМОГО СКОУПА УХОДИТ БЕЗ ОГОВОРОК — и здесь это не то же, что при снятии       │
+	// │ участка.                                                                             │
+	// │                                                                                      │
+	// │ Ключ у скоупа ОДИН на все машины, поэтому при снятии УЧАСТКА его строку приходится   │
+	// │ беречь: скоуп жив, и на ту же машину может смотреть его второй участок. Здесь        │
+	// │ снимается САМ СКОУП — беречь строку не для кого: его участки уходят вместе с ним.    │
+	// │ Оставленная строка была бы ровно тем, из-за чего эта задача и заведена: доступ,      │
+	// │ убрать который через мир больше нечем.                                                │
+	// │                                                                                      │
+	// │ Участок на этой же машине от этого не молчит: он назван в ответе — юзер узнаёт, что  │
+	// │ вернуть скоуп на уцелевший том мало, участок надо будет завести заново.               │
+	// └─────────────────────────────────────────────────────────────────────────────────────┘
+	if свой != "" {
+		if осталось := h.уйтиСМашины(r.Context(), sc, свой, m.Addr); осталось != nil {
+			h.opt.Logf("control: раздача снята, а строку ключа скоупа с машины %s убрать не вышло: %s", m.Addr, осталось.Why)
+			dropped.Left = append(dropped.Left, осталось.Why)
+			dropped.Ways = append(dropped.Ways, осталось.Ways...)
+		} else {
+			dropped.Removed = append(dropped.Removed, "строка ключа скоупа в ~/.ssh/authorized_keys той машины")
+		}
+	}
+	if ещёХодим(st, "", m.Addr) {
+		if dropped.Note != "" {
+			dropped.Note += "; " // сказанное подъёмом не затирается нашим: две разные правды
+		}
+		dropped.Note += "на этой машине стоял и участок снятого скоупа — его дорога ушла вместе с ключом скоупа; " +
+			"вернёшь скоуп на уцелевший том — заведи участок заново: POST /api/resources"
+	}
+
+	// Времянки контроллера: ключ, блок в `config` и контекст. Контекст снимает и сам подъём,
+	// но обещание «на этой машине следов не осталось» держим мы, а не его умолчание.
+	h.res.DropKey(m.Name)
+	h.res.DropContext(r.Context(), m.Name)
+
+	// Сессия, которая вела В ЭТОТ скоуп, больше никуда не ведёт: раздачи по адресу нет.
+	h.mu.Lock()
+	if h.sess != nil && h.sess.sc.Addr.Raw == sc.Addr.Raw {
+		h.sess = nil
+	}
+	h.mu.Unlock()
+
+	// ОБА ИСХОДА ПРО ТОМ НАЗЫВАЮТСЯ ВСЛУХ, и словами про личность, а не про «состояние
+	// вещи»: у раздачи скоупа в томе лежит ЛИЧНОСТЬ, и человек имеет право знать, стёрлась
+	// она или ждёт на месте.
+	//
+	// КОМАНДА СТИРАНИЯ ЗДЕСЬ НЕ ПОВТОРЯЕТСЯ: её называют выходы (`dropped.ways`), и второй
+	// раз она сказана быть не должна. Два текста об одном разъезжаются молча, а сторож на
+	// присутствие проходит зелёным, пока жива хоть одна копия (своя грабля `WORLD2-150`).
+	note := "том раздачи остался, и в нём лежит личность: снятие вещи не означает её потерю (`WORLD2` 1.9) — " +
+		"подними раздачу на том же томе, и она снова отдаст её"
+	if flag(r.URL.Query().Get("with-state")) {
+		note = "том раздачи стёрт вместе с раздачей — личность по этому адресу стёрта, и вернуть её мир не может"
+	}
+	if нечитаемо != "" {
+		note += "; " + нечитаемо
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dropped": dropped,
+		"scope":   scopeView(addr),
+		"note":    note,
+	})
+	return nil
+}
+
+// уйтиСМашины — убрать свою строку из `~/.ssh/authorized_keys` названной машины, зайдя ПО
+// ТОМУ САМОМУ ключу: пароля у нас нет и быть не должно, а ключ лежит в скоупе.
+//
+// Возвращает не отказ ручки, а СЛОВА: действие, ради которого мы сюда пришли, уже
+// состоялось, и подменять его причину уборкой нельзя. Молчать — тоже: строка осталась на
+// машине юзера, и убрать её теперь может только он.
+func (h *Handler) уйтиСМашины(ctx context.Context, sc *scope.Scope, ключ, addr string) *refusal.Refusal {
+	if strings.TrimSpace(ключ) == "" {
+		return nil
+	}
+	authorized, ref := creds.Authorized(ключ, creds.Sign(sc.Addr.String()))
+	if ref != nil {
+		return ref
+	}
+	user, host, port, ref := resource.SplitAddr(addr)
+	if ref != nil {
+		return ref
+	}
+	return creds.RemoveByKey(ctx, creds.Machine{User: user, Host: host, Port: port},
+		ключ, authorized, filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
+}
+
+// ещёХодим — на ЭТУ ЖЕ машину смотрит другой участок того же скоупа.
+//
+// Ключ у скоупа один на все машины (`state.UserKeyName`), поэтому строка в чужом
+// `authorized_keys` принадлежит не участку, а СКОУПУ. Убрав её, пока на машину смотрит
+// второй участок, мир оборвал бы живую вещь — и обнаружилось бы это при следующем подъёме,
+// а не сейчас. Машины сличаются по хосту: имя участка — слово юзера, а не адрес.
+func ещёХодим(st *state.State, кроме, addr string) bool {
+	if st == nil {
+		return false
+	}
+	host, _, ref := resource.CheckAddr(addr)
+	if ref != nil {
+		return false
+	}
+	for _, t := range st.Territories {
+		if t.Name == кроме {
+			continue
+		}
+		if h, _, ref := resource.CheckAddr(t.Addr); ref == nil && h == host {
+			return true
+		}
+	}
+	return false
 }
 
 // ── вход и выход ─────────────────────────────────────────────────────────────
@@ -838,7 +1221,7 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 	// Раздача здесь заведомо отвечает: без неё не состоялся бы вход, а состояние этой
 	// сессии только что из неё и прочитано. Значит ключ ложится в скоуп ДО машины — как и
 	// задумано, и обратный порядок тут не нужен.
-	key, цена, ref := h.machineKey(r.Context(), sess.sc, st, body.Name, body.Addr, body.Creds, true)
+	key, цена, ref := h.machineKey(r.Context(), sess.sc, st, body.Name, body.Addr, body.Creds)
 	if ref != nil {
 		return ref
 	}
@@ -859,7 +1242,9 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 	if ref := sess.sc.Write(r.Context(), st); ref != nil {
 		// Вещь по ЧУЖОМУ рецепту снимается без наших значений: что ей нужно, знает она, а
 		// не мы, и подсовывать ей `SHARE_*` значило бы толковать чужой рецепт.
-		if _, low := h.res.Lower(r.Context(), body.Name, recipePath, body.Recipe, nil, false, false); low != nil {
+		if _, low := h.res.Lower(r.Context(), resource.Drop{
+			Name: body.Name, RecipePath: recipePath, RecipeName: body.Recipe,
+		}); low != nil {
 			h.opt.Logf("control: вещь %s снять за собой не вышло: %s", body.Name, low.Why)
 		}
 		h.res.DropKey(body.Name)
@@ -903,16 +1288,17 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 			fmt.Sprintf("участка «%s» в твоём скоупе нет — снимать нечего", name),
 			"посмотри, какие есть: GET /api/resources")
 	}
-	// НА ЭТОМ УЧАСТКЕ МОЖЕТ СТОЯТЬ РАЗДАЧА ТВОЕЙ ЖЕ ЛИЧНОСТИ. Сняв её молча, контроллер
-	// оборвал бы юзеру доступ к самому себе — и обнаружилось бы это при следующем входе, а
-	// не сейчас. Отказ механики с причиной и выходом (`WORLD2` 2.3).
-	if host, _, ref := resource.CheckAddr(t.Addr); ref == nil && host == sess.sc.Addr.Host {
-		return refusal.New(http.StatusConflict, "drop-scope-home",
-			fmt.Sprintf("на участке «%s» стоит раздача твоего скоупа (%s) — сняв его, ты потеряешь доступ к своей личности", name, sess.sc.Addr),
-			"перенеси личность на другой участок и войди по новому адресу",
-			"если правда этого хочешь — сними раздачу руками на той машине: ./deploy/remote.sh drop "+name+" --recipe <рецепт раздачи>")
-	}
-
+	// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+	// │ ЗАПРЕТА «НА ЭТОМ УЧАСТКЕ СТОИТ РАЗДАЧА ТВОЕГО СКОУПА» ЗДЕСЬ БОЛЬШЕ НЕТ.              │
+	// │                                                                                      │
+	// │ Он был следствием ошибки, а не правилом: пока заведение само записывало машину       │
+	// │ раздачи территорией, у скоупа появлялся «дом», и снятие такого участка стирало бы    │
+	// │ файл, в котором записано, что у юзера есть машины. Территория больше не заводится    │
+	// │ сама (`WORLD2-152`); завёл её юзер руками — это ЕГО участок, и снимать его он вправе.│
+	// │ Что стоит на машине — вопрос его решения, а не нашего разрешения (`WORLD2` 0.1).     │
+	// │                                                                                      │
+	// │ Раздачу скоупа по адресу снимает своя ручка — `DELETE /api/scope`.                    │
+	// └─────────────────────────────────────────────────────────────────────────────────────┘
 	q := r.URL.Query()
 	// Рецепт называется и при снятии: снимаем ТО ЖЕ, что ставили, а своего реестра вещей
 	// зона не заводит — второй список того же самого разъехался бы со скоупом.
@@ -922,8 +1308,14 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 		return ref
 	}
 
-	dropped, ref := h.res.Lower(r.Context(), name, recipePath, recipeName, nil,
-		flag(q.Get("with-state")), flag(q.Get("with-image")))
+	dropped, ref := h.res.Lower(r.Context(), resource.Drop{
+		Name:       name,
+		RecipePath: recipePath,
+		RecipeName: recipeName,
+		WithState:  flag(q.Get("with-state")),
+		WithImage:  flag(q.Get("with-image")),
+		Ручка:      "DELETE /api/resources/" + name,
+	})
 	if ref != nil {
 		return ref
 	}
@@ -935,13 +1327,27 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 	//
 	// Делается ДО того, как участок исчезнет из состояния: после него мы уже не будем
 	// знать ни адреса, ни ключа.
-	if ключ, есть := st.Key(t.Key); есть {
-		if authorized, ref := creds.Authorized(ключ.Value, creds.Sign(sess.sc.Addr.String())); ref == nil {
-			if user, host, port, ref := resource.SplitAddr(t.Addr); ref == nil {
-				creds.RemoveByKey(r.Context(), creds.Machine{User: user, Host: host, Port: port},
-					ключ.Value, authorized, filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
-				h.opt.Logf("control: участок %s снят — убрал свою строку из ~/.ssh/authorized_keys машины %s", name, t.Addr)
-			}
+	ключ, есть := st.Key(t.Key)
+	switch {
+	case !есть:
+	case ещёХодим(st, name, t.Addr):
+		// НА ЭТОЙ МАШИНЕ СТОИТ ЕЩЁ ОДИН ТВОЙ УЧАСТОК, а ключ у скоупа один на все машины:
+		// убрав строку сейчас, мир оборвал бы себе дорогу к живой вещи. Говорим вслух, что
+		// строка осталась и почему, — иначе «ушли совсем» было бы неправдой молча.
+		h.opt.Logf("control: участок %s снят, строку на машине %s оставил — на неё смотрит ещё один участок скоупа", name, t.Addr)
+		dropped.Left = append(dropped.Left,
+			"наша строка в ~/.ssh/authorized_keys той машины: на ней стоит ещё один твой участок, а ключ у скоупа один на все машины")
+		dropped.Ways = append(dropped.Ways, "сними и его — уйдёт и она: GET /api/resources покажет, какие остались")
+	default:
+		if осталось := h.уйтиСМашины(r.Context(), sess.sc, ключ.Value, t.Addr); осталось != nil {
+			// НЕ ВЫШЛО — ЭТО НЕ МОЛЧАНИЕ. Вещь снята, и отказывать поверх снятого нельзя; но
+			// строка осталась на МАШИНЕ ЮЗЕРА, и убрать её теперь может только он.
+			h.opt.Logf("control: участок %s снят, а строку с машины %s убрать не вышло: %s", name, t.Addr, осталось.Why)
+			dropped.Left = append(dropped.Left, осталось.Why)
+			dropped.Ways = append(dropped.Ways, осталось.Ways...)
+		} else {
+			h.opt.Logf("control: участок %s снят — убрал свою строку из ~/.ssh/authorized_keys машины %s", name, t.Addr)
+			dropped.Removed = append(dropped.Removed, "наша строка в ~/.ssh/authorized_keys той машины")
 		}
 	}
 

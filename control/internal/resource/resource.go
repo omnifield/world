@@ -365,6 +365,27 @@ type Dropped struct {
 	Note string `json:"note,omitempty"`
 }
 
+// Drop — что снимаем и чем это повторяют. Полей больше трёх, и называются они по имени
+// намеренно: позиционным списком «снять с состоянием» и «снять с образом» отличаются двумя
+// голыми `true` подряд, а перепутать их значит стереть чужое молча.
+type Drop struct {
+	Name       string
+	RecipePath string
+	// RecipeName — имя рецепта, названное человеком. Уезжает обратно в выходы: команда,
+	// которую он повторит, обязана снимать ТУ ЖЕ вещь.
+	RecipeName string
+	// Env — значения, которые читает сам рецепт (см. ниже, почему они обязательны).
+	Env []string
+	// WithState · WithImage — стереть состояние вещи · унести образ. Оба по умолчанию нет:
+	// стереть их молча значило бы потерять то, что юзер клал не сюда и не сейчас.
+	WithState bool
+	WithImage bool
+	// Ручка — чем человек повторит это снятие с ключом: `DELETE /api/resources/vps` либо
+	// `DELETE /api/scope`. Выход обязан быть КОМАНДОЙ, которую можно повторить как есть, а
+	// у скоупа и у территории ручки разные — оставь мы здесь одну, вторая врала бы.
+	Ручка string
+}
+
 // Lower — снять вещь с территории. Состояние вещи и образ по умолчанию остаются: стереть
 // их молча значило бы потерять то, что юзер клал не сюда и не сейчас.
 //
@@ -372,7 +393,7 @@ type Dropped struct {
 // заводит — «что мы там поднимали», помнит человек (тот же довод, что у соседа).
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-// │ `env` НАЗЫВАЕТСЯ И ЗДЕСЬ, И ЭТО НЕ СИММЕТРИЯ РАДИ СТРОЙНОСТИ.                        │
+// │ `Env` НАЗЫВАЕТСЯ И ЗДЕСЬ, И ЭТО НЕ СИММЕТРИЯ РАДИ СТРОЙНОСТИ.                        │
 // │                                                                                      │
 // │ Рецепт раздачи собирает имя проекта, контейнера и тома из `SHARE_NAME` (`WORLD2-150`  │
 // │ B3). Позови мы снятие БЕЗ него — компоуз взял бы своё умолчание и снял бы ЧУЖУЮ       │
@@ -383,7 +404,10 @@ type Dropped struct {
 // │ а компоуз на необъявленной такой переменной не разбирает файл целиком — снятие без    │
 // │ него отказало бы `bad-recipe` вместо снятия (`WORLD2-145`, тот же род).               │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
-func (m *Manager) Lower(ctx context.Context, name, recipePath, recipeName string, env []string, withState, withImage bool) (Dropped, *refusal.Refusal) {
+func (m *Manager) Lower(ctx context.Context, d Drop) (Dropped, *refusal.Refusal) {
+	name, recipePath, recipeName, env := d.Name, d.RecipePath, d.RecipeName, d.Env
+	withState, withImage := d.WithState, d.WithImage
+
 	args := []string{"drop", name, "--recipe", recipePath}
 	if withState {
 		args = append(args, "--with-state")
@@ -424,17 +448,25 @@ func (m *Manager) Lower(ctx context.Context, name, recipePath, recipeName string
 	if recipeName == "" {
 		query = ""
 	}
+	// Ручка не названа — выходов про ключи не пишем вовсе: выход, зовущий в несуществующую
+	// ручку, хуже отсутствующего. Оставленное при этом называется по-прежнему.
+	снять := func(param string) []string {
+		if d.Ручка == "" {
+			return nil
+		}
+		return []string{"снять и его: " + d.Ручка + with(query, param)}
+	}
 	if withState {
 		out.Removed = append(out.Removed, "тома рецепта — состояние вещи стёрто")
 	} else {
 		out.Left = append(out.Left, "тома рецепта — состояние вещи, оно переживает снятие")
-		out.Ways = append(out.Ways, "снять и его: DELETE /api/resources/"+name+with(query, "with-state=1"))
+		out.Ways = append(out.Ways, снять("with-state=1")...)
 	}
 	if withImage {
 		out.Removed = append(out.Removed, "образ, названный рецептом")
 	} else {
 		out.Left = append(out.Left, "образ, названный рецептом")
-		out.Ways = append(out.Ways, "снять и его: DELETE /api/resources/"+name+with(query, "with-image=1"))
+		out.Ways = append(out.Ways, снять("with-image=1")...)
 	}
 	if len(out.Left) == 0 {
 		out.Ways = append(out.Ways, "на той машине нашего не осталось ничего, кроме докера и ssh — их ставил не мир")
@@ -642,6 +674,30 @@ func (m *Manager) PutKey(name, addr, creds string) *refusal.Refusal {
 		return ref
 	}
 	return m.putKey(name, host, creds)
+}
+
+// PutContext — контекст докера на машину ДО того, как скоуп о ней знает. Нужен там же, где
+// `PutKey`, и по прямой причине: СНЯТИЕ берёт адрес машины ИЗ КОНТЕКСТА, а не из своих
+// ключей (`deploy/remote.sh`, `cmd_drop`: `ctx_exists || refuse no-such-resource`). Значит
+// снять раздачу скоупа, о которой в скоупе не написано ничего, можно только положив
+// контекст перед вызовом — иначе сосед откажет «такого ресурса не заводили», и это будет
+// правдой про его реестр и неправдой про машину.
+func (m *Manager) PutContext(ctx context.Context, name, addr string) *refusal.Refusal {
+	host, port, ref := checkAddr(addr)
+	if ref != nil {
+		return ref
+	}
+	return m.putContext(ctx, name, addr, host, port)
+}
+
+// DropContext — снять ОДИН свой контекст. Не `Unbind`: тот снимает ВСЕ наши контексты, и
+// позови мы его ради уборки за одной неудачей — вошедший в этот момент юзер лишился бы
+// разложенных территорий, ничего об этом не узнав.
+func (m *Manager) DropContext(ctx context.Context, name string) {
+	if m.Runner == nil {
+		return
+	}
+	_, _ = m.Runner.Run(ctx, run.Command{Name: m.Docker, Args: []string{"context", "rm", "-f", ContextPrefix + name}})
 }
 
 // DropKey — снять ключ территории и её блок в `config`. Зовётся, когда подъём не удался:
