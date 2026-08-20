@@ -46,7 +46,7 @@ func куда(t *testing.T, m *sshtest.Machine) Machine {
 
 func TestПарольМеняетсяНаКлюч(t *testing.T) {
 	m := машина(t)
-	pair, ref := Generate()
+	pair, ref := Generate(Sign("http://проба:8070/"))
 	if ref != nil {
 		t.Fatal(ref.Why)
 	}
@@ -75,7 +75,7 @@ func TestПарольМеняетсяНаКлюч(t *testing.T) {
 // ключей, и убирать их пришлось бы человеку руками.
 func TestПовторныйЗаходНеПлодитСтрок(t *testing.T) {
 	m := машина(t)
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 	known := filepath.Join(t.TempDir(), "known_hosts")
 
 	for i := 0; i < 3; i++ {
@@ -103,7 +103,7 @@ func TestНеЗаписалосьЭтоОтказАНеУспех(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = os.Chmod(дом, 0o700) })
 
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 	ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, "", 5)
 	if ref == nil {
 		t.Fatal("контроллер отчитался успехом, ничего не записав")
@@ -120,7 +120,7 @@ func TestНеЗаписалосьЭтоОтказАНеУспех(t *testing.T) 
 func TestУспехРешаетсяСчётомАНеКодомВозврата(t *testing.T) {
 	m := машина(t)
 	m.Silent = true
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 
 	ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, "", 5)
 	if ref == nil {
@@ -135,7 +135,7 @@ func TestУспехРешаетсяСчётомАНеКодомВозврата(
 // их разные вещи (`WORLD2` 2.3).
 func TestНеверныйПарольЭтоОтказДоступа(t *testing.T) {
 	m := машина(t)
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 
 	ref := Install(context.Background(), куда(t, m), "не-тот", pair.Authorized, "", 5)
 	if ref == nil || ref.Code != "access-denied" {
@@ -156,7 +156,7 @@ func TestНеверныйПарольЭтоОтказДоступа(t *testing.T
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 func TestПароляНетВОтказе(t *testing.T) {
 	m := машина(t)
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 	пароль := "очень-секретный-пароль-1234"
 
 	ref := Install(context.Background(), куда(t, m), пароль, pair.Authorized, "", 5)
@@ -189,15 +189,15 @@ func TestВидКредНазываетсяЯвно(t *testing.T) {
 // Ключ юзера лежит в скоупе приватным; публичный производен от него и в формате не
 // хранится — второе поле того же самого однажды разъехалось бы с первым.
 func TestПубличныйКлючПроизводенОтПриватного(t *testing.T) {
-	pair, _ := Generate()
-	line, ref := Authorized(pair.Private)
+	pair, _ := Generate(Sign("http://проба:8070/"))
+	line, ref := Authorized(pair.Private, Sign("http://проба:8070/"))
 	if ref != nil {
 		t.Fatal(ref.Why)
 	}
 	if line != pair.Authorized {
 		t.Fatalf("публичный ключ собрался иначе:\n%s\n%s", line, pair.Authorized)
 	}
-	if _, ref := Authorized("это не ключ"); ref == nil || ref.Code != "bad-key" {
+	if _, ref := Authorized("это не ключ", comment); ref == nil || ref.Code != "bad-key" {
 		t.Fatalf("мусор вместо ключа принят: %+v", ref)
 	}
 }
@@ -228,12 +228,12 @@ func TestДоМашиныНеДозвонилисьЭтоДругаяСтупе�
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 func TestПодменаМашиныОтвергаетсяСвоимКодом(t *testing.T) {
 	m := машина(t)
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 	known := filepath.Join(t.TempDir(), "known_hosts")
 
 	// Записываем для ЭТОГО адреса ключ другой машины — так выглядит переустановленный
 	// (или подменённый) хост с точки зрения связки.
-	чужой, _ := Generate()
+	чужой, _ := Generate(Sign("http://проба:8070/"))
 	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(чужой.Authorized))
 	if err != nil {
 		t.Fatalf("чужой ключ не разобрался: %v", err)
@@ -259,7 +259,7 @@ func TestПодменаМашиныОтвергаетсяСвоимКодом(t 
 // А НЕЗНАКОМАЯ машина принимается — иначе первый заход был бы невозможен вовсе.
 func TestНезнакомаяМашинаЗапоминается(t *testing.T) {
 	m := машина(t)
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 	known := filepath.Join(t.TempDir(), "known_hosts")
 
 	if ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, known, 5); ref != nil {
@@ -277,7 +277,7 @@ func TestНезнакомаяМашинаЗапоминается(t *testing.T) 
 // какая чья, юзер не знает (живой прогон 2026-08-20: восемь строк на одной машине).
 func TestСнятиеУбираетСвоюСтрокуЗаходомПоКлючу(t *testing.T) {
 	m := машина(t)
-	pair, _ := Generate()
+	pair, _ := Generate(Sign("http://проба:8070/"))
 	known := filepath.Join(t.TempDir(), "known_hosts")
 
 	if ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, known, 5); ref != nil {
@@ -297,8 +297,8 @@ func TestСнятиеУбираетСвоюСтрокуЗаходомПоКлю�
 // ЧУЖИЕ СТРОКИ НЕ ТРОГАЕМ: файл принадлежит юзеру, и всё, что в нём не наше, — не наше дело.
 func TestСнятиеНеТрогаетЧужиеСтроки(t *testing.T) {
 	m := машина(t)
-	наша, _ := Generate()
-	чужая, _ := Generate()
+	наша, _ := Generate(Sign("http://проба:8070/"))
+	чужая, _ := Generate(Sign("http://проба:8070/"))
 	known := filepath.Join(t.TempDir(), "known_hosts")
 
 	if ref := Install(context.Background(), куда(t, m), m.Pass, чужая.Authorized, known, 5); ref != nil {
@@ -316,5 +316,57 @@ func TestСнятиеНеТрогаетЧужиеСтроки(t *testing.T) {
 	}
 	if !strings.Contains(лежит, strings.TrimSpace(чужая.Authorized)) {
 		t.Fatalf("убрана ЧУЖАЯ строка — мир распорядился не своим:\n%s", лежит)
+	}
+}
+
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПОДПИСЬ — СЛОВА ДЛЯ ЧЕЛОВЕКА, А ДОСТУП ДАЁТ КЛЮЧ. Поэтому строки сравниваются ПО     │
+// │ КЛЮЧУ: смени мы подпись и ищи по ней — на машине оказалась бы ВТОРАЯ строка с тем же │
+// │ ключом, и убрать старую было бы нечем.                                                │
+// │                                                                                      │
+// │ Так и накопилось восемь строк на одной машине (живой прогон 2026-08-20).             │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func TestСменаПодписиНеПлодитСтрокИСтараяУбирается(t *testing.T) {
+	m := машина(t)
+	pair, _ := Generate(Sign("http://первый:8070/"))
+	known := filepath.Join(t.TempDir(), "known_hosts")
+
+	// Ключ лёг со СТАРОЙ подписью.
+	if ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, known, 5); ref != nil {
+		t.Fatalf("первый заход: %s", ref.Why)
+	}
+
+	// Тот же ключ, НОВАЯ подпись — строк не прибавляется.
+	новая, ref := Authorized(pair.Private, Sign("http://второй:8070/"))
+	if ref != nil {
+		t.Fatal(ref.Why)
+	}
+	if ref := Install(context.Background(), куда(t, m), m.Pass, новая, known, 5); ref != nil {
+		t.Fatalf("заход с новой подписью: %s", ref.Why)
+	}
+	if n := strings.Count(strings.TrimSpace(m.Authorized()), "\n"); n != 0 {
+		t.Fatalf("смена подписи оставила на машине лишнюю строку:\n%s", m.Authorized())
+	}
+
+	// И снятие НОВОЙ подписью убирает строку, положенную под СТАРОЙ.
+	RemoveByKey(context.Background(), куда(t, m), pair.Private, новая, known, 5)
+	if лежит := strings.TrimSpace(m.Authorized()); лежит != "" {
+		t.Fatalf("строка со старой подписью пережила снятие:\n%s", лежит)
+	}
+}
+
+// ПОДПИСЬ НАЗЫВАЕТ СКОУП. Без этого человек, открывший свой `authorized_keys`, видит
+// несколько одинаковых строк и не может понять, какая от какого скоупа.
+func TestПодписьНазываетСкоуп(t *testing.T) {
+	pair, _ := Generate(Sign("http://194.41.113.134:8077/"))
+	if !strings.Contains(pair.Authorized, "194.41.113.134:8077") {
+		t.Fatalf("подпись не называет скоуп: %s", pair.Authorized)
+	}
+	if !strings.Contains(pair.Authorized, comment) {
+		t.Fatalf("подпись не называет, кто положил строку: %s", pair.Authorized)
+	}
+	// Адреса нет — подпись прежняя: так подписаны ключи, положенные до этого правила.
+	if Sign("") != comment {
+		t.Fatalf("без адреса подпись изменилась: %s", Sign(""))
 	}
 }

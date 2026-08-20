@@ -387,7 +387,7 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		// │ юзера мы на машину не клали и трогать его не смеем.                             │
 		// └───────────────────────────────────────────────────────────────────────────────┘
 		if note != "" {
-			if authorized, ref := creds.Authorized(key.Value); ref == nil {
+			if authorized, ref := creds.Authorized(key.Value, creds.Sign(sc.Addr.String())); ref == nil {
 				if user, host, port, ref := resource.SplitAddr(m.Addr); ref == nil {
 					машина, пароль := creds.Machine{User: user, Host: host, Port: port}, m.Creds.Value
 					defer func() {
@@ -582,7 +582,7 @@ func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.Sta
 
 	key, есть := st.Key(state.UserKeyName)
 	if !есть || strings.TrimSpace(key.Value) == "" {
-		pair, ref := creds.Generate()
+		pair, ref := creds.Generate(creds.Sign(sc.Addr.String()))
 		if ref != nil {
 			return state.Key{}, "", ref
 		}
@@ -610,7 +610,7 @@ func (h *Handler) machineKey(ctx context.Context, sc *scope.Scope, st *state.Sta
 			}
 		}
 	}
-	authorized, ref := creds.Authorized(key.Value)
+	authorized, ref := creds.Authorized(key.Value, creds.Sign(sc.Addr.String()))
 	if ref != nil {
 		return state.Key{}, "", ref
 	}
@@ -936,7 +936,7 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 	// Делается ДО того, как участок исчезнет из состояния: после него мы уже не будем
 	// знать ни адреса, ни ключа.
 	if ключ, есть := st.Key(t.Key); есть {
-		if authorized, ref := creds.Authorized(ключ.Value); ref == nil {
+		if authorized, ref := creds.Authorized(ключ.Value, creds.Sign(sess.sc.Addr.String())); ref == nil {
 			if user, host, port, ref := resource.SplitAddr(t.Addr); ref == nil {
 				creds.RemoveByKey(r.Context(), creds.Machine{User: user, Host: host, Port: port},
 					ключ.Value, authorized, filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
