@@ -357,7 +357,13 @@ func (m *Manager) pathLine(name string) func(string) {
 // Dropped — что осталось на той машине после снятия. Ответ обязан это называть: «снял» без
 // перечня оставленного — это обещание чистоты, которого мы не давали.
 type Dropped struct {
-	Name    string   `json:"name"`
+	Name string `json:"name"`
+	// Thing — ИМЯ ВЕЩИ, названное соседом меткой `REMOTE-THING`: то, что он и правда пошёл
+	// снимать. Довозится ДОСЛОВНО и своего разбора рецепта здесь нет — имя принадлежит
+	// рецепту, а второй разбор разъехался бы с первым (тот же довод, что у кодов отказа).
+	//
+	// Пусто — сосед промолчал: тогда и назвать нам нечего, и выдумывать имя нельзя.
+	Thing   string   `json:"thing,omitempty"`
 	Removed []string `json:"removed"`
 	Left    []string `json:"left"`
 	Ways    []string `json:"ways"`
@@ -428,7 +434,10 @@ func (m *Manager) Lower(ctx context.Context, d Drop) (Dropped, *refusal.Refusal)
 	res, err := m.Runner.Run(ctx, run.Command{Name: m.RemoteSh, Args: args, Env: env})
 
 	out := Dropped{
-		Name:    name,
+		Name: name,
+		// ЧТО СОСЕД ПОШЁЛ СНИМАТЬ — его слово, и мы его довозим. Оно нужно зовущему, чтобы
+		// назвать человеку вещь ЕЁ именем: своего разбора рецепта у нас нет.
+		Thing:   firstMatch(res.Out, ThingMark),
 		Removed: []string{"контейнеры рецепта", "сеть мира, если в ней больше никого", "контекст докера", "ключ территории из связки контроллера"},
 	}
 	if err != nil || res.Code != 0 {
