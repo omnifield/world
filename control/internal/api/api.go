@@ -339,6 +339,9 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	}
 
 	st := state.New(strings.TrimSpace(body.Identity.Name), body.Identity.Brand)
+	// завелось — дошли ли до конца. Читается отложенной уборкой ниже: пока здесь `false`,
+	// всё, что мы успели оставить на ЧУЖОЙ машине, подлежит снятию.
+	завелось := false
 	raised := ""
 	// shareEnv — ТЕ ЖЕ значения, которыми раздача поднята. Держим их, потому что снимать её
 	// придётся ими же: рецепт собирает из `SHARE_NAME` имя проекта, контейнера и тома, и
@@ -371,6 +374,33 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 			return ref
 		}
 		цена = note
+
+		// ┌───────────────────────────────────────────────────────────────────────────────┐
+		// │ УБРАТЬ ЗА СОБОЙ НА ЧУЖОЙ МАШИНЕ, ЕСЛИ ЗАВЕДЕНИЕ НЕ СОСТОИТСЯ.                  │
+		// │                                                                                │
+		// │ Ключ уже лежит в её `authorized_keys`, а скоуп ещё не записан. Упади мы здесь — │
+		// │ и у юзера на машине останется доступ, приватной половины которого у него НЕТ:  │
+		// │ опознать строку и убрать её ему нечем. Живой прогон 2026-08-20: за несколько    │
+		// │ неудачных попыток их накопилось шесть.                                          │
+		// │                                                                                │
+		// │ Снимаем ровно то, что положили, и только когда положили ПАРОЛЕМ: свой ключ      │
+		// │ юзера мы на машину не клали и трогать его не смеем.                             │
+		// └───────────────────────────────────────────────────────────────────────────────┘
+		if note != "" {
+			if authorized, ref := creds.Authorized(key.Value); ref == nil {
+				if user, host, port, ref := resource.SplitAddr(m.Addr); ref == nil {
+					машина, пароль := creds.Machine{User: user, Host: host, Port: port}, m.Creds.Value
+					defer func() {
+						if завелось {
+							return
+						}
+						creds.Remove(r.Context(), машина, пароль, authorized,
+							filepath.Join(h.opt.KeysDir, "known_hosts"), h.opt.SSHTimeout)
+						h.opt.Logf("control: заведение не состоялось — снял свою строку из ~/.ssh/authorized_keys машины %s", m.Addr)
+					}()
+				}
+			}
+		}
 
 		// Ключ кладётся ДО подъёма: докер пойдёт по ssh сам и возьмёт его из связки.
 		if ref := h.res.PutKey(m.Name, m.Addr, key.Value); ref != nil {
@@ -415,6 +445,7 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	if цена != "" {
 		ответ["note"] = цена
 	}
+	завелось = true
 	writeJSON(w, http.StatusCreated, ответ)
 	return nil
 }

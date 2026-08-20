@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
+
 	"github.com/omnifield/world/control/internal/creds/sshtest"
 )
 
@@ -209,5 +212,61 @@ func TestДоМашиныНеДозвонилисьЭтоДругаяСтупе�
 	ref := Install(context.Background(), куда, "секрет", "ключ", "", 2)
 	if ref == nil || ref.Code != "no-answer" {
 		t.Fatalf("отказ не тот: %+v", ref)
+	}
+}
+
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПОДМЕНА МАШИНЫ ОТВЕРГАЕТСЯ, А НЕ ЗАПИСЫВАЕТСЯ ВТОРОЙ СТРОКОЙ.                        │
+// │                                                                                      │
+// │ Живой прогон 2026-08-20: обе VPS переустановили, у машины сменился ключ хоста, а том │
+// │ со связкой это пережил. Наш слой заходил паролем МОЛЧА, а системный `ssh`, которым    │
+// │ идёт подъём, тот же ключ отвергал. Юзер получал «креды не приняты» — и шёл чинить     │
+// │ пароль, который никто не отвергал.                                                    │
+// │                                                                                      │
+// │ Здесь стережётся ОБА следствия сразу: и что мы не отдадим ключ юзера чужой машине,    │
+// │ и что причина названа своим именем.                                                   │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func TestПодменаМашиныОтвергаетсяСвоимКодом(t *testing.T) {
+	m := машина(t)
+	pair, _ := Generate()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+
+	// Записываем для ЭТОГО адреса ключ другой машины — так выглядит переустановленный
+	// (или подменённый) хост с точки зрения связки.
+	чужой, _ := Generate()
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(чужой.Authorized))
+	if err != nil {
+		t.Fatalf("чужой ключ не разобрался: %v", err)
+	}
+	строка := knownhosts.Line([]string{knownhosts.Normalize(m.Addr)}, pub) + "\n"
+	if err := os.WriteFile(known, []byte(строка), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, known, 5)
+	if ref == nil {
+		t.Fatal("подменённая машина принята молча — ключ юзера уехал бы не туда")
+	}
+	if ref.Code != "host-key-changed" {
+		t.Fatalf("причина названа не своим именем: %s — %s", ref.Code, ref.Why)
+	}
+	// Ключ юзера на такую машину не кладётся ВОВСЕ: до команды дело не доходит.
+	if strings.TrimSpace(m.Authorized()) != "" {
+		t.Fatalf("ключ юзера лёг на подменённую машину:\n%s", m.Authorized())
+	}
+}
+
+// А НЕЗНАКОМАЯ машина принимается — иначе первый заход был бы невозможен вовсе.
+func TestНезнакомаяМашинаЗапоминается(t *testing.T) {
+	m := машина(t)
+	pair, _ := Generate()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+
+	if ref := Install(context.Background(), куда(t, m), m.Pass, pair.Authorized, known, 5); ref != nil {
+		t.Fatalf("первый заход отказал: %s — %s", ref.Code, ref.Why)
+	}
+	data, err := os.ReadFile(known)
+	if err != nil || !strings.Contains(string(data), knownhosts.Normalize(m.Addr)) {
+		t.Fatalf("ключ незнакомой машины не запомнился: %v %s", err, data)
 	}
 }

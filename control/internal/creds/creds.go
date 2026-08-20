@@ -228,6 +228,70 @@ func Install(ctx context.Context, m Machine, password, authorized, knownHosts st
 		"на машине при этом ничего не сломано: ключ либо лёг, либо не лёг")
 }
 
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ Remove — УБРАТЬ СВОЮ СТРОКУ С ЧУЖОЙ МАШИНЫ. Зовётся, когда заведение не состоялось.  │
+// │                                                                                      │
+// │ Живой прогон 2026-08-20: заведение падало ПОСЛЕ того, как ключ уже лёг, — и строка    │
+// │ оставалась. Скоуп при этом не записался, значит приватного ключа у юзера нет: строку  │
+// │ на своей машине он опознать не может и убрать её ему нечем. За несколько попыток их   │
+// │ накопилось шесть.                                                                     │
+// │                                                                                      │
+// │ Отказ не вправе ничего оставлять за собой (`WORLD2` 2.3 п. 5) — а на ЧУЖОЙ машине     │
+// │ тем более. Снятие идёт тем же паролем и тем же заходом, что и установка: другого      │
+// │ способа у нас нет, а требовать его от юзера значит перекладывать свой мусор на него.  │
+// │                                                                                      │
+// │ Молча: это уборка за неудачей, и её собственный отказ подменил бы собой настоящую     │
+// │ причину, ради которой мы сюда вернулись. Не вышло — юзер узнает из `note`, который    │
+// │ ему уже сказан.                                                                       │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+func Remove(ctx context.Context, m Machine, password, authorized, knownHosts string, timeout int) {
+	if strings.TrimSpace(password) == "" || strings.TrimSpace(authorized) == "" {
+		return // заходили ключом — на машине ничего нашего не появлялось
+	}
+	if timeout <= 0 {
+		timeout = 15
+	}
+	cfg := &ssh.ClientConfig{
+		User:            m.User,
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback: rememberHost(knownHosts),
+		Timeout:         time.Duration(timeout) * time.Second,
+	}
+	d := net.Dialer{Timeout: cfg.Timeout}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(m.Port)))
+	if err != nil {
+		return
+	}
+	c, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(m.Host, strconv.Itoa(m.Port)), cfg)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	client := ssh.NewClient(c, chans, reqs)
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return
+	}
+	defer session.Close()
+	_, _ = session.Output(remove(authorized))
+}
+
+// remove — обратная команда к `install`. Убирает РОВНО нашу строку и ничего кроме: файл
+// принадлежит юзеру, и всё остальное в нём — не наше дело. Через временный файл рядом,
+// потому что перенаправление в тот же файл обнулило бы его до чтения.
+func remove(authorized string) string {
+	line := quote(authorized)
+	return strings.Join([]string{
+		"umask 077",
+		"[ -f ~/.ssh/authorized_keys ] || exit 0",
+		"grep -vxF -- " + line + " ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.world-tmp",
+		"mv ~/.ssh/authorized_keys.world-tmp ~/.ssh/authorized_keys",
+		"chmod 600 ~/.ssh/authorized_keys",
+	}, "\n")
+}
+
 // lastLine — последняя непустая строка ответа. Считает наши строки ПОСЛЕДНЯЯ команда, а до
 // неё шелл мог сказать своё (например, про несозданный каталог), и это его право.
 func lastLine(s string) string {
@@ -259,15 +323,47 @@ func install(authorized string) string {
 	}, "\n")
 }
 
-// rememberHost — ключ САМОЙ машины, записанный при первой встрече. Это тот же порядок,
-// каким живёт системный ssh с `StrictHostKeyChecking=accept-new`, только запись делается
-// здесь и один раз: дальше её читает он сам и уже сверяет.
+// ErrHostKeyChanged — по адресу отвечает машина с ДРУГИМ ключом, чем записано. Отдельной
+// ошибкой, а не текстом: её разбирает отказ, и от неё зависит, что человеку делать.
+var ErrHostKeyChanged = errors.New("ключ хоста изменился")
+
+// rememberHost — ключ САМОЙ машины. Незнакомый — запоминаем при первой встрече (это тот же
+// порядок, каким живёт системный ssh с `StrictHostKeyChecking=accept-new`). ИЗМЕНИВШИЙСЯ —
+// отказываем.
 //
-// Не записалось — не отказ: соединение состоялось, а запись это забота о следующем разе.
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ПОЧЕМУ ОТКАЗ, А НЕ ЗАПИСЬ ВТОРОЙ СТРОКОЙ. Раньше здесь было «не записалось — не       │
+// │ отказ», и любой ключ, включая подменённый, принимался МОЛЧА. Два следствия, оба       │
+// │ настоящие и оба вылезли живьём 2026-08-20:                                            │
+// │                                                                                       │
+// │   безопасность  паролем мы ходим ОДИН раз и кладём на ту сторону ключ юзера. Если по  │
+// │                 адресу отвечает не та машина, ключ ляжет ей — молча;                  │
+// │   рассогласование  системный `ssh`, которым потом идёт подъём, такой ключ ОТВЕРГАЕТ.  │
+// │                 Слой заходил, слой подъёма — нет, и человек получал «креды не         │
+// │                 приняты» про пароль, который никто не отвергал.                       │
+// │                                                                                       │
+// │ Оба слоя обязаны отвечать на подмену ОДИНАКОВО. Здесь — тот же ответ, что у ssh.      │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
 func rememberHost(path string) ssh.HostKeyCallback {
-	return func(hostport string, _ net.Addr, key ssh.PublicKey) error {
+	return func(hostport string, remote net.Addr, key ssh.PublicKey) error {
 		if path == "" {
 			return nil
+		}
+		// Сверяем с записанным ДО того, как принять. Незнакомый хост `knownhosts` называет
+		// той же ошибкой, что и подменённый, — различает их непустой `Want`: он и есть
+		// «а вот что мы помним про этот адрес».
+		if _, err := os.Stat(path); err == nil {
+			if сверить, err := knownhosts.New(path); err == nil {
+				err := сверить(hostport, remote, key)
+				if err == nil {
+					return nil // тот же ключ, что и был
+				}
+				var ke *knownhosts.KeyError
+				if errors.As(err, &ke) && len(ke.Want) > 0 {
+					return ErrHostKeyChanged
+				}
+				// хост незнаком — запоминаем ниже
+			}
 		}
 		line := knownhosts.Line([]string{knownhosts.Normalize(hostport)}, key) + "\n"
 		if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), strings.TrimSpace(line)) {
@@ -317,6 +413,15 @@ func reachFailure(m Machine, err error) *refusal.Refusal {
 
 func handshakeFailure(m Machine, err error) *refusal.Refusal {
 	text := err.Error()
+	// ПОДМЕНА МАШИНЫ — НЕ ПРОБЛЕМА КРЕД. Раньше это доезжало как «креды не приняты», и
+	// человек шёл чинить пароль, который никто не отвергал (живой прогон 2026-08-20).
+	if errors.Is(err, ErrHostKeyChanged) || strings.Contains(text, ErrHostKeyChanged.Error()) {
+		return refusal.New(http.StatusBadGateway, "host-key-changed",
+			fmt.Sprintf("по адресу %s отвечает машина с ДРУГИМ ключом, чем контроллер запомнил", m),
+			"машину переустанавливали — забудь её прежний ключ: docker exec world-control ssh-keygen -R "+m.Host,
+			"машину НЕ переустанавливали — значит по этому адресу отвечает не она, и пароль ей давать нельзя",
+			"это НЕ «пароль не принят»: до пароля дело не дошло — мы не признали саму машину")
+	}
 	if strings.Contains(text, "unable to authenticate") || strings.Contains(text, "no supported methods") {
 		return refusal.New(http.StatusForbidden, "access-denied",
 			fmt.Sprintf("машина %s пароль не приняла", m),
