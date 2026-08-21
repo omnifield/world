@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/omnifield/world/control/internal/refusal"
 	"github.com/omnifield/world/control/internal/state"
 )
 
@@ -76,17 +77,17 @@ func личность(t *testing.T) []byte {
 
 func открыть(t *testing.T, ш *раздача, пароль string) *Scope {
 	t.Helper()
-	addr, ref := Parse(ш.URL)
+	addr, ref := Parse(ш.URL, AskingSignIn)
 	if ref != nil {
 		t.Fatalf("свой же адрес не разобрался: %s", ref.Why)
 	}
-	return Open(addr, пароль, 5)
+	return Open(addr, пароль, 5, AskingSignIn)
 }
 
 // ── адрес ────────────────────────────────────────────────────────────────────
 
 func TestАдресСкоупаЭтоКореньРаздачи(t *testing.T) {
-	addr, ref := Parse("http://10.8.0.5:8070")
+	addr, ref := Parse("http://10.8.0.5:8070", AskingSignIn)
 	if ref != nil {
 		t.Fatalf("законный адрес не принят: %s", ref.Why)
 	}
@@ -110,7 +111,7 @@ func TestАдресОтказываетТамГдеУгадыватьНельз�
 	}
 	for _, tt := range tests {
 		t.Run(tt.имя, func(t *testing.T) {
-			_, ref := Parse(tt.адрес)
+			_, ref := Parse(tt.адрес, AskingSignIn)
 			if ref == nil {
 				t.Fatalf("адрес %q принят молча", tt.адрес)
 			}
@@ -224,11 +225,11 @@ func TestРаздачаНедоступнаНазываетАдресИВыхо�
 	мёртвый := "http://" + l.Addr().String() + "/"
 	_ = l.Close()
 
-	addr, ref := Parse(мёртвый)
+	addr, ref := Parse(мёртвый, AskingSignIn)
 	if ref != nil {
 		t.Fatal(ref.Why)
 	}
-	_, ref = Open(addr, "тайна", 2).Read(context.Background())
+	_, ref = Open(addr, "тайна", 2, AskingSignIn).Read(context.Background())
 	if ref == nil || ref.Code != "no-answer" {
 		t.Fatalf("отказ не назвал ступень связи: %+v", ref)
 	}
@@ -245,8 +246,8 @@ func TestРаздачаНедоступнаНазываетАдресИВыхо�
 // отвечает по-разному (где отказом, где тишиной), и проба, зависящая от сети, стережёт
 // сеть, а не контроллер.
 func TestСтупениСвязиНеСхлопываются(t *testing.T) {
-	addr, _ := Parse("http://10.8.0.5:8070/")
-	sc := Open(addr, "тайна", 5)
+	addr, _ := Parse("http://10.8.0.5:8070/", AskingSignIn)
+	sc := Open(addr, "тайна", 5, AskingSignIn)
 
 	tests := []struct {
 		имя    string
@@ -295,9 +296,9 @@ func TestLookРазличаетТриСостояния(t *testing.T) {
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	мёртвый := "http://" + l.Addr().String() + "/"
 	_ = l.Close()
-	addr, _ := Parse(мёртвый)
+	addr, _ := Parse(мёртвый, AskingSignIn)
 	// Раздачи нет вовсе — это НЕ отказ: заведение скоупа опирается ровно на это состояние.
-	if есть, ref := Open(addr, "тайна", 2).Look(context.Background()); ref != nil || есть != PresenceNone {
+	if есть, ref := Open(addr, "тайна", 2, AskingSignIn).Look(context.Background()); ref != nil || есть != PresenceNone {
 		t.Fatalf("отсутствие раздачи прочиталось как поломка: %v %+v", есть, ref)
 	}
 }
@@ -317,8 +318,8 @@ func TestПарольЕдетКаждымЗапросом(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	addr, _ := Parse(srv.URL)
-	sc := Open(addr, "тайна", 5)
+	addr, _ := Parse(srv.URL, AskingSignIn)
+	sc := Open(addr, "тайна", 5, AskingSignIn)
 	st, ref := sc.Read(context.Background())
 	if ref != nil {
 		t.Fatal(ref.Why)
@@ -353,12 +354,121 @@ func TestПортБерётсяИзАдресаСкоупа(t *testing.T) {
 		{"https://мой-скоуп.example:8443/", 8443},
 	}
 	for _, п := range для {
-		addr, ref := Parse(п.адрес)
+		addr, ref := Parse(п.адрес, AskingSignIn)
 		if ref != nil {
 			t.Fatalf("%s не разобрался: %s", п.адрес, ref.Why)
 		}
 		if got := addr.Port(); got != п.порт {
 			t.Fatalf("у адреса %s порт %d вместо %d", п.адрес, got, п.порт)
+		}
+	}
+}
+
+// ── выход зависит от того, кто спрашивает (`WORLD2-144`) ─────────────────────
+//
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ СТОРОЖ СМОТРИТ НА КЛАСС, А НЕ НА ТРИ ЗАУЧЕННЫХ СЛУЧАЯ.                               │
+// │                                                                                      │
+// │ Проверяются две разные вещи, и ни одна не заменяет другую:                            │
+// │                                                                                      │
+// │   таблица  обходится ЦЕЛИКОМ, и у каждого спрашивающего берётся ЕГО ручка. Добавили   │
+// │            спрашивающего — он проверился сам, дописывать сюда ничего не надо;         │
+// │   отказы   те же ручки прогоняются на ЖИВЫХ отказах: выход, вписанный литералом мимо  │
+// │            таблицы, — ровно та порча, ради которой узел и заведён, и таблица её не    │
+// │            увидела бы.                                                                │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+
+func TestВыходНеВедётТудаГдеЧеловекУжеСтоит(t *testing.T) {
+	// 1. ТАБЛИЦА ЦЕЛИКОМ.
+	for кто, а := range askers {
+		if а.handle == "" {
+			// Не назвавшийся не вправе советовать ручки вовсе: его выходы никем не
+			// проверяются, потому что проверять их не с чем.
+			if len(а.ways) > 0 {
+				t.Fatalf("спрашивающий %d ручки не назвал, а выходы с ручками у него есть: %v", кто, а.ways)
+			}
+			continue
+		}
+		for беда, выходы := range а.ways {
+			for _, выход := range выходы {
+				if strings.Contains(выход, а.handle) {
+					t.Fatalf("%s (беда %d): выход ведёт туда, где человек уже стоит — %q", а.handle, беда, выход)
+				}
+			}
+		}
+	}
+
+	// 2. ЖИВЫЕ ОТКАЗЫ. Три беды у каждой ручки: адрес не назван · раздача молчит ·
+	//    состояния в раздаче нет. Отказ берётся тот самый, что уедет человеку.
+	пустая := поднятьРаздачу(t, "тайна", nil)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	мёртвый := "http://" + l.Addr().String() + "/"
+	_ = l.Close()
+
+	for кто, а := range askers {
+		если := func(беда string, ref *refusal.Refusal) {
+			t.Helper()
+			if ref == nil {
+				t.Fatalf("%s, %s: отказа нет вовсе", а.handle, беда)
+			}
+			if len(ref.Ways) == 0 {
+				t.Fatalf("%s, %s: отказ без выхода — тупик (`WORLD2` 2.3)", а.handle, беда)
+			}
+			if а.handle == "" {
+				return
+			}
+			for _, выход := range ref.Ways {
+				if strings.Contains(выход, а.handle) {
+					t.Fatalf("%s, %s (%s): выход советует ту же ручку — %q", а.handle, беда, ref.Code, выход)
+				}
+			}
+		}
+
+		_, ref := Parse("", кто)
+		если("адрес не назван", ref)
+
+		мёртвыйАдрес, ref := Parse(мёртвый, кто)
+		if ref != nil {
+			t.Fatal(ref.Why)
+		}
+		_, ref = Open(мёртвыйАдрес, "тайна", 2, кто).Read(context.Background())
+		если("раздача не отвечает", ref)
+
+		пустойАдрес, ref := Parse(пустая.URL, кто)
+		if ref != nil {
+			t.Fatal(ref.Why)
+		}
+		_, ref = Open(пустойАдрес, "тайна", 5, кто).Read(context.Background())
+		если("состояния в раздаче нет", ref)
+	}
+}
+
+// ВХОД СОВЕТУЕТ ЗАВЕСТИ СКОУП, А ЗАВЕДЕНИЕ — НЕТ. Обратная сторона того же свойства:
+// проверка «ручку не советуют» зеленела бы и на выходах, вычищенных у всех подряд, а
+// подсказка на входе верна и нужна (`WORLD2-144`: «первый выход при этом верный»).
+func TestВходПодсказываетЗавестиСкоуп(t *testing.T) {
+	_, ref := Parse("", AskingSignIn)
+	if ref == nil {
+		t.Fatal("пустой адрес принят молча")
+	}
+	if !strings.Contains(strings.Join(ref.Ways, " "), "POST /api/scope") {
+		t.Fatalf("вход перестал подсказывать, где заводят скоуп: %v", ref.Ways)
+	}
+}
+
+// НЕ НАЗВАВШИЙСЯ ПОЛУЧАЕТ ВЫХОДЫ БЕЗ РУЧЕК. Нулевое значение — безопасная сторона:
+// следующая ручка, забывшая назваться, промолчит, а не соврёт.
+func TestНеНазвавшийсяРучекНеСоветует(t *testing.T) {
+	_, ref := Parse("", AskingUnnamed)
+	if ref == nil || len(ref.Ways) == 0 {
+		t.Fatalf("отказ без выхода — тупик: %+v", ref)
+	}
+	for _, выход := range ref.Ways {
+		if strings.Contains(выход, "/api/") {
+			t.Fatalf("не назвавшийся советует ручку: %q", выход)
 		}
 	}
 }

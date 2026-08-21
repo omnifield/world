@@ -11,6 +11,7 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/omnifield/world/control/internal/creds/sshtest"
+	"github.com/omnifield/world/control/internal/refusal"
 )
 
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
@@ -22,8 +23,15 @@ import (
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 
 func машина(t *testing.T) *sshtest.Machine {
+	return машинаСПаролем(t, "секрет")
+}
+
+// машинаСПаролем — та же подставная машина, но пароль ей называют. Нужно там, где пароль и
+// есть предмет проверки: искать в отказе короткое слово «секрет» значило бы искать то, что
+// может встретиться в тексте само по себе.
+func машинаСПаролем(t *testing.T, пароль string) *sshtest.Machine {
 	t.Helper()
-	m, err := sshtest.Start("world", "секрет", filepath.Join(t.TempDir(), "дом"))
+	m, err := sshtest.Start("world", пароль, filepath.Join(t.TempDir(), "дом"))
 	if err != nil {
 		t.Fatalf("подставная машина не поднялась: %v", err)
 	}
@@ -150,23 +158,135 @@ func TestНеверныйПарольЭтоОтказДоступа(t *testing.T
 }
 
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-// │ ПАРОЛЬ НЕ УТЕКАЕТ НИКУДА. Здесь — что его нет в ОТКАЗЕ: отказ читают люди, и он же   │
-// │ уезжает в журнал. Что его нет в скоупе, в связке и в журнале ручек, стерегут тесты   │
-// │ ручек и проба зоны.                                                                  │
+// │ ПАРОЛЯ НЕТ НИ В ОДНОМ ОТКАЗЕ ПУТИ — ПРОВЕРЯЕТСЯ КЛАСС, А НЕ ПУТЬ (`WORLD2-143`).     │
+// │                                                                                      │
+// │ Прежний сторож стоял на ОДНОМ пути — «пароль не подошёл», — и порча ревью 2026-08-17 │
+// │ прошла мимо него зелёной: подробность дописали в `key-not-installed`, а он строится   │
+// │ отдельно. Пути отказа будут появляться и дальше, и перечислять их поимённо — то же,   │
+// │ что перечислять вещи мира вместо чтения каталога.                                     │
+// │                                                                                      │
+// │ Поэтому здесь прогоняется ВСЁ, чем этот путь умеет отказывать: не пустили · записать  │
+// │ не вышло (двумя разными способами) · строк оказалось больше одной · машина не та ·    │
+// │ не дотянулись · строка осталась после уборки. У каждого отказа берётся ВЕСЬ текст,     │
+// │ который уедет человеку и в журнал, и в нём не должно быть значения, которое мы этому  │
+// │ вызову передали.                                                                      │
+// │                                                                                      │
+// │ Сторож при этом ловит ошибку, которой устройство уже не допускает: пароль живёт ровно │
+// │ в `Install`, а отказы строятся в `установить`, где такого имени нет. Одно другого не  │
+// │ заменяет — сторож стоит на СВОЙСТВЕ, а устройство закрывает ПУТЬ.                     │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
-func TestПароляНетВОтказе(t *testing.T) {
-	m := машина(t)
+func TestПароляНетНиВОдномОтказеПути(t *testing.T) {
+	const пароль = "очень-секретный-пароль-1234"
 	pair, _ := Generate(Sign("http://проба:8070/"))
-	пароль := "очень-секретный-пароль-1234"
 
-	ref := Install(context.Background(), куда(t, m), пароль, pair.Authorized, "", 5)
-	if ref == nil {
-		t.Fatal("подставная машина приняла чужой пароль")
+	случаи := []struct {
+		имя  string
+		код  string
+		дать func(t *testing.T) *refusal.Refusal
+	}{
+		{
+			имя: "машина пароль не приняла", код: "access-denied",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, "машина-ждёт-другого")
+				return Install(context.Background(), куда(t, m), пароль, pair.Authorized, "", 5)
+			},
+		},
+		{
+			имя: "машина промолчала — измерить нечем", код: "key-not-installed",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, пароль)
+				m.Silent = true
+				return Install(context.Background(), куда(t, m), пароль, pair.Authorized, "", 5)
+			},
+		},
+		{
+			имя: "записать не вышло — дом только на чтение", код: "key-not-installed",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, пароль)
+				if err := os.Chmod(m.Home, 0o500); err != nil {
+					t.Skipf("права на каталог не меняются: %v", err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(m.Home, 0o700) })
+				return Install(context.Background(), куда(t, m), пароль, pair.Authorized, "", 5)
+			},
+		},
+		{
+			имя: "строк оказалось больше одной", код: "key-doubled",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, пароль)
+				связка := filepath.Join(m.Home, ".ssh")
+				if err := os.MkdirAll(связка, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				дважды := pair.Authorized + "\n" + pair.Authorized + "\n"
+				if err := os.WriteFile(filepath.Join(связка, "authorized_keys"), []byte(дважды), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return Install(context.Background(), куда(t, m), пароль, pair.Authorized, "", 5)
+			},
+		},
+		{
+			имя: "по адресу отвечает машина с другим ключом", код: "host-key-changed",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, пароль)
+				return Install(context.Background(), куда(t, m), пароль, pair.Authorized, чужаяСвязка(t, m), 5)
+			},
+		},
+		{
+			имя: "до машины не дойти", код: "no-answer",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, пароль)
+				адрес := куда(t, m)
+				m.Close() // порт освободился — по адресу больше никого
+				return Install(context.Background(), адрес, пароль, pair.Authorized, "", 2)
+			},
+		},
+		{
+			// Уборка ходит ТЕМ ЖЕ паролем и отказывает своим кодом: строка осталась на
+			// чужой машине. Пароль и здесь никуда не попадает.
+			имя: "строка осталась после уборки", код: "key-left",
+			дать: func(t *testing.T) *refusal.Refusal {
+				m := машинаСПаролем(t, пароль)
+				адрес := куда(t, m)
+				m.Close()
+				return Remove(context.Background(), адрес, пароль, pair.Authorized, "", 2)
+			},
+		},
 	}
-	весь := ref.Code + " " + ref.Why + " " + strings.Join(ref.Ways, " ")
-	if strings.Contains(весь, пароль) {
-		t.Fatalf("пароль утёк в отказ: %s", весь)
+
+	for _, с := range случаи {
+		t.Run(с.имя, func(t *testing.T) {
+			ref := с.дать(t)
+			if ref == nil {
+				t.Fatal("отказа нет вовсе — стеречь тут нечего, и это само по себе дефект")
+			}
+			if ref.Code != с.код {
+				t.Fatalf("путь отказа не тот: ждали %s, пришёл %s — %s", с.код, ref.Code, ref.Why)
+			}
+			// ВЕСЬ отказ целиком: человеку уезжает и причина, и выходы, и `from`.
+			весь := ref.Code + " " + ref.Why + " " + strings.Join(ref.Ways, " ") + " " + ref.From
+			if strings.Contains(весь, пароль) {
+				t.Fatalf("пароль утёк в отказ %s: %s", ref.Code, весь)
+			}
+		})
 	}
+}
+
+// чужаяСвязка — `known_hosts`, где для АДРЕСА ЭТОЙ машины записан ключ другой. Так выглядит
+// переустановленный или подменённый хост с точки зрения связки контроллера.
+func чужаяСвязка(t *testing.T, m *sshtest.Machine) string {
+	t.Helper()
+	чужой, _ := Generate(Sign("http://проба:8070/"))
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(чужой.Authorized))
+	if err != nil {
+		t.Fatalf("чужой ключ не разобрался: %v", err)
+	}
+	путь := filepath.Join(t.TempDir(), "known_hosts")
+	строка := knownhosts.Line([]string{knownhosts.Normalize(m.Addr)}, pub) + "\n"
+	if err := os.WriteFile(путь, []byte(строка), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return путь
 }
 
 // ВИД КРЕД НАЗЫВАЕТСЯ ЯВНО. Пустое и неизвестное — разные отказы: первое значит «не
