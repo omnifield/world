@@ -8,13 +8,19 @@
 # те, что уже написаны. Ни своей обёртки, ни своего раннера, ни своего формата отчёта:
 # всё, что печатается ниже, — это вывод самих проб, дословно.
 #
-# Три работы, и они РАЗДЕЛЬНЫЕ, чтобы было видно, какая упала, а не одна простыня:
+# Четыре работы, и они РАЗДЕЛЬНЫЕ, чтобы было видно, какая упала, а не одна простыня:
 #   go      — `go test ./...` в каждом из трёх модулей (они разные, из корня не собрать);
 #   shell   — `shellcheck` + `bash -n` по всему шеллу репозитория;
-#   probes  — уже написанные пробы зон, без докера.
+#   probes  — уже написанные пробы зон, без докера;
+#   mashina — НАСТОЯЩАЯ машина: контейнер с живым systemd и sshd, настоящий `deploy/remote.sh`,
+#             состояние машины читает goss (`WORLD2-154`, второй пункт `WORLD2-151`).
 #
-# Чего здесь НЕТ намеренно: матрицы ОС (у нас Linux), goss, bats, Playwright, контейнеров
-# с systemd — это следующие пункты `WORLD2-151`, и они идут ПОСЛЕ того, как встанет это.
+# Первые три работы гоняют то, что уже написано, и ни одна из них не касается настоящего
+# демона. Четвёртая — касается: она и заведена затем, что три первых зелёные там, где живой
+# прогон падает на первом шаге.
+#
+# Чего здесь НЕТ намеренно: матрицы ОС (один `ubuntu2404`, остальные — следующим заходом,
+# когда станет ясно время), bats, Playwright — это следующие пункты `WORLD2-151`.
 
 name: CI
 
@@ -310,3 +316,352 @@ jobs:
           # То же самое в лог работы: сводку смотрят не всегда, лог — всегда.
           echo "── коды возврата проб ──"
           cat "$RUNNER_TEMP/kody.txt"
+
+  # ───────────────────────────────────────────────────────────── настоящая машина
+  #
+  # ЗДЕСЬ КОНЧАЮТСЯ ЗАГЛУШКИ. Всё, что выше, гоняется без докера и на подставных `ssh` —
+  # а `B1` («мир ставит докер на чужую машину») до сегодня проверялся только руками на живых
+  # VPS, и каждая находка живого прогона (машина без выхода наружу, сменившийся ключ хоста,
+  # sshd, который не принимает то, что мы шлём) стоила круга работы и находилась в первые
+  # минуты на настоящей системе. `probe-remote.sh` — 1103 строки, и ноль касаний настоящего
+  # демона (`WORLD2-154`).
+  #
+  # Эта работа поднимает НАСТОЯЩУЮ машину — контейнер с живым systemd и sshd, — даёт ей ключ,
+  # зовёт НАСТОЯЩИЙ `deploy/remote.sh` и спрашивает состояние машины у ЧУЖОГО инструмента.
+  # Подмены `PATH` в ней нет ни одной: работает тот самый скрипт, которым человек ставит мир
+  # на свою VPS. Сломай `remote.sh` — работа обязана покраснеть.
+  #
+  # СВОЕГО ЗДЕСЬ НЕТ НИЧЕГО, и это не аскеза, а сверка с рынком (2026-08-21):
+  #
+  #   «чистая машина»    `geerlingguy/docker-ubuntu2404-ansible` — образ, которым тестируют
+  #                      ansible-роли по матрице ОС. systemd внутри НАСТОЯЩИЙ, значит и
+  #                      `systemctl start docker` там всерьёз. Своего образа не строим;
+  #   состояние машины   `goss` (goss-org/goss, Apache-2.0) — один статический бинарь и YAML.
+  #                      Спека — `deploy/mashina.goss.yaml`, довод и сверка записаны там;
+  #   сам подход         `rancher/install-docker` гоняет свой install-скрипт в контейнере
+  #                      `--privileged` по матрице дистрибутивов на каждом PR
+  #                      (`scripts/test-docker`, смотрено 2026-08-21) — ровно наша задача,
+  #                      решённая до нас. Отличие названо честно: они systemctl ЗАГЛУШАЮТ
+  #                      (`echo '' > /usr/bin/systemctl`) и сверяют только версию клиента, а
+  #                      нам нужна живая служба — потому машина у нас с systemd.
+  #
+  # ДВЕ МАШИНЫ, И РАЗЛИЧАЮТСЯ ОНИ РОВНО ОДНИМ: у первой юзеру дан `sudo` без пароля, у второй
+  # нет. Образ, подготовка и ключ у них тождественны. Поэтому «докер встал» и «мир отказался
+  # ставить докер» здесь — следствие ОДНОГО названного различия, а не двух разных стендов, про
+  # которые пришлось бы верить на слово.
+  #
+  # МАТРИЦЫ ОС НЕТ НАРОЧНО: один `ubuntu2404`. Остальные дистрибутивы — следующим заходом,
+  # когда станет ясно фактическое время (`WORLD2-154`).
+  #
+  # ЦЕНА. Это самая дорогая работа репозитория: две машины, `apt` внутри них, установка докера
+  # из сети и настоящий образ двери из реестра. Поэтому она САМА говорит, сколько стоила —
+  # последним шагом в сводку. Гонять её на каждый пуш или только на PR в `main` — решение по
+  # измеренному времени, а не по догадке.
+  mashina:
+    name: настоящая машина — докер ставит мир, а не заглушка
+    runs-on: ubuntu-24.04
+    # Своя граница по времени: повисший ssh или не поднявшийся systemd иначе жгли бы шесть
+    # часов раннера молча. Выход за 20 минут — сам по себе находка, а не «просто медленно».
+    timeout-minutes: 20
+    env:
+      # Версия проверялки пинована и сверена суммой — по тому же доводу, что и shellcheck
+      # выше: инструмент проверки не вправе меняться сам по себе, между двумя нашими пушами.
+      # Сумма — из `goss_0.4.10_SHA256SUMS` того же выпуска (сверено 2026-08-21).
+      GOSS_VERSION: v0.4.10
+      GOSS_SHA256: 26e365428946294bcec0c61d867bb3c8349f39feb3d0e6f59084e98632785cc7
+      # Образ машины пинован ДАЙДЖЕСТОМ: тег у него один и тот же (`latest`), и он переезжает
+      # при каждой пересборке. Без дайджеста «та же самая машина» означала бы разную машину.
+      # Дайджест снят 2026-08-21; обновлять — отдельным решением, а не молча.
+      MASHINA_OBRAZ: geerlingguy/docker-ubuntu2404-ansible:latest@sha256:8f71d6ef6617ce600a0c9f210a21bff095ef9cf2b7c5ac437f838e697ad5bbe5
+      # Как гоняется спека — в ОДНОМ месте: она запускается четырежды (до установки на обеих
+      # машинах, после установки, после снятия), и разъехавшиеся запуски проверяли бы разное.
+      GOSS_ZAPUSK: goss --gossfile /tmp/mashina.goss.yaml --package dpkg validate --format documentation
+      # Имена ресурсов и порты. Порт публикуется на 127.0.0.1 — наружу раннера машине смотреть
+      # незачем.
+      RESURS: ci-mashina
+      RESURS_OTKAZ: ci-otkaz
+      PORT: "2222"
+      PORT_OTKAZ: "2223"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: поставить goss — пин и контрольная сумма
+        run: |
+          echo "$(date +%s) начало" >> "$RUNNER_TEMP/vremya.txt"
+          url="https://github.com/goss-org/goss/releases/download/${GOSS_VERSION}/goss_${GOSS_VERSION#v}_linux_x86_64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/goss.tgz" "$url"
+          # Сумма сверяется ДО распаковки: проверялка, приехавшая неизвестно какой, не
+          # проверяет ничего.
+          echo "$GOSS_SHA256  $RUNNER_TEMP/goss.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/goss.tgz" -C "$RUNNER_TEMP" goss
+          "$RUNNER_TEMP/goss" --version
+
+      - name: ключ — тем способом, которым его берёт remote.sh
+        run: |
+          # Мир кред НЕ ЗАВОДИТ: докер по ssh берёт ключ там, где его берёт ssh — агент либо
+          # `~/.ssh/config` (`deploy/remote.sh`, шапка). Агент здесь не годится: каждый шаг —
+          # новая оболочка, и агент умрёт вместе с ней. Значит config, второй из двух путей,
+          # названных самим скриптом. Своего способа передать ключ мы не изобретаем — у
+          # `docker context` такого поля нет вовсе, и наш ключ докер бы молча проигнорировал.
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -N '' -q -f ~/.ssh/world-ci -C world-ci
+          {
+            echo "Host 127.0.0.1"
+            echo "  IdentityFile ~/.ssh/world-ci"
+            echo "  IdentitiesOnly yes"
+          } >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          # `known_hosts` НЕ подкладываем: ключ хоста принимает сам `remote.sh` своим
+          # `StrictHostKeyChecking=accept-new`, и это его настоящая ветка — та самая, которая
+          # на живом прогоне 18–21.08 и сломалась о сменившийся ключ.
+
+      - name: поднять две машины — systemd, sshd и разница в одном
+        run: |
+          klyuch="$(cat ~/.ssh/world-ci.pub)"
+
+          # podnyat <машина> <порт> <sudo|bez-sudo>
+          podnyat() {
+              # `--privileged` и `--cgroupns=host` — рецепт живого systemd в контейнере от
+              # автора образа (molecule-раскладка geerlingguy). Том под `/var/lib/docker` —
+              # затем, что overlay поверх overlay докер не берёт, и демон внутри не встанет.
+              docker run -d --name "$1" \
+                  --privileged --cgroupns=host \
+                  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+                  -v "$1-docker:/var/lib/docker" \
+                  -p "127.0.0.1:$2:22" \
+                  "$MASHINA_OBRAZ" /lib/systemd/systemd >/dev/null
+
+              # Ждём, пока systemd машины договорит, и спрашиваем ЕГО, а не порт: `degraded` —
+              # обычное состояние контейнера (часть юнитов там не нужна), и это не поломка.
+              local sostoyanie=""
+              local _
+              for _ in $(seq 60); do
+                  sostoyanie="$(docker exec "$1" systemctl is-system-running 2>/dev/null || true)"
+                  case "$sostoyanie" in running|degraded) break ;; esac
+                  sleep 1
+              done
+              case "$sostoyanie" in
+                  running|degraded) ;;
+                  *) echo "::error::машина $1: systemd не поднялся, сказал «${sostoyanie:-ничего}»"; return 1 ;;
+              esac
+
+              # sshd — единственное, что доставляется в готовый образ: он сделан для ansible,
+              # и ssh-сервера в нём нет. Ставится ПАКЕТОМ дистрибутива, а не нашими руками.
+              docker exec "$1" sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server' >/dev/null
+              docker exec "$1" systemctl enable --now ssh >/dev/null 2>&1
+
+              # Юзер, которым мир ходит на машину. Имя `world` названо и в спеке goss: спека
+              # проверяет ИМЕННО ЭТУ машину и вправе знать, кого на ней заводили.
+              docker exec "$1" useradd --create-home --shell /bin/bash world
+              docker exec "$1" install -d -m 700 -o world -g world /home/world/.ssh
+              printf '%s\n' "$klyuch" | docker exec -i "$1" tee /home/world/.ssh/authorized_keys >/dev/null
+              docker exec "$1" chown world:world /home/world/.ssh/authorized_keys
+              docker exec "$1" chmod 600 /home/world/.ssh/authorized_keys
+
+              # ЕДИНСТВЕННОЕ РАЗЛИЧИЕ ДВУХ МАШИН — вот эта строка и ничего больше.
+              if [ "$3" = sudo ]; then
+                  docker exec "$1" sh -c 'echo "world ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/world && chmod 440 /etc/sudoers.d/world'
+              fi
+
+              # Готовность спрашиваем у systemd. Своей проверки доступности не заводим: их в
+              # репозитории уже восемь штук с четырьмя словарями кодов (`WORLD2-151`), девятая
+              # тут была бы ровно тем, за что эта задача и взялась.
+              docker exec "$1" systemctl is-active ssh
+
+              docker cp "$RUNNER_TEMP/goss" "$1:/usr/local/bin/goss"
+              docker cp deploy/mashina.goss.yaml "$1:/tmp/mashina.goss.yaml"
+              echo "машина $1 готова: ssh на 127.0.0.1:$2, права — $3"
+          }
+
+          podnyat mashina "$PORT" sudo
+          podnyat mashina-bez-prav "$PORT_OTKAZ" bez-sudo
+
+      - name: до прогона — спека ОБЯЗАНА краснеть на обеих машинах
+        run: |
+          # СТОРОЖ САМОГО СТОРОЖА. Спека, зеленеющая на машине без докера, не проверяет
+          # ничего — и её зелёное после установки не значит ничего тоже. Проверяем это ДО
+          # прогона, а не верим спеке на слово.
+          #
+          # Повод не теоретический: в нашем девбоксе лежит ЗАГЛУШКА `systemctl`, отвечающая
+          # кодом 0 на любой вопрос, и та же самая спека там зеленела по СЛУЖБЕ на машине, где
+          # докера нет вовсе (проверено локально 2026-08-21). На машине с настоящим systemd
+          # этого не будет — но узнавать такое надо от работы, а не от веры в неё.
+          for m in mashina mashina-bez-prav; do
+              if docker exec "$m" sh -c "$GOSS_ZAPUSK"; then
+                  echo "::error::спека goss зеленеет на машине $m, где докера ещё нет — она не проверяет ничего"
+                  exit 1
+              fi
+              echo "машина $m: спека красная, как и должна быть до установки"
+          done
+
+      - name: прогон 1 — НАСТОЯЩИЙ remote.sh на машине без докера
+        run: |
+          echo "$(date +%s) прогон-1-начало" >> "$RUNNER_TEMP/vremya.txt"
+          # Ни `ssh`, ни `docker`, ни `curl` не подставлены. Рецепт — тоже настоящий, дверь.
+          #
+          # Потоки развёл сам скрипт: человеческие слова — в stderr, метки машине
+          # (`REMOTE-PATH`, `REMOTE-THING`, `REMOTE-REFUSAL`) — в stdout. Этим и пользуемся:
+          # утверждения вешаются на МЕТКУ, а не на формулировку, которая вправе меняться
+          # (`WORLD2` 4.2 — проба, привязанная к тексту, зеленеет на верной правке).
+          set +e
+          ./deploy/remote.sh add "$RESURS" --addr "world@127.0.0.1:$PORT" --recipe deploy/compose.yaml \
+              > "$RUNNER_TEMP/progon-1.out" 2> "$RUNNER_TEMP/progon-1.err"
+          rc=$?
+          set -e
+          echo "$(date +%s) прогон-1-конец" >> "$RUNNER_TEMP/vremya.txt"
+          cat "$RUNNER_TEMP/progon-1.err"
+          echo "── метки машине ──"
+          cat "$RUNNER_TEMP/progon-1.out"
+          if [ "$rc" -ne 0 ]; then
+              echo "::error::настоящий remote.sh не поставил мир на настоящую машину: код $rc"
+              exit "$rc"
+          fi
+          grep -qx 'REMOTE-PATH: docker-install' "$RUNNER_TEMP/progon-1.out" || {
+              echo "::error::метки «REMOTE-PATH: docker-install» нет — ветка установки не выполнялась"
+              exit 1
+          }
+
+      - name: goss на машине — докер стоит, служба активна, юзер в группе
+        run: |
+          # Состояние машины читает ЧУЖОЙ инструмент. Слова нашего же скрипта («докер на
+          # ресурсе есть: версия …») здесь не участвуют вовсе: скрипт, сломанный так, что он
+          # рапортует успех, не поставив, напечатал бы ровно их.
+          docker exec mashina sh -c "$GOSS_ZAPUSK"
+
+      - name: докер был — не тронут
+        run: |
+          # Снимок берём у МАШИНЫ: версия пакета и момент, когда демон стал активен. Полезь
+          # мир ставить докер второй раз — сменится либо первое, либо второе (установка
+          # перезапускает службу). «Не тронут» становится видимым, а не подразумеваемым.
+          # Одинарные кавычки НАРОЧНО: `${Version}` — это формат самого dpkg-query, и
+          # разворачивать его нашей оболочкой нечем. Гасим на месте, а не общим списком.
+          # shellcheck disable=SC2016
+          bylo_ver="$(docker exec mashina dpkg-query -W -f='${Version}' docker-ce)"
+          bylo_start="$(docker exec mashina systemctl show -p ActiveEnterTimestamp --value docker)"
+
+          # Адрес не повторяем НАРОЧНО: заведённому ресурсу он не нужен — адрес лежит в
+          # контексте. Заодно прогоняется и эта ветка.
+          set +e
+          ./deploy/remote.sh add "$RESURS" --recipe deploy/compose.yaml \
+              > "$RUNNER_TEMP/progon-2.out" 2> "$RUNNER_TEMP/progon-2.err"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/progon-2.err"
+          echo "── метки машине ──"
+          cat "$RUNNER_TEMP/progon-2.out"
+          [ "$rc" -eq 0 ] || { echo "::error::второй прогон вернул $rc"; exit "$rc"; }
+
+          if grep -q 'REMOTE-PATH: docker-install' "$RUNNER_TEMP/progon-2.out"; then
+              echo "::error::мир полез ставить докер на машину, где докер УЖЕ СТОИТ"
+              exit 1
+          fi
+          # shellcheck disable=SC2016
+          stalo_ver="$(docker exec mashina dpkg-query -W -f='${Version}' docker-ce)"
+          stalo_start="$(docker exec mashina systemctl show -p ActiveEnterTimestamp --value docker)"
+          [ "$bylo_ver" = "$stalo_ver" ] || { echo "::error::версия докера на машине сменилась: $bylo_ver → $stalo_ver"; exit 1; }
+          [ "$bylo_start" = "$stalo_start" ] || { echo "::error::демон докера перезапускали: $bylo_start → $stalo_start"; exit 1; }
+          # И образ второй раз не везётся — он уже там.
+          grep -qx 'REMOTE-PATH: image-present' "$RUNNER_TEMP/progon-2.out" || {
+              echo "::error::второй прогон не сказал «образ на ресурсе уже есть» — значит вёз его заново"
+              exit 1
+          }
+          echo "докер не тронут: версия $stalo_ver, демон активен с $stalo_start"
+
+      - name: снять — и спросить машину, что снялось
+        run: |
+          set +e
+          ./deploy/remote.sh drop "$RESURS" --recipe deploy/compose.yaml \
+              > "$RUNNER_TEMP/snyatie.out" 2> "$RUNNER_TEMP/snyatie.err"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/snyatie.err"
+          [ "$rc" -eq 0 ] || { echo "::error::снятие вернуло $rc"; exit "$rc"; }
+
+          # ЧТО СНЯЛОСЬ — спрашиваем машину, а не свой же журнал.
+          ostalos="$(docker exec mashina docker ps -aq --filter 'label=com.docker.compose.project=world')"
+          [ -z "$ostalos" ] || { echo "::error::на машине остались контейнеры вещи: $ostalos"; exit 1; }
+          if docker exec mashina docker network inspect omnifield-gateway >/dev/null 2>&1; then
+              echo "::error::общая сеть на машине осталась, хотя в ней больше никого нет"
+              exit 1
+          fi
+          # Контекст — единственное, что мир заводит на ЭТОЙ машине.
+          if docker context inspect "world-$RESURS" >/dev/null 2>&1; then
+              echo "::error::контекст world-$RESURS остался на раннере"
+              exit 1
+          fi
+          # А ДОКЕР ОСТАЁТСЯ: снятие вещи его не убирает — он не наша вещь. Это обещание
+          # скрипта, и проверяет его та же спека, которой проверялась установка.
+          docker exec mashina sh -c "$GOSS_ZAPUSK"
+          echo "снялось: контейнеры, сеть, контекст. Осталось: докер, тома и образ — как и сказано"
+
+      - name: отказ живьём — машине не дали прав
+        run: |
+          echo "$(date +%s) отказ-начало" >> "$RUNNER_TEMP/vremya.txt"
+          # Машина та же, образ тот же, ключ тот же. Разница одна: юзеру не дан sudo без
+          # пароля. ЗАГЛУШКА такого не умеет вовсе — у неё нет прав, которых можно не дать.
+          set +e
+          ./deploy/remote.sh add "$RESURS_OTKAZ" --addr "world@127.0.0.1:$PORT_OTKAZ" --recipe deploy/compose.yaml \
+              > "$RUNNER_TEMP/otkaz.out" 2> "$RUNNER_TEMP/otkaz.err"
+          rc=$?
+          set -e
+          echo "$(date +%s) отказ-конец" >> "$RUNNER_TEMP/vremya.txt"
+          cat "$RUNNER_TEMP/otkaz.err"
+          echo "── метки машине ──"
+          cat "$RUNNER_TEMP/otkaz.out"
+          [ "$rc" -eq 1 ] || { echo "::error::ждали отказ (код 1), получили $rc"; exit 1; }
+          grep -qx 'REMOTE-REFUSAL: docker-install-denied' "$RUNNER_TEMP/otkaz.out" || {
+              echo "::error::отказ есть, а код не тот: ждали docker-install-denied"
+              exit 1
+          }
+          # И на машине действительно ничего не появилось — спрашиваем ту же спеку, и она
+          # обязана быть красной.
+          if docker exec mashina-bez-prav sh -c "$GOSS_ZAPUSK"; then
+              echo "::error::мир отказался ставить докер, а спека на той машине зелёная"
+              exit 1
+          fi
+          echo "отказ живьём: docker-install-denied, докера на машине нет"
+
+      # Упало — показываем МАШИНУ, а не пересказ. Журнал демона и журнал контейнера: причина
+      # живого отказа лежит там, а не в нашем выводе.
+      - name: журнал машин — только если упало
+        if: ${{ failure() }}
+        run: |
+          for m in mashina mashina-bez-prav; do
+              echo "── $m ──"
+              docker exec "$m" systemctl --no-pager status docker || true
+              docker exec "$m" journalctl -u docker --no-pager -n 50 || true
+              docker exec "$m" journalctl -u ssh --no-pager -n 20 || true
+              docker logs --tail=50 "$m" || true
+          done
+
+      # Работа дорогая — и она сама говорит, сколько стоила. Не «примерно»: секунды, снятые
+      # в этом же прогоне. По ним решается, гонять её на каждый пуш или только на PR в `main`.
+      - name: время — сколько это стоило
+        if: ${{ !cancelled() }}
+        run: |
+          echo "$(date +%s) конец" >> "$RUNNER_TEMP/vremya.txt"
+          vzyat() { awk -v m="$1" '$2 == m { print $1; exit }' "$RUNNER_TEMP/vremya.txt"; }
+          stroka() {
+              local a b
+              a="$(vzyat "$1")"; b="$(vzyat "$2")"
+              if [ -n "$a" ] && [ -n "$b" ]; then
+                  echo "| $3 | $((b - a)) |"
+              else
+                  echo "| $3 | не дошло |"
+              fi
+          }
+          {
+            echo "## настоящая машина — сколько это стоило"
+            echo
+            echo "| отрезок | секунд |"
+            echo "|---|---|"
+            stroka начало конец "вся работа"
+            stroka прогон-1-начало прогон-1-конец "прогон 1 — установка докера и подъём двери"
+            stroka отказ-начало отказ-конец "отказ живьём"
+            echo
+            echo "Время здесь не украшение: работа дорогая, и по нему решается, гонять её на"
+            echo "каждый пуш или только на PR в \`main\` (\`WORLD2-154\`). Матрица ОС — следующим"
+            echo "заходом, и её цена считается от этого числа."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "── засечки ──"
+          cat "$RUNNER_TEMP/vremya.txt"
