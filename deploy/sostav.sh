@@ -103,6 +103,9 @@ SOSTAV_SLOVAMI=
 sostav_net() { SOSTAV_STATE="$1"; SOSTAV_SLOVAMI="$2"; return 1; }
 
 # sostav_obrazy — ключи всех образов, по строке.
+# Кавычек тут нет НАРОЧНО: перечень хранится строкой через пробел, и разбиение на слова —
+# это и есть способ отдать его построчно. Закавычить — отдать одну строку вместо списка.
+# shellcheck disable=SC2086
 sostav_obrazy() { printf '%s\n' $SOSTAV_OBRAZY; }
 
 # sostav_est КЛЮЧ — знаем ли такой образ.
