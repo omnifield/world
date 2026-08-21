@@ -315,7 +315,9 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 		return ref
 	}
 
-	addr, ref := scope.Parse(body.Scope.Addr)
+	// НАЗЫВАЕМСЯ: выходы отказа зависят от ручки, на которой стоит человек. Совет «заведи
+	// скоуп» верен на входе и превращается в петлю здесь (`WORLD2-144`).
+	addr, ref := scope.Parse(body.Scope.Addr, scope.AskingCreate)
 	if ref != nil {
 		return ref
 	}
@@ -330,7 +332,7 @@ func (h *Handler) postScope(w http.ResponseWriter, r *http.Request) *refusal.Ref
 	// Пустой бренд — ЗАКОННОЕ состояние, а не поломка (`WORLD2-135`): свежесозданный
 	// скоуп это имя и пустота. Проверки на него здесь нет намеренно.
 
-	sc := scope.Open(addr, body.Scope.Password, h.opt.ScopeTimeout)
+	sc := scope.Open(addr, body.Scope.Password, h.opt.ScopeTimeout, scope.AskingCreate)
 	presence, ref := sc.Look(r.Context())
 	if ref != nil {
 		return ref
@@ -778,7 +780,7 @@ func (h *Handler) deleteScope(w http.ResponseWriter, r *http.Request) *refusal.R
 	if ref := decode(r, &body); ref != nil {
 		return ref
 	}
-	addr, ref := scope.Parse(body.Scope.Addr)
+	addr, ref := scope.Parse(body.Scope.Addr, scope.AskingDrop)
 	if ref != nil {
 		return ref
 	}
@@ -805,7 +807,7 @@ func (h *Handler) deleteScope(w http.ResponseWriter, r *http.Request) *refusal.R
 		return ref
 	}
 
-	sc := scope.Open(addr, body.Scope.Password, h.opt.ScopeTimeout)
+	sc := scope.Open(addr, body.Scope.Password, h.opt.ScopeTimeout, scope.AskingDrop)
 	presence, ref := sc.Look(r.Context())
 	if ref != nil {
 		return ref
@@ -1096,7 +1098,7 @@ func (h *Handler) postSession(w http.ResponseWriter, r *http.Request) *refusal.R
 	if ref := decode(r, &body); ref != nil {
 		return ref
 	}
-	addr, ref := scope.Parse(body.Addr)
+	addr, ref := scope.Parse(body.Addr, scope.AskingSignIn)
 	if ref != nil {
 		return ref
 	}
@@ -1104,7 +1106,9 @@ func (h *Handler) postSession(w http.ResponseWriter, r *http.Request) *refusal.R
 		return noPassword()
 	}
 
-	sc := scope.Open(addr, body.Password, h.opt.ScopeTimeout)
+	// Скоуп сессии открыт ВХОДОМ, и он же обслуживает все чтения и записи внутри сессии:
+	// человек, получивший отказ на «добавить территорию», стоит на входе в ту же личность.
+	sc := scope.Open(addr, body.Password, h.opt.ScopeTimeout, scope.AskingSignIn)
 	st, ref := sc.Read(r.Context())
 	if ref != nil {
 		return ref
