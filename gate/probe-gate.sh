@@ -581,7 +581,10 @@ lint_cure() {
 
 # lint_code <код> — порча копии, и только если она покраснела — сам шелл зоны.
 lint_code() {
-    local code="$1" copy="$WORK/линтер-порча-$code.sh" out
+    local code="$1"
+    # Два `local`, а не один: присваивание из той же строки ещё не вступило в силу, и
+    # `copy` собралось бы из пустого `code` (SC2318).
+    local copy="$WORK/линтер-порча-$code.sh" out
     { cat "${BASH_SOURCE[0]}"; lint_bait "$code"; } > "$copy"
     if lint_run "$code" "$copy" >/dev/null 2>&1; then
         skip "в шелле зоны молчит $code" \
