@@ -5,7 +5,9 @@
   // `jsxImportSource: solid-js` — то, ради чего база вообще существовала: Solid берёт JSX из
   // своего рантайма, а не из React. Со сменой мажора Solid эту строку правим у себя, и это
   // честнее, чем ждать выпуска чужого пакета.
-  "include": ["src", "vite.config.ts", "vitest.config.ts"],
+  // `e2e` и конфиг прогона — такой же код зоны, как `src`: не проверяй их тут, и разъехавшийся
+  // сценарий стал бы виден только на прогоне, где он и без того дорог.
+  "include": ["src", "e2e", "vite.config.ts", "vitest.config.ts", "playwright.config.ts"],
   "compilerOptions": {
     "target": "ESNext",
     "module": "ESNext",
