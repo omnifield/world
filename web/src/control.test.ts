@@ -600,6 +600,83 @@ describe("форма ответа проверяется до показа", () 
     expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
   });
 
+  it("комьюнити участка доезжают списком — и пустой список законен", async () => {
+    // Форма соседа поехала (`WORLD2-122`): у участка появились комьюнити, в которых он состоит.
+    // Их сколько угодно (`WORLD2` 2.5 п. 3), а пустой список — обычное состояние, а не «не
+    // спросили»: принадлежность лежит в скоупе, и спрашивать про неё некого.
+    const { fetch } = отвечает([{ body: JSON.stringify({ resources: [УЧАСТОК, МОЛЧУН] }) }]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "ok" && answer.value[0]?.fields).toEqual(УЧАСТОК.fields);
+    expect(УЧАСТОК.fields.length).toBeGreaterThan(0);
+    expect(answer.kind === "ok" && answer.value[1]?.fields).toEqual([]);
+  });
+
+  it("поля «fields» нет вовсе — отказ: комьюнити не догадка пульта", async () => {
+    // Контроллер пишет список ВСЕГДА и `null` вместо пустого не отдаёт — нормализует у себя.
+    // Подставить сюда `[]` за него значило бы сказать «ни в одном» там, где мы не знаем
+    // ничего: то же самое, что запрещено у вещей.
+    const { fields: _, ...без } = УЧАСТОК;
+    const { fetch } = отвечает([{ body: JSON.stringify({ resources: [без] }) }]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
+  it("`fields: null` — тоже отказ: у принадлежности нет «не спросили»", async () => {
+    // У ВЕЩЕЙ `null` законен, у комьюнити — нет, и мерка эта взята оттуда, где поле рождается.
+    // Вещи спрашивают у машины, и она может молчать; комьюнити лежат в скоупе, а он перед нами.
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resources: [{ ...УЧАСТОК, fields: null }] }) },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
+  it("безымянное комьюнити в списке — отказ, а не строка без имени", async () => {
+    // За именем комьюнити стоит адрес, как и за именем ключа (`WORLD2` 3.4 п. 4): пустым оно
+    // не приезжает, и показанная пустая строка списка означала бы членство неизвестно в чём.
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resources: [{ ...УЧАСТОК, fields: ["дом", ""] }] }) },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
+  it("заявленный ресурс доезжает словами юзера, и пустой — законное значение", async () => {
+    // `resource` — что участок ЗАЯВИЛ о себе сам (`WORLD2` 2.5 пп. 2, 6, 7), а не мера мира.
+    // Пусто значит «не заявлял», и мерка тут та же, что у бренда: пустая строка законна.
+    const { fetch } = отвечает([{ body: JSON.stringify({ resources: [УЧАСТОК, МОЛЧУН] }) }]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "ok" && answer.value[0]?.resource).toBe(УЧАСТОК.resource);
+    expect(УЧАСТОК.resource).not.toBe("");
+    expect(answer.kind === "ok" && answer.value[1]?.resource).toBe("");
+  });
+
+  it("поля «resource» нет вовсе — отказ: «не заявлял» говорит контроллер, а не пульт", async () => {
+    // Пустая строка и отсутствие поля — разные ответы (`WORLD2` 3.4, `WORLD2-135`). Первое
+    // сказал контроллер, второе значит, что форма разъехалась.
+    const { resource: _, ...без } = УЧАСТОК;
+    const { fetch } = отвечает([{ body: JSON.stringify({ resources: [без] }) }]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
+  it("заявленный ресурс не строкой — отказ, а не «наверное, цифры»", async () => {
+    // Заявление это СЛОВА участка, и цифр в нём может не быть вовсе. Приехало число — форма
+    // разошлась, и это вопрос к зоне control, а не повод показать его как есть.
+    const { fetch } = отвечает([
+      { body: JSON.stringify({ resources: [{ ...УЧАСТОК, resource: 4 }] }) },
+    ]);
+    const answer = await liveControl(fetch).resources();
+
+    expect(answer.kind === "refusal" && answer.refusal.code).toBe("answer-not-expected");
+  });
+
   it("образец контракта разбирается целиком — форма соседа и мерки пульта сходятся", async () => {
     const { fetch } = отвечает([{ body: JSON.stringify({ resources: [УЧАСТОК, МОЛЧУН] }) }]);
     const answer = await liveControl(fetch).resources();

@@ -40,6 +40,13 @@
 // `GET /api/recipes` (чем контроллер умеет поднимать) и поле `recipe` у добавления ресурса
 // здесь по той же причине не появились: выбирать вещь `WORLD2-131` на экран не просил.
 // Прежний запрос пульта работает как работал — рецепт не назван, и контроллер ставит дверь.
+//
+// ТРЁХ РУЧЕК ЧЛЕНСТВА И ЗАЯВЛЕНИЯ ЗДЕСЬ ТОЖЕ НЕТ, И ЭТО СКАЗАНО ВСЛУХ (`WORLD2-163`):
+// `POST`/`DELETE /api/resources/{имя}/fields` и `PUT /api/resources/{имя}/resource` у
+// контроллера есть (`WORLD2-122`), а пульт ими не действует — он их ПОКАЗЫВАЕТ. Комьюнити
+// участка и заявленный им ресурс приезжают в ответе списка, и на экране они видны; менять их
+// человек пока идёт к контроллеру. Молчаливое «поле в ответе есть, но его не видно» было бы
+// худшим из трёх исходов — оно и было причиной этой задачи.
 
 /** Ручки контроллера. Те же пути, что в `control/internal/api`. */
 export const PATH = {
@@ -158,6 +165,24 @@ export type Resource = {
    * спросили» — это знание, которого у нас нет (`WORLD2` 4.2).
    */
   things: Thing[] | null;
+  /**
+   * КОМЬЮНИТИ, В КОТОРЫХ УЧАСТОК СОСТОИТ (`WORLD2` 1.3, `2.5` п. 3). Их сколько угодно:
+   * принадлежность — не пространство, и состоять в нескольких сообществах естественно.
+   *
+   * У списка ДВА исхода, а не три, как у вещей: пустой — «ни в одном», и это обычное
+   * состояние. Третьего («не спросили») здесь нет и быть не может — принадлежность лежит в
+   * скоупе, а скоуп перед нами; спрашивать некого. Поэтому `null` тут не значение, а
+   * разъехавшийся контракт.
+   */
+  fields: string[];
+  /**
+   * ЧТО УЧАСТОК ЗАЯВИЛ О СЕБЕ САМ (`WORLD2` 2.5 пп. 2, 6, 7) — его же словами, строкой.
+   *
+   * Это НЕ измерение: ресурса в цифрах мир не меряет, и отдельный инструмент осмотра отложен
+   * сознательно (`2.5` п. 10). Пусто — «не заявлял», и это законное значение, а не пробел в
+   * ответе: мерка тут та же, что у бренда.
+   */
+  resource: string;
 };
 
 /**
@@ -529,7 +554,12 @@ function readAddedResource(
   if (!rec) return notExpected(path, "это не объект");
 
   const added = readOneResource(rec.resource);
-  if (!added) return notExpected(path, "нет объекта «resource» с полями name, addr, reach, things");
+  if (!added) {
+    return notExpected(
+      path,
+      "нет объекта «resource» с полями name, addr, reach, things, fields, resource",
+    );
+  }
 
   const list = readResourceList(rec.resources, path);
   if (list.kind === "refusal") return list;
@@ -568,12 +598,39 @@ function readOneResource(raw: unknown): Resource | null {
   const things = readThings(rec.things);
   if (things === НЕ_ТА_ФОРМА) return null;
 
+  // Комьюнити спрашиваем СПИСКОМ И СТРОГО: контроллер пишет его всегда и `null` вместо пустого
+  // не отдаёт — нормализует у себя (`control/internal/resource`, `List`). Значит отсутствие
+  // поля или `null` здесь — это разъехавшаяся форма, а не «не спросили»: третьего исхода у
+  // принадлежности нет, она лежит в скоупе (`WORLD2` 2.5 п. 4).
+  const fields = readFieldNames(rec.fields);
+  if (!fields) return null;
+
+  // Заявленный ресурс — ЛЮБАЯ строка, в том числе пустая: «не заявлял» это состояние мира, и
+  // мерка та же, что у бренда (`WORLD2-135`). А вот отсутствие поля — форма разъехалась.
+  if (typeof rec.resource !== "string") return null;
+
   return {
     name: rec.name as string,
     addr: rec.addr as string,
     reach: rec.reach as string,
     things,
+    fields,
+    resource: rec.resource,
   };
+}
+
+/**
+ * Имена комьюнити участка. Пустой строкой имя не приезжает: за именем поля стоит адрес, и
+ * безымянного комьюнити контроллер не заводит вовсе (`no-name`, `no-such-field`).
+ */
+function readFieldNames(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: string[] = [];
+  for (const item of raw) {
+    if (!isFilled(item)) return null;
+    out.push(item as string);
+  }
+  return out;
 }
 
 /**
