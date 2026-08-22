@@ -214,6 +214,11 @@ case "$1" in
                 case "${STUB_UP:-ok}" in
                     ok)   printf 'Container world-door  Started\n'; exit 0 ;;
                     busy) printf 'Error response from daemon: driver failed programming external connectivity: Bind for 0.0.0.0:8080 failed: port is already allocated\n' >&2; exit 1 ;;
+                    # ВТОРОЕ СЛОВО ДОКЕРА О ТОМ ЖЕ. Он говорит про занятый порт по-разному —
+                    # от версии и системы, — и шаблонов в `remote.sh` поэтому три. Стеречь
+                    # надо каждый: мёртвый шаблон выглядит заботой, а не срабатывает
+                    # (`WORLD2-158`: один такой там и лежал, целиком внутри соседнего).
+                    busy2) printf 'Error response from daemon: driver failed programming external connectivity: bind: address already in use\n' >&2; exit 1 ;;
                     *)    printf 'Error response from daemon: something else entirely\n' >&2; exit 1 ;;
                 esac ;;
             *" down"*) exit "${STUB_DOWN:-0}" ;;
@@ -985,6 +990,14 @@ red() {
         STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=1 \
         STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 STUB_UP=busy \
         -- add vps --addr world@10.8.0.5
+    # ТО ЖЕ САМОЕ ДРУГИМИ СЛОВАМИ ДОКЕРА. Шаблонов в `remote.sh` три, потому что докер
+    # говорит про занятый порт по-разному, а проверялся до сих пор ровно один — и рядом с
+    # проверенным спокойно жил мёртвый, целиком лежавший внутри соседнего (`WORLD2-158`).
+    # Второе слово стережём отдельно: иначе «шаблонов три» остаётся обещанием.
+    want_refusal port-busy "порт занят, и докер сказал это ДРУГИМИ словами" \
+        STUB_CTX_EXISTS=0 STUB_SSH_OK=1 STUB_REMOTE_DOCKER=1 STUB_REMOTE_IMAGE=1 \
+        STUB_LOCAL_IMAGE=1 STUB_NET_EXISTS=1 STUB_UP=busy2 \
+        -- add vps --addr world@10.8.0.5
     want_refusal no-such-resource "снимают ресурс, которого не заводили" \
         STUB_CTX_EXISTS=0 -- drop vps
     # «Запущено» и «отвечает» — разные вещи, и вторую мы обязаны дождаться либо отказать.
@@ -1019,7 +1032,9 @@ live() {
     part "ЖИВОЙ ПРОГОН на настоящем втором ресурсе"
 
     # Подставные инструменты убираем: здесь нужен настоящий докер и настоящий ssh.
-    local real_path="${PATH#$STUB_DIR:}"
+    # Каталог заглушек закавычен ВНУТРИ подстановки: имя временного каталога приходит от
+    # `mktemp`, и незакавыченным оно читалось бы как шаблон (`SC2295`).
+    local real_path="${PATH#"$STUB_DIR:"}"
 
     if [ -z "$LIVE_ADDR" ]; then
         skip "дверь встаёт на чистом ресурсе" \
