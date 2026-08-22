@@ -1077,8 +1077,22 @@ run_case 1 "$HERE/build.sh" --only-control
 said "собранного пульта"
 not_called "control/compose.yaml build"
 
+# polozhit_pult — положить ГОТОВЫЙ пульт так, как его оставляет шаг 1: каталог и манифест
+# рядом. Отдельным помощником, потому что «готовый пульт» перестал быть просто непустым
+# файлом: после `WORLD2-115` шаг 3 требует подпись — иначе заглушка снова уедет в образ.
+polozhit_pult() {
+    mkdir -p "$OUT"
+    printf 'собранный пульт\n' > "$OUT/index.html"
+    {
+        printf 'kem=deploy/build.sh шаг 1\n'
+        printf 'pult-iz=%s\n' "$("$HERE/sostav.sh" --control --pult)"
+        printf 'versiya=%s\n' "$("$HERE/version.sh" --pult 2>/dev/null || true)"
+        printf 'lico=%s\n' "$(sha256sum "$OUT/index.html" | cut -d' ' -f1)"
+    } > "$OUT.sborka"
+}
+
 part "26b. --only-control с готовым пультом → складывает образ и НЕ собирает пульт заново"
-mkdir -p "$OUT"; printf 'собранный пульт\n' > "$OUT/index.html"
+polozhit_pult
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 0 "$HERE/build.sh" --only-control
 called "control/compose.yaml build"
@@ -1099,6 +1113,39 @@ not_called "compose -f $HERE/compose.yaml build"
 built=$(grep -c "^run .*$NODE_IMAGE" "$STUB_LOG")
 [ "$built" = 1 ] && good "пульт собран ровно один раз (сборщик звался $built раз)" \
                  || bad "сборщик пульта звался $built раз — второй сборки в зоне быть не должно"
+
+# ============================== 26d…26f. «В КАТАЛОГЕ ЛЕЖИТ ПУЛЬТ» — ЭТО УТВЕРЖДЕНИЕ
+# `WORLD2-115`. Шаг 3 проверял `[ -s index.html ]` — то есть «файл непустой». Файл из 28 байт
+# со словами «прежняя сборка» её проходил, и образ контроллера уезжал с фальшивым лицом молча.
+# Заглушки в тот каталог клала наша же проба; причину убрали (часть 33), но проверка осталась
+# бы слабой: любой обрывок — недокачанный, недописанный, оставленный чужой командой — прошёл
+# бы так же. Поэтому шаг 1 теперь ПОДПИСЫВАЕТ сборку манифестом, а шаг 3 подпись спрашивает.
+#
+# Три случая, и каждый когда-нибудь случится сам.
+part "26g. в каталоге что-то лежит, а манифеста нет → отказ, образ НЕ складывается"
+rm -rf "$OUT" "$OUT.sborka"
+mkdir -p "$OUT"; printf 'прежняя сборка\n' > "$OUT/index.html"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/build.sh" --only-control
+said "не сборка"
+not_called "control/compose.yaml build"
+
+part "26h. манифест есть, а содержимое каталога подменили → отказ по разошедшейся сумме"
+polozhit_pult
+printf 'подменённое лицо\n' > "$OUT/index.html"       # подпись осталась от прежнего содержимого
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/build.sh" --only-control
+said "НЕ та сборка"
+not_called "control/compose.yaml build"
+
+part "26i. пульт подписан ДРУГИМ деревом → отказ: в образ уехало бы старое лицо"
+polozhit_pult
+sed -i 's/^versiya=.*/versiya=sha-0000000/' "$OUT.sborka"
+STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
+    run_case 1 "$HERE/build.sh" --only-control
+said "собран из ДРУГОГО дерева"
+not_called "control/compose.yaml build"
+rm -rf "$OUT" "$OUT.sborka"
 
 part "26d. умолчание: ./deploy/build.sh собирает мир — без пульта и без контроллера"
 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
