@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // scope-identity.mjs — SessionStart hook: инжектит identity-баннер по OMNIFIELD_SCOPE.
-// Роль-модель (зоны/пины моделей/число архитекторов) — ДАННЫЕ из `.omnifield/harness.yaml`,
+// Роль-модель (зоны/пины моделей/число архитекторов) — ДАННЫЕ из `.claude/harness.yaml`,
 // НЕ хардкод. Роли-рамка (инварианты) — .claude/agents/{architect,owner,layer}.md.
 //   - 'main' → architect;  <zone> → owner-<zone>;  невалид → anomaly;  ПУСТО → баннер «роли нет»
 //     (не тишина: молчание на старте неотличимо от нормальной работы, BRAIN2-46 §3).
@@ -21,7 +21,7 @@ import {
   zoneReality,
 } from "./harness-config.mjs";
 
-// Признак незаполненного сида живёт в harness-config — одно знание на баннер и на доктора.
+// Признак незаполненного сида живёт в harness-config — одно знание на всех читателей конфига.
 // Ре-экспорт: исторические импорты из этого модуля продолжают работать.
 export { needsOnboarding };
 
@@ -45,7 +45,7 @@ function modelLine(config, role) {
 function productLabel(config) {
   return config.product
     ? `продукта \`${config.product}\``
-    : "этого продукта (имя не задано в `.omnifield/harness.yaml` → впиши `product:`)";
+    : "этого продукта (имя не задано в `.claude/harness.yaml` → впиши `product:`)";
 }
 
 /**
@@ -61,12 +61,12 @@ export function foreignConfigWarning(config, cwd) {
   return [
     `# ⚠️ КОНФИГ, ПОХОЖЕ, НЕ ОТ ЭТОГО РЕПОЗИТОРИЯ`,
     ``,
-    `\`.omnifield/harness.yaml\` объявляет зоны (${zones}), и **ни одна их папка здесь не существует**`,
+    `\`.claude/harness.yaml\` объявляет зоны (${zones}), и **ни одна их папка здесь не существует**`,
     `— объявлено путей: ${reality.declared}, найдено: 0. Так выглядит конфиг, скопированный из соседнего`,
     `продукта: имя продукта, роадмап и зоны в нём — чужие, а не «зоны ещё не созданы».`,
     ``,
     `**Action: STOP, спроси user.** Не иди в роадмап названного продукта и не заводи здесь`,
-    `его зоны, пока не подтверждено, что конфиг верный. Разбор — \`node .claude/hooks/harness-doctor.mjs\`.`,
+    `его зоны, пока не подтверждено, что конфиг верный. Смотреть — \`.claude/harness.yaml\`, секция \`zones\`.`,
   ];
 }
 
@@ -93,7 +93,7 @@ export function overlapNotice(config, scope) {
     `папок, а не вас друг от друга. Значит от взаимного затирания не защищает ничто —`,
     `ни гейт, ни git (у вас общее дерево). Правишь общие файлы — сначала спроси user,`,
     `не идёт ли там работа. Пересечение не задумано — это вопрос к architect: сам`,
-    `\`.omnifield/harness.yaml\` не правь, он вне твоей зоны.`,
+    `\`.claude/harness.yaml\` не правь, он вне твоей зоны.`,
   ];
 }
 
@@ -141,7 +141,7 @@ function onboardingBanner(config) {
   return [
     `# Session identity — OMNIFIELD_SCOPE=main (architect · ОНБОРДИНГ)${modelLine(config, "architect")}`,
     ``,
-    `Ты **architect/main**, но \`.omnifield/harness.yaml\` — ещё НЕЗАПОЛНЕННЫЙ общий шаблон`,
+    `Ты **architect/main**, но \`.claude/harness.yaml\` — ещё НЕЗАПОЛНЕННЫЙ общий шаблон`,
     `(\`product: ${config.product ?? "(пусто)"}\`, зоны/пины — placeholder). Это НЕ аномалия и НЕ повод паниковать:`,
     `**твоя первая задача — ОНБОРДИНГ, не работа.** Заполни роль-модель под этот продукт ВМЕСТЕ с user.`,
     ``,
@@ -159,8 +159,8 @@ function onboardingBanner(config) {
     `## Пока сид не заполнен`,
     `- **Owner'ов НЕ поднимаем** — governance режет по placeholder-путям, owner упрётся в стену.`,
     `- **Непонятно — спрашивай USER** (не другого агента; агенты друг друга не зовут).`,
-    `- Проверка после заполнения: \`node .claude/hooks/harness-doctor.mjs\`.`,
-    `- Обвязку (\`.claude/\`, \`.omnifield/harness.yaml\`) — закоммить в репу; артефакты установки`,
+    `- После заполнения перезапусти сессию: баннер соберётся по новому конфигу.`,
+    `- Обвязку (\`.claude/\`, \`.claude/harness.yaml\`) — закоммить в репу; артефакты установки`,
     `  (\`agent-harness-plugin/\`, демо-папки) — НЕ коммить (gitignore).`,
   ].join("\n");
 }
@@ -170,7 +170,7 @@ function architectBanner(config) {
     `# Session identity — OMNIFIELD_SCOPE=main (architect)${modelLine(config, "architect")}`,
     ``,
     `Ты в роли **architect/main** ${productLabel(config)}. Правила роли — \`.claude/agents/architect.md\` + \`.claude/agents/shared-policy.md\`.`,
-    `Роль-модель — данные \`.omnifield/harness.yaml\` (архитекторов сконфигурено: ${config.architects}).`,
+    `Роль-модель — данные \`.claude/harness.yaml\` (архитекторов сконфигурено: ${config.architects}).`,
     ``,
     `- **ВИТРИНА ОДНА — Windshift, и ходишь в неё MCP-инструментами.** Канон и роадмап — страницами,`,
     `  работа и ТЗ — узлами; другого источника истины нет и искать его негде.`,
@@ -230,7 +230,7 @@ export function anomalyBanner(config, scope) {
   const lines = [
     `# Session identity — OMNIFIELD_SCOPE=${scope} (UNRESOLVED)`,
     ``,
-    `**Аномалия**: scope "${scope}" не резолвится в зону (нет в \`.omnifield/harness.yaml\`).`,
+    `**Аномалия**: scope "${scope}" не резолвится в зону (нет в \`.claude/harness.yaml\`).`,
     ``,
   ];
   if (near.length === 1) {
@@ -261,7 +261,7 @@ export function anomalyBanner(config, scope) {
   lines.push(
     ...launchBlock(scopes),
     ``,
-    `Зоны действительно нет (это не опечатка) — тогда впиши её в \`.omnifield/harness.yaml\``,
+    `Зоны действительно нет (это не опечатка) — тогда впиши её в \`.claude/harness.yaml\``,
     `(секция \`zones:\`) и перезапустись. Случай редкий: сперва проверь имя выше.`,
     ``,
     `**Action**: STOP. Сообщи user — scope невалидный. Не начинай работу (нет boundary/ownership).`,
@@ -288,8 +288,8 @@ export function noScopeBanner(config) {
     ...launchBlock(scopes),
     ``,
     scopes.length > 1
-      ? `Доступные scope: ${scopes.join(", ")} (из \`.omnifield/harness.yaml\`).`
-      : `Зон в \`.omnifield/harness.yaml\` нет — доступен только \`main\`. Разбор: \`node .claude/hooks/harness-doctor.mjs\`.`,
+      ? `Доступные scope: ${scopes.join(", ")} (из \`.claude/harness.yaml\`).`
+      : `Зон в \`.claude/harness.yaml\` нет — доступен только \`main\` (секция \`zones\` пуста).`,
   ].join("\n");
 }
 

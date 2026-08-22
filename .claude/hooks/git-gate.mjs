@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // git-gate.mjs — PreToolUse hook: hard-gate на write-операции git/gh. Уровень доступа —
-// ДАННЫЕ из `.omnifield/harness.yaml` (config.git[role]): architect=full / owner=commit-only /
+// ДАННЫЕ из `.claude/harness.yaml` (config.git[role]): architect=full / owner=commit-only /
 // layer=none. Роль-семантика (ЧТО режет каждый уровень) — рамка (инвариант).
 //
 // Несколько owner-сессий могут работать в одном shared working tree (одна .git).
