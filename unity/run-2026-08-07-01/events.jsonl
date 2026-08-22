@@ -1,7 +1,0 @@
-{"ts":"2026-08-07T18:23:32Z","seq":1,"attempt":"place baser at -5,-2","subject":{"kind":"building","schema":"baser","cell":[-5,-2]},"allowed":true}
-{"ts":"2026-08-07T18:23:34Z","seq":2,"attempt":"place baser at -24,-1","subject":{"kind":"building","schema":"baser","cell":[-24,-1]},"allowed":false,"rule":"no-place","reason":"за пределами поля (клетка -24,-1).","suggest":"сдвинь постройку ближе к центру поля."}
-{"ts":"2026-08-07T18:23:35Z","seq":3,"attempt":"place baser at -25,-6","subject":{"kind":"building","schema":"baser","cell":[-25,-6]},"allowed":false,"rule":"no-place","reason":"за пределами поля (клетка -25,-6).","suggest":"сдвинь постройку ближе к центру поля."}
-{"ts":"2026-08-07T18:23:37Z","seq":4,"attempt":"place baser at 21,4","subject":{"kind":"building","schema":"baser","cell":[21,4]},"allowed":false,"rule":"no-place","reason":"за пределами поля (клетка 21,4).","suggest":"сдвинь постройку ближе к центру поля."}
-{"ts":"2026-08-07T18:23:37Z","seq":5,"attempt":"place baser at -1,-9","subject":{"kind":"building","schema":"baser","cell":[-1,-9]},"allowed":true}
-{"ts":"2026-08-07T18:23:38Z","seq":6,"attempt":"place baser at 2,-2","subject":{"kind":"building","schema":"baser","cell":[2,-2]},"allowed":true}
-{"ts":"2026-08-07T18:23:38Z","seq":7,"attempt":"place baser at -5,-5","subject":{"kind":"building","schema":"baser","cell":[-5,-5]},"allowed":true}

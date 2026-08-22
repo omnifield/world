@@ -44,9 +44,14 @@
   // (версия pnpm — из пина самого репозитория через corepack; образ = тонкая оболочка),
   // остальные тулчейны приезжают сюда: чего тут нет, того в девбоксе нет, и постсоздание
   // говорит об этом вслух, если репозиторий тулчейн объявил.
+  // ⚠️ `just` — фича СТОРОННЯЯ (guiyomh), не из официального каталога devcontainers: там его
+  // нет. Версия пинуется намеренно — плавающая community-фича это чужой код, приезжающий в
+  // нашу среду без спроса. Отвалится — ставится одной строкой:
+  //   curl -fsSL https://github.com/casey/just/releases/latest/download/just-<ver>-x86_64-unknown-linux-musl.tar.gz | tar xz just
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1": {},
-    "ghcr.io/devcontainers/features/go:1": {}
+    "ghcr.io/devcontainers/features/go:1": {},
+    "ghcr.io/guiyomh/features/just:0": { "version": "1.58.0" }
   },
 
   // Общие на машине named-volume'ы (одни креды/стор на все omnifield-девбоксы), переживают recreate.
