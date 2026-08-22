@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // governance.mjs — PreToolUse hook: hard-gate на ПРАВКУ файла (Edit/Write/NotebookEdit)
-// ВНЕ зоны owner'а. Наш дифференциатор (kb:BRAIN2-2): границу зоны держит МАШИННЫЙ гейт по
-// файловому пути, а не текст промпта (промпт-граница ненадёжна — инъекция сбивает, kb:BRAIN2-9).
+// ВНЕ зоны owner'а. Наш дифференциатор: границу зоны держит МАШИННЫЙ гейт по
+// файловому пути, а не текст промпта (промпт-граница ненадёжна — инъекция сбивает).
 // Родственник git-gate.mjs: git-gate режет git-ЗАПИСЬ по роли, governance режет ПРАВКУ вне paths[].
 //
-// Доступ по роли (kb:BRAIN2-2/BRAIN2-5):
+// Доступ по роли:
 //   - architect (scope=main, marker) → БЕЗ ограничения по путям (видит всё).
 //   - owner (scope=<zone>)           → правки ТОЛЬКО внутри zonePaths(зоны) из harness.yaml.
 //   - layer (scope=layer)            → своя политика: файлы не ограничиваем (узость — промптом; git=none).
 //   - scope не резолвится в зону       → DENY всё (нет boundary → аномалия, safe-by-default).
 //
-// Субагенты (BRAIN2-4) НЕ триггерят SessionStart и наследуют env OMNIFIELD_SCOPE родителя →
+// Субагенты НЕ триггерят SessionStart и наследуют env OMNIFIELD_SCOPE родителя →
 // routine-помощник owner'а виден гейту как owner-зона и режется теми же paths[] (граница не течёт).
 //
 // Контракт (Claude Code PreToolUse):

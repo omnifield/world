@@ -4,7 +4,7 @@
 //   - CLI:    `node scope-resolve.mjs <scope>` → stdout JSON, exit 0 (OK) | 1 (unknown).
 //   - import: `import { resolveScope } from './scope-resolve.mjs'` (грузит конфиг из cwd).
 //
-// scope = leaf-имя зоны (либо 'main' = architect). Первоисточник зон — конфиг (kb:BRAIN2-12).
+// scope = leaf-имя зоны (либо 'main' = architect). Первоисточник зон — конфиг.
 
 import { argv } from "node:process";
 import { fileURLToPath } from "node:url";
