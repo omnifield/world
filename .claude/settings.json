@@ -1,5 +1,5 @@
 {
-  "$comment": "Эталонный блок регистрации harness-хуков для .claude/settings.json — единственный источник правды о том, что обвес ЗАРЕГИСТРИРУЕТ у потребителя (git-gate + governance на PreToolUse; main-session-marker + scope-identity на SessionStart). git-gate режет git-запись по роли (Bash/PowerShell), governance режет ПРАВКУ файла вне зоны owner'а (Edit/Write/NotebookEdit). Раскладка кладёт этот файл в .claude/settings.json классом placed-once: settings.json — общий файл клиента (permissions, env, свои хуки), перегенерация снесла бы чужое. Цена класса названа вслух: регистрация НОВЫХ хуков следующих версий сама не приезжает — расхождение ловит и печатает готовой строкой harness-doctor.mjs.",
+  "$comment": "Регистрация harness-хуков. git-gate режет git-запись по роли (Bash/PowerShell), governance режет ПРАВКУ файла вне зоны owner'а (Edit/Write/NotebookEdit), main-session-marker и scope-identity работают на SessionStart. Файл наш целиком: добавляешь свой хук — дописывай сюда же, никто этот файл не перезаписывает.",
   "hooks": {
     "PreToolUse": [
       {

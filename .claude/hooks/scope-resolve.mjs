@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // scope-resolve.mjs — резолв scope → зона продукта, config-driven (зоны из
-// `.omnifield/harness.yaml`, НЕ хардкод). Двойной режим:
+// `.claude/harness.yaml`, НЕ хардкод). Двойной режим:
 //   - CLI:    `node scope-resolve.mjs <scope>` → stdout JSON, exit 0 (OK) | 1 (unknown).
 //   - import: `import { resolveScope } from './scope-resolve.mjs'` (грузит конфиг из cwd).
 //

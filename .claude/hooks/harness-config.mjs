@@ -1,5 +1,5 @@
 // harness-config.mjs — единый источник роль-модели как ДАННЫХ: читает
-// `.omnifield/harness.yaml` (пресет-сид, доставленный плагином mode:seed) и отдаёт хукам
+// `.claude/harness.yaml` (пресет-сид, доставленный плагином mode:seed) и отдаёт хукам
 // зоны/пути, пины моделей, число архитекторов, git-доступ по роли. Ноль хардкода зон.
 //
 // Зависимостей нет (хуки Claude Code стартуют голым node). YAML парсится подмножеством
@@ -177,10 +177,10 @@ export function checkpointsTarget(config) {
   return { workspace: typeof ws === "string" && ws.trim() ? ws.trim() : null, root: root.trim() };
 }
 
-/** Читает `.omnifield/harness.yaml` из cwd; нет файла/парс упал → DEFAULT_CONFIG. */
+/** Читает `.claude/harness.yaml` из cwd; нет файла/парс упал → DEFAULT_CONFIG. */
 export function loadConfig(cwd = process.cwd()) {
   try {
-    const text = readFileSync(join(cwd, ".omnifield", "harness.yaml"), "utf8");
+    const text = readFileSync(join(cwd, ".claude", "harness.yaml"), "utf8");
     return normalizeConfig(parseYaml(text));
   } catch {
     return { ...DEFAULT_CONFIG, git: { ...GIT_INVARIANT } };
