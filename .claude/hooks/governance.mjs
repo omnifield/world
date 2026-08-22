@@ -81,13 +81,39 @@ export function resolveTarget(rawPath, repoRoot) {
 }
 
 /**
+ * Каталог ПАМЯТИ роль-сессии — её собственный инструмент, а не чужая зона.
+ *
+ * Заведено 2026-08-22 после случая с owner-`control`: он не смог поправить свою же заметку
+ * («порчу ставить только после коммита»), потому что каталог памяти лежит ВНЕ репозитория, и
+ * гейт видел его как «чужое». Правило рамки при этом ничего такого не запрещает — наоборот,
+ * оно прямо разрешает держать в памяти контекст текущей работы.
+ *
+ * Граница узкая намеренно: разрешается ровно сегмент `memory` внутри `claude/projects/…`.
+ * **Это НЕ дыра в границе зон:** durable-знание продукта по-прежнему живёт на витрине, и
+ * память его не заменяет — она про то, как агент работает, а не про то, как устроен мир.
+ * Правку кода чужой зоны через этот путь не сделать: репозиторий здесь ни при чём.
+ */
+export function isOwnMemory(targetAbs, repoRoot) {
+  // ВНУТРИ репозитория памяти не бывает. Без этой проверки владелец зоны заводил бы у себя
+  // папку `claude/projects/x/memory/` и писал в неё что угодно — гейт пустил бы по имени пути.
+  // Найдено собственной порчей при заведении правила: первая редакция такой путь РАЗРЕШАЛА.
+  if (within(targetAbs, repoRoot)) return false;
+  const parts = targetAbs.split(/[/\\]/);
+  const projects = parts.indexOf("projects");
+  if (projects < 1 || parts[projects - 1] !== "claude") return false;
+  return parts.slice(projects + 1).includes("memory");
+}
+
+/**
  * Причина блокировки правки, либо null (разрешено). unrestricted → всегда null; иначе цель
- * должна лежать хотя бы в одном owned-корне. Пустые корни (нерезолвимая зона) → всё блокируется.
+ * должна лежать хотя бы в одном owned-корне либо быть памятью самой роли. Пустые корни
+ * (нерезолвимая зона) → всё блокируется.
  */
 export function editViolation({ scope, config, repoRoot, rawPath }) {
   const owned = ownedRoots(scope, config, repoRoot);
   if (owned.unrestricted) return null;
   const target = resolveTarget(rawPath, repoRoot);
+  if (isOwnMemory(target, repoRoot)) return null;
   if (owned.roots.some((r) => within(target, r))) return null;
   if (!owned.roots.length) {
     return `scope "${scope}" не резолвится в зону с путями — boundary неизвестна`;
