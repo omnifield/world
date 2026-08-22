@@ -1199,6 +1199,153 @@ func TestПоляЛожатсяВСкоуп(t *testing.T) {
 	}
 }
 
+// ── комьюнити участка, адрес локации, заявленный ресурс ──────────────────────
+
+// адресЛокации — что контроллер отвечает на вопрос «какой у неё адрес».
+func (s *стенд) адресЛокации(t *testing.T, участок, локация string) string {
+	t.Helper()
+	status, body := s.зов(t, "GET", "/api/resources/"+участок+"/address?location="+локация, "", "metka")
+	if status != http.StatusOK {
+		t.Fatalf("адрес локации не отдан: %d %v", status, body)
+	}
+	адрес, _ := body["address"].(string)
+	if адрес == "" {
+		t.Fatalf("адрес пуст: %v", body)
+	}
+	return адрес
+}
+
+// ГЛАВНОЕ, ЧТО СТЕРЕЖЁТ ЭТА ПРОВЕРКА (`WORLD2` 2.1 п. 5, `2.2` п. 4): участок присоединился
+// к двум комьюнити и ушёл из них — АДРЕС ЛОКАЦИИ НЕ ДРОГНУЛ ни разу.
+func TestКомьюнитиУчасткаНеДвигаютАдресЛокации(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", "", state.Territory{Name: "vps", Addr: "world@10.8.0.5"}))
+	st.войти(t, ш)
+
+	до := st.адресЛокации(t, "vps", "baser")
+	if до != "егор/vps/baser" {
+		t.Fatalf("адрес собрался не тремя ярусами: %s", до)
+	}
+
+	for _, имя := range []string{"дом", "работа"} {
+		if status, body := st.зов(t, "POST", "/api/fields", `{"name":"`+имя+`"}`, "metka"); status != http.StatusCreated {
+			t.Fatalf("поле не завелось: %d %v", status, body)
+		}
+		status, body := st.зов(t, "POST", "/api/resources/vps/fields", `{"field":"`+имя+`"}`, "metka")
+		if status != http.StatusOK {
+			t.Fatalf("присоединение не прошло: %d %v", status, body)
+		}
+		// ЧЕГО НЕ ПРОИЗОШЛО — СКАЗАНО ВСЛУХ: вторая сторона доступа у службы поля, и не
+		// увидевший этой строки счёл бы себя присоединённым.
+		if note, _ := body["note"].(string); !strings.Contains(note, "служба поля") {
+			t.Fatalf("не сказано, чего не произошло: %v", body)
+		}
+		if стало := st.адресЛокации(t, "vps", "baser"); стало != до {
+			t.Fatalf("адрес сдвинулся от присоединения к «%s»: %s → %s", имя, до, стало)
+		}
+	}
+
+	// Участок состоит в ДВУХ комьюнити разом, и это видно списком (`2.5` п. 3).
+	файл := ш.файл(t)
+	if len(файл.Territories[0].Fields) != 2 {
+		t.Fatalf("в скоуп уехало не два комьюнити: %+v", файл.Territories[0].Fields)
+	}
+	if файл.Format != 2 {
+		t.Fatalf("формат состояния не поднялся до 2: %d", файл.Format)
+	}
+
+	status, body := st.зов(t, "DELETE", "/api/resources/vps/fields/дом", "", "metka")
+	if status != http.StatusOK {
+		t.Fatalf("отвязка не прошла: %d %v", status, body)
+	}
+	// ОТВЯЗКА ОБЪЯВЛЯЕТСЯ (`2.2` п. 5), а уведомлять сегодня некому — и это сказано, а не
+	// замолчано.
+	if note, _ := body["note"].(string); !strings.Contains(note, "НЕ УВЕДОМЛЕНО") {
+		t.Fatalf("отвязка промолчала о том, что поле не уведомлено: %v", body)
+	}
+	if стало := st.адресЛокации(t, "vps", "baser"); стало != до {
+		t.Fatalf("адрес сдвинулся от отвязки: %s → %s", до, стало)
+	}
+	if остались := ш.файл(t).Territories[0].Fields; len(остались) != 1 || остались[0] != "работа" {
+		t.Fatalf("отвязка убрала не то: %+v", остались)
+	}
+}
+
+func TestОтказыКомьюнитиИАдресаПриходятТройкой(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", "", state.Territory{Name: "vps", Addr: "world@10.8.0.5"}))
+	st.войти(t, ш)
+
+	tests := []struct {
+		имя, метод, путь, тело, код string
+		статус                      int
+	}{
+		{"участка нет", "POST", "/api/resources/net/fields", `{"field":"дом"}`, "no-such-resource", http.StatusNotFound},
+		{"комьюнити не записано", "POST", "/api/resources/vps/fields", `{"field":"дом"}`, "no-such-field", http.StatusNotFound},
+		{"комьюнити не названо", "POST", "/api/resources/vps/fields", `{"field":""}`, "no-name", http.StatusBadRequest},
+		{"не состоит вовсе", "DELETE", "/api/resources/vps/fields/дом", "", "not-joined", http.StatusNotFound},
+		{"локация не названа", "GET", "/api/resources/vps/address", "", "no-name", http.StatusBadRequest},
+		{"адрес чужого участка", "GET", "/api/resources/net/address?location=baser", "", "no-such-resource", http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.имя, func(t *testing.T) {
+			status, body := st.зов(t, tt.метод, tt.путь, tt.тело, "metka")
+			if status != tt.статус {
+				t.Fatalf("отдано %d вместо %d: %v", status, tt.статус, body)
+			}
+			отказ(t, body, tt.код)
+		})
+	}
+
+	// До входа ни комьюнити, ни адреса не существует — как и территорий.
+	for _, путь := range []string{"/api/resources/vps/fields", "/api/resources/vps/address"} {
+		метод := "GET"
+		if strings.HasSuffix(путь, "fields") {
+			метод = "POST"
+		}
+		_, body := st.зов(t, метод, путь, `{"field":"дом"}`, "")
+		отказ(t, body, "not-signed-in")
+	}
+}
+
+// РЕСУРС УЧАСТКА ЗАЯВЛЯЕТСЯ, А НЕ ИЗМЕРЯЕТСЯ (`2.5` пп. 2, 6, 7). Проверок «хватит ли» нет
+// ни одной, и пустое значение законно (`0.2`).
+func TestРесурсУчасткаЗаявляется(t *testing.T) {
+	st := поднять(t, докерОтвечает)
+	ш := новаяРаздача(t, "тайна")
+	ш.поднять(t, личность(t, "егор", "", state.Territory{Name: "vps", Addr: "world@10.8.0.5"}))
+	st.войти(t, ш)
+
+	status, body := st.зов(t, "GET", "/api/resources", "", "metka")
+	список, _ := body["resources"].([]any)
+	первый, _ := список[0].(map[string]any)
+	if status != http.StatusOK || первый["resource"] != "" {
+		t.Fatalf("незаявленный ресурс виден не пустым: %d %v", status, body)
+	}
+	// Пустой список комьюнити отдаётся списком, а не `null`: спрашивать тут некого —
+	// принадлежность лежит в скоупе (`2.5` п. 4).
+	if поля, есть := первый["fields"].([]any); !есть || len(поля) != 0 {
+		t.Fatalf("комьюнити участка отданы не пустым списком: %v", первый["fields"])
+	}
+
+	status, body = st.зов(t, "PUT", "/api/resources/vps/resource", `{"resource":"2 ядра, 4 ГБ"}`, "metka")
+	if status != http.StatusOK {
+		t.Fatalf("заявление не прошло: %d %v", status, body)
+	}
+	if ш.файл(t).Territories[0].Resource != "2 ядра, 4 ГБ" {
+		t.Fatalf("заявленное не уехало в скоуп: %+v", ш.файл(t).Territories[0])
+	}
+	// Снять заявление — то же действие пустым значением. Отказа здесь нет и быть не может.
+	if status, body := st.зов(t, "PUT", "/api/resources/vps/resource", `{"resource":""}`, "metka"); status != http.StatusOK {
+		t.Fatalf("снятие заявления отказало: %d %v", status, body)
+	}
+	if ш.файл(t).Territories[0].Resource != "" {
+		t.Fatal("заявление не снялось пустым значением")
+	}
+}
+
 // ── форма ────────────────────────────────────────────────────────────────────
 
 func TestНеТаРучкаИНеТотГлагол(t *testing.T) {

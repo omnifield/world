@@ -14,6 +14,10 @@
 //	GET    /api/resources          территории юзера: имя, адрес, отвечает ли, что на ней стоит
 //	POST   /api/resources          завести территорию — на ней встаёт вещь, названная рецептом
 //	DELETE /api/resources/{имя}    снять территорию; в ответе — что осталось на той машине
+//	POST   /api/resources/{имя}/fields          записать участок в комьюнити
+//	DELETE /api/resources/{имя}/fields/{поле}   вывести его оттуда
+//	PUT    /api/resources/{имя}/resource        участок ЗАЯВЛЯЕТ свой ресурс
+//	GET    /api/resources/{имя}/address?location=…  адрес локации: скоуп → территория → имя
 //	GET    /api/recipes            чем контроллер умеет поднимать: каталог рецептов
 //	GET    /api/fields             поля юзера
 //	POST   /api/fields             завести поле
@@ -200,13 +204,21 @@ func New(opt Options) *Handler {
 	h.mux.HandleFunc("GET /api/resources", h.wrap("resources", h.getResources))
 	h.mux.HandleFunc("POST /api/resources", h.wrap("resource-add", h.postResource))
 	h.mux.HandleFunc("DELETE /api/resources/{name}", h.wrap("resource-drop", h.deleteResource))
+	// КОМЬЮНИТИ УЧАСТКА И ЕГО ЗАЯВЛЕННЫЙ РЕСУРС — ручки участка, а не отдельная вещь: в
+	// комьюнити состоит ТЕРРИТОРИЯ (`WORLD2` 1.3 п. 4), и ресурс тоже её (`2.5` п. 2).
+	h.mux.HandleFunc("POST /api/resources/{name}/fields", h.wrap("resource-join", h.postResourceField))
+	h.mux.HandleFunc("DELETE /api/resources/{name}/fields/{field}", h.wrap("resource-leave", h.deleteResourceField))
+	h.mux.HandleFunc("PUT /api/resources/{name}/resource", h.wrap("resource-declare", h.putResourceResource))
+	// АДРЕС ЛОКАЦИИ СЧИТАЕТСЯ, А НЕ ХРАНИТСЯ (`2.1`): ручка — вопрос миру, а не чтение
+	// записи. Своего реестра локаций контроллер не заводит: имя локации называет юзер.
+	h.mux.HandleFunc("GET /api/resources/{name}/address", h.wrap("location-address", h.getLocationAddress))
 	h.mux.HandleFunc("GET /api/recipes", h.wrap("recipes", h.getRecipes))
 	h.mux.HandleFunc("GET /api/fields", h.wrap("fields", h.getFields))
 	h.mux.HandleFunc("POST /api/fields", h.wrap("field-add", h.postField))
 
 	// Тот же путь другим методом — это не «нет такой ручки», а «не тем глаголом», и
 	// сказать об этом надо разными словами: иначе человек ищет опечатку в пути.
-	for _, p := range []string{"/api/scope", "/api/session", "/api/me", "/api/progress", "/api/resources", "/api/resources/{name}", "/api/recipes", "/api/fields"} {
+	for _, p := range []string{"/api/scope", "/api/session", "/api/me", "/api/progress", "/api/resources", "/api/resources/{name}", "/api/resources/{name}/fields", "/api/resources/{name}/fields/{field}", "/api/resources/{name}/resource", "/api/resources/{name}/address", "/api/recipes", "/api/fields"} {
 		h.mux.HandleFunc(p, h.wrap("wrong-method", wrongMethod))
 	}
 
@@ -1248,6 +1260,10 @@ type resourceBody struct {
 	// Recipe — ЧТО поднять на этой территории: имя рецепта из каталога либо путь (в
 	// названии с косой чертой контроллер видит путь). Не назван — дверь.
 	Recipe string `json:"recipe"`
+	// Resource — ЧТО УЧАСТОК ЗАЯВЛЯЕТ О СЕБЕ (`WORLD2` 2.5 пп. 2, 6, 7). Необязательно и
+	// ничем не проверяется: мир ресурс не меряет, а нехватка его — данность, а не отказ
+	// (`0.2`). Заявить можно и потом — `PUT /api/resources/{имя}/resource`.
+	Resource string `json:"resource"`
 }
 
 func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
@@ -1311,7 +1327,12 @@ func (h *Handler) postResource(w http.ResponseWriter, r *http.Request) *refusal.
 		return ref
 	}
 
-	if ref := st.AddTerritory(state.Territory{Name: body.Name, Addr: body.Addr, Things: вещи(вещь)}, key); ref != nil {
+	// Комьюнити у свежего участка нет, и это его первое законное состояние (`WORLD2` 2.5
+	// п. 4), а не недоделка: присоединяется он отдельным решением юзера.
+	if ref := st.AddTerritory(state.Territory{
+		Name: body.Name, Addr: body.Addr, Things: вещи(вещь),
+		Fields: []string{}, Resource: strings.TrimSpace(body.Resource),
+	}, key); ref != nil {
 		return ref
 	}
 	if ref := sess.sc.Write(r.Context(), st); ref != nil {
@@ -1437,6 +1458,160 @@ func (h *Handler) deleteResource(w http.ResponseWriter, r *http.Request) *refusa
 	writeJSON(w, http.StatusOK, map[string]any{
 		"dropped":   dropped,
 		"resources": h.res.List(r.Context(), st.Territories),
+	})
+	return nil
+}
+
+// ── комьюнити участка и его заявленный ресурс ────────────────────────────────
+
+// ┌─────────────────────────────────────────────────────────────────────────────────────┐
+// │ ЭТИ ТРИ РУЧКИ ПРАВЯТ ТОЛЬКО ЛИЧНОСТЬ ЮЗЕРА (`WORLD2` 3.4, «Где лежит список полей»). │
+// │                                                                                      │
+// │ Членство лежит в двух местах, и оба законные: у юзера — в каких комьюнити его        │
+// │ участок состоит, у самого поля — чьи участки в нём состоят. ВТОРУЮ СТОРОНУ ДЕРЖИТ    │
+// │ СЛУЖБА ПОЛЯ (`1.3`, зона `field`, `WORLD2-123`), и её здесь нет: условий входа мы не │
+// │ проверяем, в чужой список не пишем и об этом ГОВОРИМ ВСЛУХ полем `note` — человек,   │
+// │ не увидевший этой строки, счёл бы себя присоединённым.                                │
+// │                                                                                      │
+// │ АДРЕС ЛОКАЦИИ ЭТИ РУЧКИ НЕ ДВИГАЮТ (`2.1` п. 5, `2.2` п. 4) — ни одна из них.        │
+// └─────────────────────────────────────────────────────────────────────────────────────┘
+
+// полеЗаписано — что именно произошло и чего не произошло. Строка одна на присоединение и
+// на отвязку: недоделано в обоих случаях одно и то же, и разные слова про одно и то же
+// завели бы второй словарь.
+const полеЗаписано = "записано в твою личность; сама служба поля — список участников и условия входа — это соседняя половина ступени, и её здесь нет"
+
+func (h *Handler) postResourceField(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	sess, ref := h.current(r)
+	if ref != nil {
+		return ref
+	}
+	name := r.PathValue("name")
+	if ref := resource.ValidName(name); ref != nil {
+		return ref
+	}
+	var body struct {
+		Field string `json:"field"`
+	}
+	if ref := decode(r, &body); ref != nil {
+		return ref
+	}
+	st, ref := sess.sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	if ref := st.JoinField(name, body.Field); ref != nil {
+		return ref
+	}
+	if ref := sess.sc.Write(r.Context(), st); ref != nil {
+		return ref
+	}
+	h.opt.Logf("control: участок %s записан в комьюнити %s — адрес его локаций от этого не двигается", name, strings.TrimSpace(body.Field))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resources": h.res.List(r.Context(), st.Territories),
+		"note":      "комьюнити " + полеЗаписано,
+	})
+	return nil
+}
+
+func (h *Handler) deleteResourceField(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	sess, ref := h.current(r)
+	if ref != nil {
+		return ref
+	}
+	name := r.PathValue("name")
+	if ref := resource.ValidName(name); ref != nil {
+		return ref
+	}
+	st, ref := sess.sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	field := r.PathValue("field")
+	if ref := st.LeaveField(name, field); ref != nil {
+		return ref
+	}
+	if ref := sess.sc.Write(r.Context(), st); ref != nil {
+		return ref
+	}
+	h.opt.Logf("control: участок %s вышел из комьюнити %s — вещи целы, адрес тот же, потеряна видимость", name, field)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resources": h.res.List(r.Context(), st.Territories),
+		// ОТВЯЗКА ОБЪЯВЛЯЕТСЯ ПОЛЮ (`WORLD2` 2.2 п. 5): молча уйти нельзя, иначе список
+		// участников останется врать. Уведомить некому — службы поля ещё нет, — и обещать
+		// доставку, которой не было, мы не станем: это ровно то молчание, которого мир
+		// себе не позволяет.
+		"note": "отвязка " + полеЗаписано + ". Поле об уходе НЕ УВЕДОМЛЕНО — уведомляет служба поля",
+	})
+	return nil
+}
+
+// putResourceResource — участок ЗАЯВЛЯЕТ свой ресурс (`WORLD2` 2.5 пп. 2, 6, 7).
+//
+// Мир его не меряет и не сторожит: нехватка ресурса — данность, а не отказ (`0.2`), и
+// проверки «хватит ли» здесь нет ни одной. Пустое значение законно и снимает заявление.
+func (h *Handler) putResourceResource(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	sess, ref := h.current(r)
+	if ref != nil {
+		return ref
+	}
+	name := r.PathValue("name")
+	if ref := resource.ValidName(name); ref != nil {
+		return ref
+	}
+	var body struct {
+		Resource string `json:"resource"`
+	}
+	if ref := decode(r, &body); ref != nil {
+		return ref
+	}
+	st, ref := sess.sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	if ref := st.Declare(name, body.Resource); ref != nil {
+		return ref
+	}
+	if ref := sess.sc.Write(r.Context(), st); ref != nil {
+		return ref
+	}
+	h.opt.Logf("control: участок %s заявил о себе: %q — мир это не меряет и не сторожит", name, strings.TrimSpace(body.Resource))
+	writeJSON(w, http.StatusOK, map[string]any{"resources": h.res.List(r.Context(), st.Territories)})
+	return nil
+}
+
+// ── адрес локации ────────────────────────────────────────────────────────────
+
+// getLocationAddress — какой адрес у локации с таким именем на этом участке.
+//
+// ВОПРОС, А НЕ ЧТЕНИЕ ЗАПИСИ: адрес считается из ярусов (`WORLD2` 2.1), и в файле
+// состояния его нет. Имя локации называет юзер — своего реестра локаций контроллер не
+// заводит, и знать, что именно юзер развернул, ему неоткуда.
+//
+// Ответ печатает и ЗАПИСЬ, и ЯРУСЫ порознь. Иначе тому, кто спросил, пришлось бы резать
+// строку обратно, чтобы узнать участок, — то есть разбирать то, что мы же и склеили.
+func (h *Handler) getLocationAddress(w http.ResponseWriter, r *http.Request) *refusal.Refusal {
+	sess, ref := h.current(r)
+	if ref != nil {
+		return ref
+	}
+	name := r.PathValue("name")
+	if ref := resource.ValidName(name); ref != nil {
+		return ref
+	}
+	st, ref := sess.sc.Read(r.Context())
+	if ref != nil {
+		return ref
+	}
+	adr, ref := st.LocationAddress(name, r.URL.Query().Get("location"))
+	if ref != nil {
+		return ref
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"address":   adr.String(),
+		"scope":     adr.Scope,
+		"territory": adr.Territory,
+		"location":  adr.Name,
 	})
 	return nil
 }

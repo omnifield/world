@@ -96,6 +96,16 @@ type Resource struct {
 	// Things — что на территории поднято. `null` означает «не спросили» (машина молчит), а
 	// пустой список — «спросили, и там ничего нет» (`WORLD2` 4.2).
 	Things []Thing `json:"things"`
+	// Fields — В КАКИХ КОМЬЮНИТИ УЧАСТОК СОСТОИТ (`WORLD2` 1.3, `2.5` п. 3). Берётся из
+	// СКОУПА, а не с машины: принадлежность — знание юзера, и машина о ней не знает вовсе.
+	//
+	// Пустой список — законное и обычное состояние, а не «не спросили»: в отличие от
+	// вещей, спрашивать тут некого (`2.5` п. 4).
+	Fields []string `json:"fields"`
+	// Resource — ЧТО УЧАСТОК ЗАЯВИЛ О СЕБЕ САМ (`2.5` пп. 2, 6, 7). Не измерение: мир
+	// ресурс не меряет и им не отказывает, нехватка его — данность (`0.2`). Пусто —
+	// «не заявлял».
+	Resource string `json:"resource"`
 }
 
 // Manager — работа с территориями юзера.
@@ -147,7 +157,12 @@ func (m *Manager) say(format string, args ...any) {
 func (m *Manager) List(ctx context.Context, territories []state.Territory) []Resource {
 	out := make([]Resource, 0, len(territories))
 	for _, t := range territories {
-		r := Resource{Name: t.Name, Addr: t.Addr}
+		r := Resource{Name: t.Name, Addr: t.Addr, Fields: t.Fields, Resource: t.Resource}
+		if r.Fields == nil {
+			// Пустой список, а не `null`: у комьюнити нет состояния «не спросили» —
+			// принадлежность лежит в скоупе, и он перед нами (`WORLD2` 2.5 п. 4).
+			r.Fields = []string{}
+		}
 		r.Reach, r.Things = m.things(ctx, ContextPrefix+t.Name)
 		r.Things = свои(r.Things, t.Things)
 		out = append(out, r)
