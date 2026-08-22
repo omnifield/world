@@ -15,7 +15,7 @@
 // не может (режимов материализации в записи нет, `merge` отменён), поэтому деградацию делаем
 // ГРОМКОЙ: доктор сверяет эталонный блок регистрации с настоящим settings.json и печатает
 // строку, которую нужно дописать. Это не обход формы — механизм не подменяется, называется то,
-// что механизм назвать не может (tasker:BRAIN2-41 §4).
+// что механизм назвать не может.
 
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -32,7 +32,6 @@ import {
   overlappingZones,
   PLACEHOLDER_PRODUCT,
   parseYaml,
-  pilotWorkspace,
   rejectedZoneNames,
   resolveScope,
   roleOf,
@@ -208,7 +207,7 @@ export function registrationReport(cwd, moduleUrl, { ok, bad, warn }) {
   return lines;
 }
 
-// --- машинный pre-commit: есть он или его нет (BRAIN2-64) --------------------
+// --- машинный pre-commit: есть он или его нет --------------------
 //
 // ГРАНИЦА, названная вслух, чтобы через месяц её не «дочинили»: git-хуки потребителя — ЕГО
 // территория. Обвес их НЕ везёт и молча не ставит. Рынок здесь единодушен (сверено 2026-08-01):
@@ -219,7 +218,7 @@ export function registrationReport(cwd, moduleUrl, { ok, bad, warn }) {
 //
 // Наше дело — сказать ПРАВДУ о том, есть машина или нет: рамка требует зелёный pre-commit, и
 // агент, который считает, что его проверят, ведёт себя иначе, чем тот, кто знает, что не
-// проверят (случай owner-сессии baser, tasker:BRAIN2-52).
+// проверят (случай owner-сессии соседнего продукта).
 
 /** Каталог `.git`: папка либо файл `gitdir: …` (worktree/submodule). null — репозитория нет. */
 export function gitDirOf(cwd) {
@@ -341,7 +340,7 @@ export function report(cwd, moduleUrl) {
   // --- продукт ---------------------------------------------------------------
   // Плейсхолдер шаблона — НЕ заполненный продукт. Раньше здесь стояла зелёная галочка на
   // `my-product`, пока баннер тот же конфиг уводил в онбординг: два инструмента говорили про
-  // одно состояние разное, причём зелёный был у того, которым установку ПРОВЕРЯЮТ (BRAIN2-46 §1).
+  // одно состояние разное, причём зелёный был у того, которым установку ПРОВЕРЯЮТ.
   if (needsOnboarding(config)) {
     p(
       warn(
@@ -358,26 +357,14 @@ export function report(cwd, moduleUrl) {
   const grabli = grabliTarget(config);
   if (grabli) p(ok(`grabli-ws: ${grabli} (затыки/грабли пишем сюда)`));
   else p(warn("grabli-ws не задан (`grabli.workspace`) — канал записи граблей не сконфигурен"));
-  const tsk = serviceBase(config, "tasker");
-  const kb = serviceBase(config, "knowledger");
-  if (tsk || kb) {
-    p(ok(`services (доступ curl'ом, НЕ MCP): tasker=${tsk ?? "—"} · knowledger=${kb ?? "—"}`));
-    p(
-      `    проверь связь: curl -s ${tsk ?? "<tasker>"}/healthz  (нет ответа → сэндбокс off / смени адрес)`,
-    );
+  const mcp = serviceBase(config, "windshift_mcp");
+  const rest = serviceBase(config, "windshift");
+  if (mcp || rest) {
+    p(ok(`витрина: ${mcp ?? "—"} (агенты — MCP-инструментами)`));
+    if (rest) p(`    REST ${rest} — людям и отладке; агенту только с оговоркой вслух`);
+    p(`    адрес выдаёт туннель и может смениться — стенд «лёг», сперва проверь адрес, а не стенд`);
   } else {
-    p(warn("services не заданы (`services.tasker/.knowledger`) — базы сервисов не сконфигурены"));
-  }
-  const pilotKb = pilotWorkspace(config, "knowledger");
-  const pilotTsk = pilotWorkspace(config, "tasker");
-  if (pilotKb || pilotTsk) {
-    p(
-      ok(
-        `раздел пилотов: knowledger=${pilotKb ?? "—"} · tasker=${pilotTsk ?? "—"} (ходит architect)`,
-      ),
-    );
-  } else {
-    p("  · раздел пилотов не задан (`pilots.tasker/.knowledger`) — правило молчит (штатно)");
+    p(warn("витрина не задана (`services.windshift_mcp`) — источник истины не сконфигурен"));
   }
   const checkpoints = checkpointsTarget(config);
   if (checkpoints) {
@@ -433,7 +420,7 @@ export function report(cwd, moduleUrl) {
       ),
     );
   }
-  // Валидатор роль-модели (relative / непустой) — kb:BRAIN2-1.
+  // Валидатор роль-модели (relative / непустой) —.
   const cfgErrors = validateConfig(config);
   if (cfgErrors.length) {
     p("");
@@ -458,7 +445,7 @@ export function report(cwd, moduleUrl) {
   for (const line of registrationReport(cwd, moduleUrl, { ok, bad, warn })) p(line);
   p("");
 
-  // --- машинный pre-commit (BRAIN2-64: рамка его требует, обвес его не везёт) -
+  // --- машинный pre-commit -
   for (const line of precommitReport(cwd, { ok, bad, warn })) p(line);
   p("");
 

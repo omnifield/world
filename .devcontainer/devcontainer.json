@@ -1,9 +1,9 @@
 {
-  // world-devbox — Ф2 (kb:ADR-16 volume-workspace, kb:FUND-4 containers-only).
-  // ГРИНФИЛД на стандартном Dev Containers (adopt-not-invent, kb:ADR-20): upstream-образ +
+  // world-devbox — Ф2.
+  // ГРИНФИЛД на стандартном Dev Containers (adopt-not-invent): upstream-образ +
   // features + native "Clone Repository in Container Volume". БЕЗ skeleton-скриптов
   // (devbox.sh/-manifest/-session/-services) и БЕЗ biome/GH-Packages — это devopser-legacy.
-  // Docker-инварианты канон-чистого девбокса сохранены (kb:DEVOPSER-3).
+  // Docker-инварианты канон-чистого девбокса сохранены.
   "name": "world-devbox",
   "image": "mcr.microsoft.com/devcontainers/typescript-node:24",
   "remoteUser": "node",
@@ -14,8 +14,8 @@
   // нет ничего: его самого нет.
   "initializeCommand": "docker network create omnifield-gateway 2>/dev/null || true",
 
-  // Канон-чистые инварианты (kb:DEVOPSER-3): peer-alias в общей сети omnifield-gateway
-  // (видят tasker/knowledger по имени), host-gateway, НОЛЬ host-портов (single-origin —
+  // Канон-чистые инварианты: peer-alias в общей сети omnifield-gateway
+  // (видят соседей по имени), host-gateway, НОЛЬ host-портов (single-origin —
   // наружу только дверь :8080; verdaccio :4873 остаётся внутренним), контейнер переживает
   // рестарт демона.
   "runArgs": [
@@ -26,7 +26,7 @@
   ],
 
   // Переменные окружения контейнера: секрет-модель, адрес pnpm-стора.
-  // Секрет-модель (kb:FUND-4): креды/кэши — в named-volume'ах, ENV указывает в /home/node/.secrets.
+  // Секрет-модель: креды/кэши — в named-volume'ах, ENV указывает в /home/node/.secrets.
   // Ничего не хардкодим в образ/репо; тома переживают recreate.
   // Стор pnpm назван ДВУМЯ именами, и это не дубль: до pnpm 11 он читает npm-конфиг
   // (NPM_CONFIG_*), с 11-й — свой (PNPM_CONFIG_*). Без них при воркспейсе-томе pnpm
@@ -51,7 +51,7 @@
 
   // Общие на машине named-volume'ы (одни креды/стор на все omnifield-девбоксы), переживают recreate.
   // Workspace-ТОМ здесь НЕ объявляем: им управляет "Clone Repository in Container Volume"
-  // (kb:ADR-16) — VS Code сам создаёт том, клонирует репо, монтирует как workspace. См. runbook.
+  // — VS Code сам создаёт том, клонирует репо, монтирует как workspace. См. runbook.
   "mounts": [
     "source=omnifield-secrets,target=/home/node/.secrets,type=volume",
     "source=omnifield-pnpm-store,target=/home/node/.pnpm-store,type=volume"
@@ -70,7 +70,7 @@
   },
 
   // Одноразовая (per-volume) настройка: corepack→pnpm-пин + глобальный ассистент
-  // (kb:FUND-4 — исполнение/ассистент живут В контейнере, не на хосте).
+  //.
   "onCreateCommand": "sudo corepack enable && env -u NPM_CONFIG_STORE_DIR npm install -g @anthropic-ai/claude-code@latest",
 
   // Репо-зависимая настройка: названные потери тулчейна, права на общие тома, seed claude-онбординга, проверка доступа к реестру, установка зависимостей.
