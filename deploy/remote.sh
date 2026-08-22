@@ -902,7 +902,13 @@ cmd_add() {
         # Номер порта берём ИЗ ОТВЕТА ДОКЕРА, а не из своего значения: какой порт вещь просит
         # наружу, знает её рецепт, и наш пересказ назвал бы не тот (`WORLD2` 2.3).
         case "$out" in
-            *"port is already allocated"*|*"address already in use"*|*"Ports are not available"*|*"bind: address already in use"*)
+            # Слова докера о занятом порте разнятся по версиям и по системам, поэтому их
+            # три. Четвёртого («bind: address already in use») здесь БОЛЬШЕ НЕТ, и это не
+            # потеря: он весь целиком лежал внутри второго — тот ловит любую строку с
+            # «address already in use», в том числе с приставкой `bind:`. Мёртвый шаблон
+            # выглядел бы заботой о лишнем случае, а на деле не срабатывал ни разу
+            # (`SC2221`/`SC2222`, `WORLD2-158`).
+            *"port is already allocated"*|*"address already in use"*|*"Ports are not available"*)
                 local busy; busy="$(printf '%s\n' "$out" | sed -n 's/.*[Bb]ind for [^:]*:\([0-9]\+\).*/\1/p' | head -n1)"
                 refuse port-busy \
                     "порт ${busy:-из рецепта} на ресурсе $NAME занят кем-то ещё" \
@@ -1147,7 +1153,9 @@ cmd_list() {
     local name endpoint
     while IFS="	" read -r name endpoint; do
         [ -n "$name" ] || continue
-        printf '%-16s %-32s %s\n' "${name#$PREFIX}" "${endpoint#ssh://}" "$name" >&2
+        # Приставка закавычена ВНУТРИ подстановки: без кавычек она читалась бы как шаблон,
+        # и `*` или `?` в ней срезали бы не то, что срезают сегодня (`SC2295`).
+        printf '%-16s %-32s %s\n' "${name#"$PREFIX"}" "${endpoint#ssh://}" "$name" >&2
     done <<< "$rows"
     say ""
     say "  что на ресурсе сейчас: ./deploy/remote.sh status <имя>"

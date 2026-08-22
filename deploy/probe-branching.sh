@@ -32,16 +32,28 @@
 # И вторая причина: докера нет ни в одной нашей локации, а проверять надо каждый заход.
 # Для владельца зоны это единственная доступная проверка вообще — до самого хоста.
 #
-# ЧТО ОНА ТРОГАЕТ НА ДИСКЕ: `deploy/.build/web-dist` — сценарии сборки кладут туда
-# подставной результат. Настоящая сборка, если она там лежала, отодвигается в сторону и
-# возвращается на место в конце (в том числе при прерывании). Больше ничего.
+# ЧТО ОНА ТРОГАЕТ НА ДИСКЕ: НИЧЕГО В ДЕРЕВЕ. Сценарии сборки кладут подставной пульт в свой
+# временный каталог, который живёт ровно прогон (`WORLD_BUILD_OUT`, читает его `build.sh`).
+#
+# ПРЕЖДЕ БЫЛО ИНАЧЕ, И ЭТО СТОИЛО НАМ ФАЛЬШИВОГО ПУЛЬТА В ОБРАЗЕ (`WORLD2-115`). Проба
+# писала заглушки в `deploy/.build/web-dist` — туда же, куда сборка кладёт НАСТОЯЩИЙ пульт,
+# — и отодвигала прежнюю сборку в сторону, возвращая её в конце. Пока прогон доходил до
+# конца, это работало; прерванный прогон (или `kill -9`) оставлял в предмете «прежнюю
+# сборку» из 28 байт, и месяц она там лежала. Проверка `[ -s … ]` её пропускала.
+#
+# Правило теперь то же, что зона уже выучила на гите: проба, которая ради своего сценария
+# правит рабочую копию, однажды съест чужую работу. Каталог свой — и то, что настоящий
+# остался нетронутым, ПРОВЕРЯЕТСЯ в конце прогона (часть 33), а не обещается.
 #
 # Имена переменных латинские: bash не поддерживает не-ASCII в именах переменных.
 set -uo pipefail   # без -e: проба сама разбирает коды возврата, падать ей нельзя
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/.." && pwd)"
-OUT="$HERE/.build/web-dist"
+# НАСТОЯЩИЙ каталог сборки — здесь он только предмет наблюдения: проба в него не пишет и в
+# конце проверяет, что он не изменился (часть 33). Свой каталог заводится ниже, рядом с
+# подставным докером, — раньше `mktemp` его негде взять.
+NASTOYASHIY_OUT="$HERE/.build/web-dist"
 PORT="${WORLD_PROBE_BRANCH_PORT:-18080}"
 NODE_IMAGE=node:24-alpine   # по нему заглушка отличает сборщик пульта от проверки склада
 # Адрес подставной двери — он же адрес, который проба подставляет прогоняемым скриптам
@@ -68,9 +80,10 @@ usage() {
     · докер и гит подставные, контейнеров не запускается ни одного;
     · В РЕЕСТР НЕ ХОДИТ ВОВСЕ — ни одной публикации, ни настоящей, ни пробной.
 
-  Трогает на диске: deploy/.build/web-dist (настоящая сборка отодвигается
-  и возвращается в конце). Разрушительного для живого мира — ничего:
-  ни портов, ни контейнеров, ни поля.
+  Трогает на диске: НИЧЕГО в дереве. Подставной пульт кладётся во временный
+  каталог прогона, а не в deploy/.build/web-dist; что настоящий остался
+  нетронутым — проверяется в конце (часть 33). Разрушительного для живого
+  мира — ничего: ни портов, ни контейнеров, ни поля.
 
   -h, --help   эта подсказка
 
@@ -102,13 +115,23 @@ DOOR_PID=
 cleanup() {
     [ -n "$DOOR_PID" ] && kill "$DOOR_PID" 2>/dev/null
     rm -rf "$STUB_DIR"
-    rm -rf "$OUT"
-    [ -d "$OUT.saved" ] && mv "$OUT.saved" "$OUT"
     return 0
 }
 trap cleanup EXIT
 
-[ -d "$OUT" ] && { rm -rf "$OUT.saved"; mv "$OUT" "$OUT.saved"; }
+# СВОЙ КАТАЛОГ СБОРКИ — внутри временного, значит умирает вместе с прогоном и в предмете не
+# оставляет ничего даже при `kill -9`. Отдаём его `build.sh` значением: путь у неё не зашит
+# ровно ради этого (`WORLD2-115`).
+#
+# Прежнего «отодвину настоящий и верну в конце» здесь БОЛЬШЕ НЕТ, и это не упрощение — оно и
+# было дырой: возврат держался на том, что прогон дойдёт до конца, а прерванный не доходит.
+OUT="$STUB_DIR/web-dist"
+export WORLD_BUILD_OUT="$OUT"
+
+# Снимок НАСТОЯЩЕГО каталога — до первого сценария; с ним сверяется часть 33. Снимаем
+# `ls -laR`, а не хэши: нам нужно «изменилось ли», а не «чем именно», и вывод `ls` одинаково
+# есть везде, где зона живёт, — включая Git Bash на Windows.
+NASTOYASHIY_SNIMOK="$(ls -laR "$NASTOYASHIY_OUT" 2>&1)"
 
 cat > "$STUB_DIR/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -2152,6 +2175,300 @@ STUB_STAMP=sha-9999999 STUB_HAVE_PROBE=1 STUB_BUILDER=ok \
     run_case 1 "$HERE/release.sh" --control
 said "разъехались"
 not_called "push"
+
+# ПЕРЕЧЕНЬ ПОДКЛЮЧАЕМ, а не пересказываем: объявление живёт в одном файле, и проба обязана
+# читать ТО ЖЕ САМОЕ, что читают сборка и версия. Подключённый `sostav.sh` только объявляет.
+. "$HERE/sostav.sh"
+
+# ====================================== 34. ПЕРЕЧЕНЬ ОБРАЗА ↔ ЕГО СБОРОЧНЫЙ ФАЙЛ
+# `WORLD2-147`. Версия образа считается по ПЕРЕЧНЮ (`deploy/sostav.sh`), а что реально едет в
+# образ — говорит его `Dockerfile`. Две правды, и до сих пор они могли разъехаться молча:
+# ревью-порча 18.08 вычеркнула `share/compose.yaml` из перечня контроллера при живом `COPY` —
+# версия ответила спокойно, проба осталась зелёной, и неподвижный тег стал бы врать о том, из
+# чего образ собран.
+#
+# ЧЕМ ЧИТАЕМ `COPY` — и почему не готовым. Сверка с рынком 2026-08-22: у `docker buildx` нет
+# способа напечатать, какие пути из контекста берёт сборка. `--call` умеет `check`, `outline`,
+# `targets` и `subrequests.describe` — цели, аргументы сборки и проверки, но не файлы;
+# `--print`/`--dry-run` в доке нет вовсе. Официальный разбор `Dockerfile` существует только
+# Go-пакетом buildkit — это четвёртый Go-модуль в репозитории ради одного сторожа, и он всё
+# равно не поехал бы: работа `probes` в CI гоняется БЕЗ докера вовсе.
+#
+# Поэтому читаем сами — с одним обязательным свойством: **сторож краснеет на всём, чего не
+# понимает.** Незнакомая форма, `ADD`, перенос строки, heredoc, чужой ключ — это краснота с
+# именем файла и номером строки, а не тихий пропуск. Молчаливое «прочитал не то» и делает
+# самодельные разборы чужих форматов опасными; здесь молчать он не умеет.
+#
+# СВЕРЯЕМ В ОБЕ СТОРОНЫ, и это не педантизм: «всё из перечня есть в `COPY`» ловит вычеркнутое,
+# «все `COPY` есть в перечне» — добавленное. Порознь каждая половина пропускает свой случай.
+
+# copy_istochniki ФАЙЛ — что `COPY` берёт ИЗ КОНТЕКСТА, по строке:
+#   src <путь>              источник из контекста
+#   nepon <номер> <чего>    форму сторож не знает — это краснота, а не пропуск
+copy_istochniki() {
+    local fayl="$1" stroka cmd nomer=0 arg skolko iz_stupeni nepon_klyuch
+    local -a slova ostatok
+    while IFS= read -r stroka || [ -n "$stroka" ]; do
+        nomer=$((nomer + 1))
+        case "$stroka" in
+            ''|'#'*) continue ;;
+        esac
+        # Слова режем по пробелам НАРОЧНО — это и есть форма `Dockerfile`.
+        # shellcheck disable=SC2206
+        slova=($stroka)
+        [ "${#slova[@]}" -gt 0 ] || continue
+        cmd="$(printf '%s' "${slova[0]}" | tr '[:lower:]' '[:upper:]')"
+        case "$cmd" in
+            COPY|ADD) ;;
+            *) continue ;;
+        esac
+        # Формы, которых сторож не знает. Каждая молча увела бы его читать не то.
+        case "$stroka" in
+            *\\)    printf 'nepon %s %s\n' "$nomer" "перенос строки"; continue ;;
+            *'<<'*) printf 'nepon %s %s\n' "$nomer" "heredoc"; continue ;;
+            *'['*)  printf 'nepon %s %s\n' "$nomer" "форма списком (JSON)"; continue ;;
+        esac
+        if [ "$cmd" = ADD ]; then
+            printf 'nepon %s %s\n' "$nomer" "ADD — у него источником бывает и сеть, и архив"
+            continue
+        fi
+        # Ключи. `--from=` значит «не из контекста»: содержимое приезжает из другой ступени
+        # сборки, а не из дерева, и такую строку пропускаем целиком.
+        ostatok=(); iz_stupeni=; nepon_klyuch=
+        for arg in "${slova[@]:1}"; do
+            case "$arg" in
+                --from=*) iz_stupeni=1 ;;
+                --chown=*|--chmod=*|--link|--parents|--exclude=*) ;;
+                --*) nepon_klyuch="$arg" ;;
+                *) ostatok+=("$arg") ;;
+            esac
+        done
+        [ -z "$nepon_klyuch" ] || { printf 'nepon %s %s\n' "$nomer" "ключ $nepon_klyuch"; continue; }
+        [ -z "$iz_stupeni" ] || continue
+        skolko="${#ostatok[@]}"
+        [ "$skolko" -ge 2 ] || { printf 'nepon %s %s\n' "$nomer" "меньше двух слов после ключей"; continue; }
+        # Последнее слово — куда кладём; всё до него — источники.
+        for arg in "${ostatok[@]:0:$((skolko - 1))}"; do printf 'src %s\n' "$arg"; done
+    done < "$fayl"
+}
+
+# razresh КОНТЕКСТ ИСТОЧНИК — путь от корня репозитория. `.` значит весь контекст.
+razresh() {
+    local k="$1" s="$2"
+    s="${s#./}"; s="${s%/}"
+    [ -n "$s" ] || s='.'
+    if [ "$s" = '.' ]; then printf '%s' "$k"; return 0; fi
+    if [ "$k" = '.' ]; then printf '%s' "$s"; else printf '%s/%s' "$k" "$s"; fi
+}
+
+# vnutri ПУТЬ СПИСОК — путь равен одному из списка либо лежит ВНУТРИ него.
+vnutri() {
+    local p="$1" e
+    while IFS= read -r e; do
+        [ -n "$e" ] || continue
+        [ "$p" = "$e" ] && return 0
+        case "$p" in "$e"/*) return 0 ;; esac
+    done <<< "$2"
+    return 1
+}
+
+# kasaetsya ПУТЬ СПИСОК — путь равен, предок или потомок кого-то из списка. Предок нужен
+# затем, что перечень называет папку (`control`), а `COPY` берёт из неё файлы поимённо.
+kasaetsya() {
+    local p="$1" e
+    while IFS= read -r e; do
+        [ -n "$e" ] || continue
+        [ "$p" = "$e" ] && return 0
+        case "$p" in "$e"/*) return 0 ;; esac
+        case "$e" in "$p"/*) return 0 ;; esac
+    done <<< "$2"
+    return 1
+}
+
+# znachenie ФАЙЛ ПОЛЕ — значение простого поля файла запуска. Читаем ДВА скалярных поля, а не
+# YAML: заводить разбор чужого формата ради двух строк значило бы завести второй такой разбор.
+znachenie() {
+    sed -n "s/^[[:space:]]*$2:[[:space:]]*\([^[:space:]#]*\)[[:space:]]*\$/\1/p" "$1" | head -n1
+}
+
+# sverka_obraza КОРЕНЬ СБОРКА КОНТЕКСТ ЗОВЁМ ПЕРЕЧЕНЬ РЕЦЕПТ АРТЕФАКТ
+# Печатает проблемы по строке; молчание значит «сошлось». Отдельной функцией, потому что её
+# гоняют ДВАЖДЫ: по настоящему дереву и по порченому (сценарии 34a…34d) — сторож, которого
+# никто не ломал, стоит ровно столько же, сколько его отсутствие.
+sverka_obraza() {
+    local koren="$1" sborka="$2" kontekst="$3" zovem="$4" puti="$5" recept="$6" artefakt="$7"
+    local chtenie nepon istochniki p s n zapusk ctx_v dfl_v ctx_abs ctx_repo art_kuda art_iz
+
+    [ -n "$sborka" ] && [ -n "$kontekst" ] || {
+        printf 'у образа «%s» не объявлено, чем он складывается или где его контекст\n' "$zovem"; return 0; }
+    [ -f "$koren/$sborka" ] || {
+        printf 'у образа «%s» объявлен сборочный файл %s, а его в дереве нет\n' "$zovem" "$sborka"; return 0; }
+
+    # ---- объявление против ФАЙЛА ЗАПУСКА: пара «сборка + контекст» не должна стать третьей
+    # правдой о сборке. Файл запуска ищем рядом со сборочным — так лежат все три образа.
+    zapusk="${sborka%/*}/compose.yaml"
+    if [ ! -f "$koren/$zapusk" ]; then
+        printf 'рядом со сборочным файлом %s нет файла запуска %s — объявление сверить не с чем\n' "$sborka" "$zapusk"
+    else
+        ctx_v="$(znachenie "$koren/$zapusk" context)"
+        dfl_v="$(znachenie "$koren/$zapusk" dockerfile)"
+        if [ -z "$ctx_v" ] || [ -z "$dfl_v" ]; then
+            printf 'в %s не нашлось полей context и dockerfile — объявление образа «%s» сверить не с чем\n' "$zapusk" "$zovem"
+        else
+            ctx_abs="$(cd -- "$koren/${zapusk%/*}/$ctx_v" 2>/dev/null && pwd)"
+            if [ -z "$ctx_abs" ]; then
+                printf 'в %s контекст «%s» не ведёт никуда\n' "$zapusk" "$ctx_v"
+            else
+                ctx_repo="${ctx_abs#"$koren"}"; ctx_repo="${ctx_repo#/}"; [ -n "$ctx_repo" ] || ctx_repo='.'
+                [ "$ctx_repo" = "$kontekst" ] || \
+                    printf 'образ «%s»: объявлен контекст «%s», а %s называет «%s»\n' "$zovem" "$kontekst" "$zapusk" "$ctx_repo"
+                [ "$(razresh "$ctx_repo" "$dfl_v")" = "$sborka" ] || \
+                    printf 'образ «%s»: объявлен сборочный файл «%s», а %s называет «%s» от контекста «%s»\n' \
+                        "$zovem" "$sborka" "$zapusk" "$dfl_v" "$ctx_repo"
+            fi
+        fi
+    fi
+
+    # ---- что сборочный файл берёт из контекста
+    chtenie="$(copy_istochniki "$koren/$sborka")"
+    nepon="$(printf '%s\n' "$chtenie" | sed -n 's/^nepon //p')"
+    if [ -n "$nepon" ]; then
+        while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            printf '%s:%s — формы сторож не знает: %s. Научи его либо перепиши строку\n' "$sborka" "${n%% *}" "${n#* }"
+        done <<< "$nepon"
+        return 0
+    fi
+
+    istochniki=""
+    while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        istochniki="${istochniki:+$istochniki$'\n'}$(razresh "$kontekst" "$s")"
+    done <<< "$(printf '%s\n' "$chtenie" | sed -n 's/^src //p')"
+
+    art_kuda="${artefakt%%:*}"; art_iz="${artefakt#*:}"
+    [ -n "$artefakt" ] || { art_kuda=""; art_iz=""; }
+
+    # ---- СТОРОНА 1: всё, что едет в образ, названо в перечне
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ -n "$art_kuda" ] && vnutri "$p" "$art_kuda"; then
+            # Артефакт: в образ едет СОБРАННОЕ, а в перечне обязан стоять его исходник.
+            vnutri "$art_iz" "$puti" && continue
+            printf 'образ «%s»: в него едет %s, собранный из %s, а этого пути в перечне нет\n' "$zovem" "$p" "$art_iz"
+            continue
+        fi
+        vnutri "$p" "$puti" && continue
+        printf 'образ «%s»: %s кладёт в него %s, а в перечне такого пути нет — правка в нём не сдвинет версию\n' \
+            "$zovem" "$sborka" "$p"
+    done <<< "$istochniki"
+
+    # ---- СТОРОНА 2: всё, что названо в перечне, либо едет в образ, либо объявлено рецептом
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        kasaetsya "$p" "$istochniki" && continue
+        vnutri "$p" "$recept" && continue
+        { [ -n "$art_iz" ] && [ "$p" = "$art_iz" ]; } && continue
+        printf 'образ «%s»: в перечне есть %s, а %s его в образ не кладёт и рецептом он не объявлен\n' \
+            "$zovem" "$p" "$sborka"
+    done <<< "$puti"
+}
+
+# ---------------------------------------------------------------- по настоящему дереву
+for obraz_k in $(sostav_obrazy); do
+    zovem_k="$(sostav_zovem "$obraz_k")"
+    besporyadok="$(sverka_obraza "$ROOT" \
+        "$(sostav_sborka "$obraz_k")" "$(sostav_kontekst "$obraz_k")" "$zovem_k" \
+        "$(sostav_puti "$obraz_k")" "$(sostav_recept "$obraz_k")" "$(sostav_artefakt "$obraz_k")")"
+    if [ -z "$besporyadok" ]; then
+        good "образ «$zovem_k»: перечень и $(sostav_sborka "$obraz_k") сходятся в обе стороны"
+    else
+        while IFS= read -r stroka_b; do [ -n "$stroka_b" ] && bad "$stroka_b"; done <<< "$besporyadok"
+    fi
+done
+
+# ---------------------------------------------------------------- порчи, прогнанные пробой
+# Сторож, которого никто не ломал, стоит ровно столько же, сколько его отсутствие. Ломаем на
+# СВОЁМ дереве в каталоге прогона: настоящие файлы не трогаются вовсе — то же правило, по
+# которому проба не пишет в предмет (часть 33).
+DEREVO="$STUB_DIR/derevo34"
+postroit_derevo() {   # <строки Dockerfile…>
+    rm -rf "$DEREVO"
+    mkdir -p "$DEREVO/zona" "$DEREVO/chuzhoe"
+    printf 'soderzhimoe\n' > "$DEREVO/zona/fayl.txt"
+    printf 'soderzhimoe\n' > "$DEREVO/chuzhoe/dano.yaml"
+    printf 'services:\n  x:\n    build:\n      context: ..\n      dockerfile: zona/Dockerfile\n' \
+        > "$DEREVO/zona/compose.yaml"
+    printf '%s\n' "$@" > "$DEREVO/zona/Dockerfile"
+}
+
+# 34a. ОБРАТНАЯ ПРОВЕРКА — сперва согласие. Без неё сторож мог бы оказаться всегда-красным, и
+# три сценария ниже краснели бы «правильно» по неправильной причине.
+part "34a. перечень и Dockerfile согласны → сторож молчит"
+postroit_derevo 'FROM scratch' 'COPY zona/fayl.txt /f' 'COPY chuzhoe/dano.yaml /d'
+tiho="$(sverka_obraza "$DEREVO" 'zona/Dockerfile' '.' 'опытный' \
+    "$(printf 'zona\nchuzhoe/dano.yaml\n')" "$(printf 'zona/Dockerfile\nzona/compose.yaml\n')" '')"
+[ -z "$tiho" ] && good "согласованный перечень проходит молча" \
+               || { bad "сторож краснеет на согласованном — он всегда-красный, и три порчи ниже ничего не значат"
+                    printf '%s\n' "$tiho" >&2; }
+
+part "34b. порча: путь вычеркнут из перечня, а COPY его берёт → красное с именем пути"
+porcha_b="$(sverka_obraza "$DEREVO" 'zona/Dockerfile' '.' 'опытный' \
+    "$(printf 'zona\n')" "$(printf 'zona/Dockerfile\nzona/compose.yaml\n')" '')"
+case "$porcha_b" in
+    *"chuzhoe/dano.yaml"*) good "вычеркнутый путь назван по имени — ровно находка WORLD2-147" ;;
+    *) bad "вычеркнутый путь прошёл молча либо назван не он: «${porcha_b:-тишина}»" ;;
+esac
+
+part "34c. порча: в Dockerfile добавлен COPY чужого файла, перечень не тронут → красное"
+postroit_derevo 'FROM scratch' 'COPY zona/fayl.txt /f' 'COPY chuzhoe/dano.yaml /d' 'COPY chuzhoe/eshchyo.yaml /e'
+printf 'soderzhimoe\n' > "$DEREVO/chuzhoe/eshchyo.yaml"
+porcha_c="$(sverka_obraza "$DEREVO" 'zona/Dockerfile' '.' 'опытный' \
+    "$(printf 'zona\nchuzhoe/dano.yaml\n')" "$(printf 'zona/Dockerfile\nzona/compose.yaml\n')" '')"
+case "$porcha_c" in
+    *"chuzhoe/eshchyo.yaml"*) good "добавленный COPY назван по имени — версия его бы не заметила" ;;
+    *) bad "добавленный COPY прошёл молча: «${porcha_c:-тишина}»" ;;
+esac
+
+part "34d. порча: форма, которой сторож не знает → он краснеет, а не читает наугад"
+postroit_derevo 'FROM scratch' 'COPY zona/fayl.txt /f' 'ADD https://example.test/a.tgz /a'
+porcha_d="$(sverka_obraza "$DEREVO" 'zona/Dockerfile' '.' 'опытный' \
+    "$(printf 'zona\n')" "$(printf 'zona/Dockerfile\nzona/compose.yaml\n')" '')"
+case "$porcha_d" in
+    *"формы сторож не знает"*) good "незнакомая форма названа вместе с номером строки" ;;
+    *) bad "незнакомую форму сторож проглотил: «${porcha_d:-тишина}»" ;;
+esac
+rm -rf "$DEREVO"
+
+# ============================================== 33. ПРОБА НЕ ТРОГАЕТ ПРЕДМЕТ
+# Проба, которая ради своего сценария правит рабочую копию, однажды съест чужую работу.
+# Зона выучила это на гите и завела подставной; к каталогу сборки то же правило применили
+# только теперь — и цена промедления известна: месяц в `deploy/.build/web-dist` лежала
+# заглушка из 28 байт, которую проверка «файл непустой» пропускала в образ (`WORLD2-115`).
+#
+# Проверяем не обещание, а факт: снимок каталога снят ДО первого сценария, сверяется ПОСЛЕ
+# последнего. Сверяется и случай «его там не было» — тогда его не должно появиться.
+part "33. настоящий каталог сборки не тронут прогоном"
+NASTOYASHIY_TEPER="$(ls -laR "$NASTOYASHIY_OUT" 2>&1)"
+if [ "$NASTOYASHIY_SNIMOK" = "$NASTOYASHIY_TEPER" ]; then
+    if [ -d "$NASTOYASHIY_OUT" ]; then
+        good "настоящая сборка на месте и не изменилась: ${NASTOYASHIY_OUT#"$ROOT"/}"
+    else
+        good "настоящего каталога сборки не было и не появилось: ${NASTOYASHIY_OUT#"$ROOT"/}"
+    fi
+else
+    bad "прогон изменил ${NASTOYASHIY_OUT#"$ROOT"/} — проба пишет в предмет"
+    printf '  было:\n%s\n  стало:\n%s\n' "$NASTOYASHIY_SNIMOK" "$NASTOYASHIY_TEPER" >&2
+fi
+
+# И то же самое с другой стороны: подставной пульт обязан лежать В СВОЁМ каталоге, а не
+# нигде. Без этой половины «предмет не тронут» проходило бы и на пробе, которая не писала
+# вовсе, — то есть перестало бы что-либо значить.
+if [ -s "$OUT/index.html" ]; then
+    good "подставной пульт лежит в своём каталоге прогона, а не в предмете"
+else
+    bad "в своём каталоге прогона пульта нет — сценарии сборки писали куда-то ещё"
+fi
 
 # ================================================================== итог
 part "── итог"
